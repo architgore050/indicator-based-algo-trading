@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Data (large, not yours to share, script for downloading dataset is given)
+data.csv
+
+# Generated output from runs
+wfv/
+optuna_db/
+*_log.txt
+*.log
+*_smoke.csv
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

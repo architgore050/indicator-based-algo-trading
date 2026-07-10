@@ -1,0 +1,22 @@
+# Core data processing
+numpy>=1.24
+pandas>=2.0
+
+# Bayesian optimization
+optuna>=3.4
+
+# Visualization
+matplotlib>=3.7
+
+# Progress bars
+tqdm>=4.65
+
+# Parallel execution (CPU workers)
+joblib>=1.3
+
+# Data download utility
+dukascopy-python>=0.1
+
+# GPU acceleration — only available in rapids conda environment (WSL)
+# Install via: conda install -c rapidsai -c nvidia -c conda-forge cudf cupy=12.0
+# Do NOT pip install these outside the rapids env
