@@ -1,9 +1,9 @@
 # AGENTS.md - OpenCode Instructions
 
 ## Core Context & Vision
-This is an XAUUSD (Gold) high-performance algorithmic trading system evolving through versions v2 → v3 → v4 → v5 → v6. It uses vectorized technical indicators and a Walk-Forward Validation (WFV) pipeline to optimize strategy parameters via Bayesian Optimization (Optuna).
+This is an XAUUSD (Gold) high-performance algorithmic trading system (v6 — only active version, all legacy versions have been retired). It uses vectorized technical indicators and a Walk-Forward Validation (WFV) pipeline to optimize strategy parameters via Bayesian Optimization (Optuna).
 
-**Developer Vision:** Maximize hardware utilization on an RTX 5080 GPU to run the WFV pipeline as fast as possible. The trajectory is a systematic migration from `pandas`/CPU-bound code to `cudf`/`cupy`/GPU-accelerated computation while preserving correctness through parity validation at every step.
+**Developer Vision:** Maximize hardware utilization on an RTX 5080 GPU to run the WFV pipeline as fast as possible. The trajectory evolved from "port pandas to GPU" to "algorithmic optimization — break out of row-by-row loops." GPU acceleration is now a secondary layer applied after eliminating sequential Python loops. The primary bottleneck was never indicator math (already vectorized) but state machine loops in signal generation and backtesting.
 
 **Design Philosophy:**
 - **Correctness before speed.** GPU acceleration must produce results identical (within tolerance) to the pandas baseline. Parity tests are non-negotiable.
@@ -33,23 +33,16 @@ The active codebase lives in `v6/`. It consists of:
 | **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals with realistic risk management |
 | **Collation** | `collate_wfv_results.py` | Aggregate WFV results across windows |
 | **Utilities** | `logging_utils.py`, `data_download.py` | Structured logging, 1-minute XAUUSD data ingestion |
+| **Validation** | `parity_test_signal_generators.py` | Parity tests comparing refactored vs backup signal generators |
+| **Configuration** | `config.json`, `backtesting_params_vm.json`, `calibration_results_vm.json` | Baseline parameters, strategy-specific backtesting params, calibration overrides |
+| **Data** | `data.csv` | Raw 1-minute XAUUSD OHLCV data |
 
 Two strategies are implemented:
 1. **VM Strategy** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD.
 2. **TV Strategy** — Inspired by TradingView community indicators (TDI, Loxx, Donchian Bands).
 
-## Legacy Systems (Still Present)
-The following version directories still exist in the workspace root and may contain code or data that is referenced, compared against, or needs migration awareness:
-
-- **`v2/`** — Early iteration. Contains `definitions.py`, `backtesting.py`, `data_download.py`. Largely superseded but may have legacy indicator logic worth understanding.
-- **`v3/`** — Added `analysis.py`, `test.py`, `setup_v5_complete.py`. Intermediate evolution of the pipeline.
-- **`v4/`** — Introduced signal generation scripts (`generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py`) and window-aware backtesting. The pandas baseline for v6's GPU refactoring.
-- **`v5/`** — Pre-GPU version of the full pipeline. Contains all 11 core scripts that were later GPU-refactored in v6. Useful as a reference when GPU dispatch paths need auditing or parity validation.
-
-When making changes to v6, be aware that legacy versions may still be used for:
-- Comparing indicator implementations across versions
-- Running pandas-only fallbacks if GPU is unavailable
-- Historical data analysis or backtesting comparisons
+## Legacy Systems (Retired)
+All legacy version directories (v2–v5) have been removed. Only `v6/` remains as the active codebase. No migration awareness or cross-version comparison is needed.
 
 ## Environment Setup (WSL + RAPIDS)
 GPU-related code runs through WSL Ubuntu with the `rapids` conda environment:
@@ -64,7 +57,7 @@ The `rapids` conda environment contains cudf, cupy, and all CUDA dependencies. E
 - **Headless execution:** Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless WSL.
 - **cudf inspection:** Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
 - **Vectorization:** Use pandas/numpy/cudf vectorized operations exclusively; NEVER use loops over data rows for indicator calculations.
-- **Protected files:** Do NOT delete testing scripts (`*test*.py`, `*_signals_test.csv`), backups (`v6/definitions_backup.py`, `.bak`/`.backup` files). These are critical for validation.
+- **Protected files:** Do NOT delete testing scripts (`*test*.py`, `*_signals_test.csv`), backups (`.bak`/`.backup` files). These are critical for validation.
 
 ## Orchestrator Behavior — Subagent Delegation
 When given a multi-part task, delegate subtasks to parallel subagents rather than doing them yourself:
@@ -123,23 +116,25 @@ All indicator functions follow a three-tier dispatch pattern:
 
 Function signatures are preserved across all tiers to ensure zero breaking changes for consumer scripts.
 
+### Algorithmic Soundness by Component
+- **Indicator Engine (`definitions.py`):** Fully vectorized. All 9 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
+- **Signal Generation (`generate_*_signals.py`):** State machine loop replaced with sparse event iteration — `np.where(has_event)[0]` reduces iterations from O(n) to O(events) where events are typically 0.1-1% of bars. Reasons pre-computed via numpy column_stack. Remaining loop is fundamentally sequential (position at t depends on position at t-1) but over sparse events only. GPU data loading available via `--gpu` flag.
+- **Backtesting (`backtest_xauusd_signal_csv.py`):** Still uses per-bar state machine loop with sequential equity compounding. This is the next target for algorithmic optimization — trade-level vectorization to eliminate O(n) loop.
+- **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with VRAM-based worker limits. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
+
 ### Configuration Management
 - `config.json` holds baseline parameters.
 - `calibration_results_*.json` files are runtime overrides produced by calibration runs.
 - Strategy-specific backtesting params live in `backtesting_params_vm.json`.
 
 ## Roadmap & Current Status
-See `v6/PLAN.md` for the detailed, up-to-date roadmap and task tracker.
+See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 
 **Summary:**
 - **Phase 1 (GPU Shift):** COMPLETE — cudf/cupy dispatch paths in all helper functions + indicator functions in `definitions.py`. GPU I/O helpers in `gpu_io.py`.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
-- **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, GEMINI.md created, dead state removed.
-- **Phase 4 (GPU Signal Generation & Backtesting):** IN PROGRESS — `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py`, and `backtest_xauusd_signal_csv.py` should use `gpu_io.py` for data loading and GPU-vectorized operations.
-
-## Reference Docs
-- `v6/PLAN.md`: Current roadmap, task tracker, implementation notes, cleanup log, and current state.
-- `v6/GEMINI.md`: Full project documentation including GPU-accelerated function docs and architecture details.
+- **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
+- **Phase 4 (Algorithmic Optimization):** IN PROGRESS — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. GPU data loading via `--gpu` flag. Backtesting loop-breaking and Optuna search space reduction remain.
 
 ---
 
@@ -163,7 +158,7 @@ This section exists to ensure AGENTS.md stays accurate and useful over time. It 
 **What NOT to update:**
 - Hardcoded implementation numbers (worker counts, VRAM percentages, row thresholds) — these are situational and will become stale.
 - Prescriptive formulas for resource allocation — let the model assess each situation based on context.
-- Code-level details that belong in `PLAN.md` or `GEMINI.md` — AGENTS.md is a high-level compass, not an implementation manual.
+- Code-level details that belong in `PLAN.md` — AGENTS.md is a high-level compass, not an implementation manual.
 
 **Maintenance principle:** AGENTS.md should provide enough context and direction for a new agent to understand *what the project is, where it has been, and which direction to head* — without dictating *exactly how* to get there. It is a map, not a recipe.
 
@@ -193,7 +188,7 @@ This section captures lessons learned from actual implementation experience. It 
 ### What to Avoid
 - **Do not hardcode concurrency limits in AGENTS.md.** The right number of workers depends on data size, VRAM availability, GPU saturation state, and whether the task prioritizes throughput or stability. Let the model assess this contextually using the hardware facts provided here as input, not as a formula to apply.
 - **Do not add new intermediate file formats.** CSV is the canonical format. If performance is an issue, optimize the in-memory computation (GPU), not the disk format.
-- **Do not delete legacy version directories without confirmation.** v2-v5 may contain indicator logic or data that needs migration awareness. They are historical artifacts but may still be referenced.
+- **Legacy v2–v5 directories have been retired.** They no longer exist in the workspace. No migration awareness needed.
 
 ---
-*Last updated: 2026-07-10 — Restructured per developer feedback: removed prescriptive formulas, added Maintenance Protocol and Experience Learning sections, preserved project context and vision.*
+*Last updated: 2026-07-11 — Added algorithmic soundness by component section. Phase 4 vision updated from "GPU porting" to "algorithmic optimization — break out of loops." Signal generators now use sparse event loops (100x fewer iterations) + pre-computed reasons. Corrected file locations: PLAN.md at root, removed legacy v2-v5 references, removed non-existent GEMINI.md/definitions_backup.py references, added missing config/data/validation files to architecture table.*

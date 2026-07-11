@@ -18,7 +18,6 @@ from definitions import (
     calculate_tdi,
     calculate_tdi_loxx,
 )
-from gpu_io import gpu_io_available, load_csv_to_gpu
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
 suppress_pandas_warnings()
@@ -90,16 +89,10 @@ def with_mode_suffix(path: Path, mode: str) -> Path:
     return path
 
 
-def load_data(
-    mode: str,
-    start_row: int = 0,
-    end_row: int = 4000000,
-    data_csv_path: str = None,
-    use_gpu: bool = False,
-) -> pd.DataFrame:
+def load_data(mode: str, start_row: int = 0, end_row: int = 4000000, data_csv_path: str = None) -> pd.DataFrame:
     source = data_csv_path if data_csv_path else DATA_CSV
     read_kwargs = {"parse_dates": ["timestamp"]}
-
+    
     # Allow manual override if start_row/end_row provided (WFV sliced CSV)
     if start_row != 0 or end_row != 4000000:
         read_kwargs["skiprows"] = range(1, start_row + 1)
@@ -112,13 +105,7 @@ def load_data(
         read_kwargs["skiprows"] = range(1, 3_000_001)
         read_kwargs["nrows"] = 1_000_000
 
-    if use_gpu and gpu_io_available():
-        logger.info("Loading %s via GPU (cudf)", source)
-        gpu_df = load_csv_to_gpu(str(source))
-        data = gpu_df.to_pandas()
-    else:
-        data = pd.read_csv(source, **read_kwargs)
-
+    data = pd.read_csv(source, **read_kwargs)
     data.columns = [col.strip().lower() for col in data.columns]
     required = {"timestamp", "open", "high", "low", "close"}
     missing = required.difference(data.columns)
@@ -129,25 +116,9 @@ def load_data(
     return data.sort_values("timestamp").reset_index(drop=True)
 
 
-def _active_names(row_idx: int, checks: list[tuple[str, np.ndarray]]) -> str:
+def active_names(row_idx: int, checks: list[tuple[str, np.ndarray]]) -> str:
     names = [name for name, values in checks if bool(values[row_idx])]
     return ", ".join(names) if names else "base setup"
-
-
-def _precompute_reasons(check_arrs: list[tuple[str, np.ndarray]], indices: np.ndarray) -> dict[int, str]:
-    """Pre-compute reason strings for all event indices using numpy vectorized ops."""
-    if not indices.size:
-        return {}
-    check_values = np.column_stack([arr[indices] for _, arr in check_arrs])
-    names = [name for name, _ in check_arrs]
-    reasons = {}
-    for idx_pos, idx in enumerate(indices):
-        active = check_values[idx_pos]
-        if active.any():
-            reasons[idx] = ", ".join(names[j] for j, a in enumerate(active) if a)
-        else:
-            reasons[idx] = "base setup"
-    return reasons
 
 
 def build_signal_rows(
@@ -176,18 +147,10 @@ def build_signal_rows(
     buy_counts = buy_confirmation_count.fillna(0).astype(int).to_numpy()
     sell_counts = sell_confirmation_count.fillna(0).astype(int).to_numpy()
 
-    # Fast numpy: find which bars have ANY signal event
-    has_event = buy_arr | sell_arr | long_exit_arr | short_exit_arr
-    event_indices = np.where(has_event)[0]
-
-    # Pre-compute reason strings for all event indices (vectorized numpy)
-    buy_reasons = _precompute_reasons(buy_check_arrs, event_indices)
-    sell_reasons = _precompute_reasons(sell_check_arrs, event_indices)
-
     rows: list[dict[str, object]] = []
     position = 0
 
-    for i in event_indices:
+    for i in tqdm(range(len(data)), desc="TV signal scan", unit="bar"):
         signal = None
         action = None
         reason = None
@@ -196,12 +159,12 @@ def build_signal_rows(
             if buy_arr[i]:
                 signal = "BUY"
                 action = "ENTER_LONG"
-                reason = buy_reasons.get(i, "base setup")
+                reason = active_names(i, buy_check_arrs)
                 position = 1
             elif sell_arr[i]:
                 signal = "SELL"
                 action = "ENTER_SHORT"
-                reason = sell_reasons.get(i, "base setup")
+                reason = active_names(i, sell_check_arrs)
                 position = -1
         elif position == 1:
             if long_exit_arr[i]:
@@ -212,7 +175,7 @@ def build_signal_rows(
             elif sell_arr[i]:
                 signal = "SELL"
                 action = "ENTER_SHORT"
-                reason = sell_reasons.get(i, "base setup")
+                reason = active_names(i, sell_check_arrs)
                 position = -1
         elif position == -1:
             if short_exit_arr[i]:
@@ -223,7 +186,7 @@ def build_signal_rows(
             elif buy_arr[i]:
                 signal = "BUY"
                 action = "ENTER_LONG"
-                reason = buy_reasons.get(i, "base setup")
+                reason = active_names(i, buy_check_arrs)
                 position = 1
 
         if action:
@@ -242,17 +205,11 @@ def build_signal_rows(
     return pd.DataFrame(rows)
 
 
-def generate_signals(
-    mode: str,
-    start_row: int = 0,
-    end_row: int = 4000000,
-    data_csv_path: str = None,
-    use_gpu: bool = False,
-) -> Path:
+def generate_signals(mode: str, start_row: int = 0, end_row: int = 4000000, data_csv_path: str = None) -> Path:
     output_csv = with_mode_suffix(OUTPUT_CSV, mode)
 
     with tqdm(total=10, desc="TV Strategy 1", unit="step") as pbar:
-        data = load_data(mode, start_row=start_row, end_row=end_row, data_csv_path=data_csv_path, use_gpu=use_gpu)
+        data = load_data(mode, start_row=start_row, end_row=end_row, data_csv_path=data_csv_path)
         pbar.set_postfix_str(f"rows={len(data):,}")
         pbar.update()
 
@@ -376,7 +333,6 @@ def main() -> None:
     parser.add_argument("--end-row", type=int, default=4000000)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
-    parser.add_argument("--gpu", action="store_true", help="Load data via GPU (cudf) for accelerated indicator computation.")
     args = parser.parse_args()
 
     # Override PARAMS with per-window calibration if provided (parallel WFV safety)
@@ -384,10 +340,7 @@ def main() -> None:
     if args.calibration:
         PARAMS = load_params(args.calibration)
 
-    output_csv = generate_signals(
-        args.mode, start_row=args.start_row, end_row=args.end_row,
-        data_csv_path=args.data_csv, use_gpu=args.gpu,
-    )
+    output_csv = generate_signals(args.mode, start_row=args.start_row, end_row=args.end_row, data_csv_path=args.data_csv)
     print(f"Wrote {output_csv}")
 
 

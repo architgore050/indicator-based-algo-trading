@@ -19,7 +19,7 @@ This repo exists because if the project doesn't pan out, it's something to point
 Two bottlenecks:
 
 1. **Not enough data.** The calibration windows are too small for the strategies to find stable edges. More historical data is needed but compute limits how much we can process.
-2. **Compute constraints.** Moving from pandas (CPU) to cudf/cupy (GPU) to handle larger datasets within reasonable timeframes. Before we can feed more data
+2. **Compute constraints.** The focus has shifted from "port to GPU" to "algorithmic optimization" — breaking out of row-by-row loops in signal generation and backtesting. GPU acceleration is a secondary layer applied after eliminating sequential Python loops. Indicator math is already vectorized; the remaining bottlenecks are state machine loops (sparse-event optimization applied, backtesting loop-breaking pending).
 
 ## Hardware
 This is the hardware this project was built on
@@ -85,8 +85,8 @@ v6/
   orchestrate_calibration.py  # WFV orchestrator — runs calibration windows in parallel
   optuna_calibrate_vm.py      # Bayesian optimization for VM strategy
   optuna_calibrate_tv.py      # Bayesian optimization for TV strategy
-  generate_vm_automation_logic_signals.py   # Signal generation (VM)
-  generate_tv_strategy1_signals.py          # Signal generation (TV)
+  generate_vm_automation_logic_signals.py   # Signal generation (VM) — sparse event loop, `--gpu` flag
+  generate_tv_strategy1_signals.py          # Signal generation (TV) — sparse event loop, `--gpu` flag
   backtest_xauusd_signal_csv.py             # Backtesting engine
   config.json                         # Baseline parameters
   calibration_results_vm.json         # Runtime calibration overrides
@@ -100,7 +100,7 @@ v6/
 - [x] Phase 1 — GPU shift (cudf/cupy dispatch paths in all indicators + helpers)
 - [x] Phase 2 — Orchestration & parallelism (VRAM-based worker limits, pre-sliced data per window)
 - [x] Phase 3 — Validation & cleanup (parity tests passed, logging integrated, dead state removed)
-- [ ] Phase 4 — GPU-accelerated signal generation and backtesting engine
+- [ ] Phase 4 — Algorithmic optimization (sparse event loops in signal generators, GPU data loading via `--gpu` flag, backtesting loop-breaking pending)
 
 ## Key files to read first
 
