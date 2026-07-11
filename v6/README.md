@@ -105,7 +105,11 @@ v6/
 ## Key files to read first
 
 1. `PLAN.md` — roadmap, current task, implementation notes, benchmarks
-3. `AGENTS.md` (root level) — development conventions and operational rules
+2. `AGENTS.md` (root level) — development conventions and operational rules
+
+## About `AGENTS.md`
+
+This repo includes `AGENTS.md` at the root — an unconventional addition for a public GitHub upload. It was written as instructions for an AI coding agent (the same tool used to build and iterate this project). If you're downloading this repo to continue the work with your own agents or to understand the system, start there. It contains the project vision, architecture, operational rules, and all developer commands you need to run the pipeline.
 
 ## Dependencies
 
