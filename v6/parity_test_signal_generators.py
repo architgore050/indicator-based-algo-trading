@@ -1,15 +1,20 @@
-"""Parity test: backup vs refactored signal generators.
+"""Parity test: backup vs refactored signal generators, or GPU vs CPU modes.
 
 Runs both .bak and current versions in smoke mode from the project directory,
 compares output CSVs row-by-row. Measures execution time to quantify improvements.
 
-Usage (Windows):
+With --gpu-parity flag (WSL only): compares --gpu vs no --gpu on current script.
+
+Usage (Windows — backup parity only):
     cd v6 && python parity_test_signal_generators.py
     cd v6 && python parity_test_signal_generators.py --start-row 2000000 --end-row 2500000 --runs 5
 
-Usage (WSL):
+Usage (WSL — GPU parity):
+    cd v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python parity_test_signal_generators.py --gpu-parity
+    cd v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python parity_test_signal_generators.py --gpu-parity --strategy vm --start-row 2000000 --end-row 2500000
+
+Usage (WSL — backup parity):
     cd v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python parity_test_signal_generators.py
-    cd v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python parity_test_signal_generators.py --start-row 2000000 --end-row 2500000 --runs 5
 """
 
 from __future__ import annotations
@@ -229,12 +234,101 @@ def run_test(current: Path, backup: Path, label: str, start_row: int = 0, end_ro
     return comparison
 
 
+def run_signal_script_gpu(script: Path, label: str, start_row: int = 0, end_row: int = 4000000) -> tuple[pd.DataFrame, float]:
+    """Run a signal generator script in smoke mode with --gpu flag. Returns (DataFrame, elapsed_seconds)."""
+    cmd = [sys.executable, str(script), "--mode", "smoke", "--start-row", str(start_row), "--end-row", str(end_row), "--gpu"]
+    logger.info("Running (GPU): %s", " ".join(cmd))
+    start = time.perf_counter()
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=str(PROJECT_DIR),
+    )
+    elapsed = time.perf_counter() - start
+    if result.returncode != 0:
+        logger.error("GPU script failed (STDOUT):\n%s", result.stdout[-2000:] if result.stdout else "(empty)")
+        logger.error("GPU script failed (STDERR):\n%s", result.stderr[-2000:] if result.stderr else "(empty)")
+        raise RuntimeError(f"GPU script {script.name} failed with code {result.returncode}")
+
+    output_path = _find_smoke_csv(PROJECT_DIR, label)
+    if output_path is None:
+        for line in result.stdout.strip().splitlines():
+            if "Wrote" in line:
+                reported = Path(line.split("Wrote")[-1].strip())
+                if reported.exists():
+                    return load_signal_csv(reported), elapsed
+        raise RuntimeError(f"Could not find GPU output CSV from {script.name}")
+
+    return load_signal_csv(output_path), elapsed
+
+
+def run_gpu_parity_test(current: Path, label: str, start_row: int = 0, end_row: int = 4000000) -> dict:
+    """Compare GPU-mode vs CPU-mode signal generation for parity.
+
+    Runs the current script twice — once with --gpu, once without — and compares outputs.
+    Returns pass/fail details plus timing comparison.
+    """
+    logger.info("=" * 60)
+    logger.info("GPU PARITY TEST: %s (rows %d–%d)", label, start_row, end_row)
+    logger.info("=" * 60)
+
+    # Clean up any existing smoke CSVs
+    for f in PROJECT_DIR.glob("*_smoke.csv"):
+        f.unlink()
+
+    try:
+        cpu_df, cpu_time = run_signal_script(current, f"{label}_cpu", start_row, end_row)
+    except Exception as e:
+        logger.error("CPU script failed: %s", e)
+        for f in PROJECT_DIR.glob("*_smoke.csv"):
+            f.unlink()
+        return {"passed": False, "details": [f"CPU baseline failed: {e}"], "timing": None, "gpu_available": False}
+
+    try:
+        gpu_df, gpu_time = run_signal_script_gpu(current, f"{label}_gpu", start_row, end_row)
+    except Exception as e:
+        logger.error("GPU script failed (GPU mode may not be available): %s", e)
+        # Clean up smoke CSVs
+        for f in PROJECT_DIR.glob("*_smoke.csv"):
+            f.unlink()
+        return {"passed": False, "details": [f"GPU path unavailable: {e}"], "timing": None, "gpu_available": False}
+
+    comparison = compare_dataframes(cpu_df, gpu_df, f"{label} CPU", f"{label} GPU")
+
+    speedup = cpu_time / gpu_time if gpu_time > 0 else float("inf")
+    if speedup > 1:
+        speedup_str = f"{speedup:.2f}x FASTER (GPU)"
+    elif speedup < 1:
+        speedup_str = f"{1/speedup:.2f}x SLOWER (GPU)"
+    else:
+        speedup_str = "same speed"
+
+    comparison["timing"] = {
+        "cpu_seconds": round(cpu_time, 3),
+        "gpu_seconds": round(gpu_time, 3),
+        "speedup": round(speedup, 2),
+        "speedup_display": speedup_str,
+    }
+
+    status = "PASS" if comparison["passed"] else "FAIL"
+    logger.info("[%s] %s GPU parity: %s | Time: CPU=%.3fs, GPU=%.3fs (%s)", status, label, "; ".join(comparison["details"]), cpu_time, gpu_time, speedup_str)
+
+    # Clean up smoke CSVs
+    for f in PROJECT_DIR.glob("*_smoke.csv"):
+        f.unlink()
+
+    return comparison
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parity test for signal generators")
     parser.add_argument("--strategy", choices=["vm", "tv", "all"], default="all")
     parser.add_argument("--start-row", type=int, default=0, help="Start row in data.csv (default=0 = full file)")
     parser.add_argument("--end-row", type=int, default=4000000, help="End row in data.csv (default=4000000)")
     parser.add_argument("--runs", type=int, default=1, help="Number of repeated runs for statistical stability (default=1)")
+    parser.add_argument("--gpu-parity", action="store_true", help="Run GPU vs CPU parity test instead of backup vs current.")
     args = parser.parse_args()
 
     if args.start_row >= args.end_row:
@@ -246,41 +340,78 @@ def main() -> None:
 
     all_results = {}
 
-    for run_num in range(1, args.runs + 1):
-        logger.info("=" * 80)
-        logger.info("RUN %d / %d", run_num, args.runs)
-        logger.info("=" * 80)
+    if args.gpu_parity:
+        # GPU parity mode: compare --gpu vs no --gpu on current script
+        for run_num in range(1, args.runs + 1):
+            logger.info("=" * 80)
+            logger.info("GPU PARITY RUN %d / %d", run_num, args.runs)
+            logger.info("=" * 80)
 
-        results = {}
+            results = {}
 
-        if args.strategy in ("vm", "all"):
-            if not VM_BACKUP.exists():
-                logger.error("Backup not found: %s", VM_BACKUP)
-            else:
-                results["VM"] = run_test(VM_CURRENT, VM_BACKUP, "VM", args.start_row, args.end_row)
+            if args.strategy in ("vm", "all"):
+                results["VM"] = run_gpu_parity_test(VM_CURRENT, "VM", args.start_row, args.end_row)
 
-        if args.strategy in ("tv", "all"):
-            if not TV_BACKUP.exists():
-                logger.error("Backup not found: %s", TV_BACKUP)
-            else:
-                results["TV"] = run_test(TV_CURRENT, TV_BACKUP, "TV", args.start_row, args.end_row)
+            if args.strategy in ("tv", "all"):
+                results["TV"] = run_gpu_parity_test(TV_CURRENT, "TV", args.start_row, args.end_row)
 
-        for label, result in results.items():
-            key = f"{label}_run{run_num}"
-            all_results[key] = result
+            for label, result in results.items():
+                key = f"{label}_gpu_run{run_num}"
+                all_results[key] = result
 
-        # Per-run summary
-        logger.info("=" * 60)
-        logger.info("RUN %d SUMMARY", run_num)
-        logger.info("=" * 60)
-        for label, result in results.items():
-            status = "PASS" if result["passed"] else "FAIL"
-            logger.info("[%s] %s", status, label)
-            for detail in result["details"]:
-                logger.info("  - %s", detail)
-            timing = result.get("timing")
-            if timing:
-                logger.info("  - Time: backup=%.3fs, current=%.3fs (%s)", timing["backup_seconds"], timing["current_seconds"], timing["speedup_display"])
+            logger.info("=" * 60)
+            logger.info("GPU PARITY RUN %d SUMMARY", run_num)
+            logger.info("=" * 60)
+            for label, result in results.items():
+                status = "PASS" if result["passed"] else "FAIL"
+                logger.info("[%s] %s GPU parity", status, label)
+                for detail in result["details"]:
+                    logger.info("  - %s", detail)
+                timing = result.get("timing")
+                if timing:
+                    gpu_avail = timing.get("gpu_available", True)
+                    if not gpu_avail:
+                        logger.info("  - GPU not available in this environment")
+                    else:
+                        logger.info("  - Time: CPU=%.3fs, GPU=%.3fs (%s)", timing["cpu_seconds"], timing["gpu_seconds"], timing["speedup_display"])
+
+    else:
+        # Original backup vs current parity mode
+        for run_num in range(1, args.runs + 1):
+            logger.info("=" * 80)
+            logger.info("RUN %d / %d", run_num, args.runs)
+            logger.info("=" * 80)
+
+            results = {}
+
+            if args.strategy in ("vm", "all"):
+                if not VM_BACKUP.exists():
+                    logger.error("Backup not found: %s", VM_BACKUP)
+                else:
+                    results["VM"] = run_test(VM_CURRENT, VM_BACKUP, "VM", args.start_row, args.end_row)
+
+            if args.strategy in ("tv", "all"):
+                if not TV_BACKUP.exists():
+                    logger.error("Backup not found: %s", TV_BACKUP)
+                else:
+                    results["TV"] = run_test(TV_CURRENT, TV_BACKUP, "TV", args.start_row, args.end_row)
+
+            for label, result in results.items():
+                key = f"{label}_run{run_num}"
+                all_results[key] = result
+
+            # Per-run summary
+            logger.info("=" * 60)
+            logger.info("RUN %d SUMMARY", run_num)
+            logger.info("=" * 60)
+            for label, result in results.items():
+                status = "PASS" if result["passed"] else "FAIL"
+                logger.info("[%s] %s", status, label)
+                for detail in result["details"]:
+                    logger.info("  - %s", detail)
+                timing = result.get("timing")
+                if timing:
+                    logger.info("  - Time: backup=%.3fs, current=%.3fs (%s)", timing["backup_seconds"], timing["current_seconds"], timing["speedup_display"])
 
     # Overall stats across all runs
     logger.info("=" * 80)
@@ -301,32 +432,65 @@ def main() -> None:
         if not run_times:
             continue
 
-        backup_times = [t["backup_seconds"] for t in run_times]
-        current_times = [t["current_seconds"] for t in run_times]
-        speedups = [t["speedup"] for t in run_times]
+        gpu_avail_runs = [t for t in run_times if t.get("gpu_available", True)]
 
-        avg_backup = sum(backup_times) / len(backup_times)
-        avg_current = sum(current_times) / len(current_times)
-        avg_speedup = sum(speedups) / len(speedups)
-        min_speedup = min(speedups)
-        max_speedup = max(speedups)
+        if args.gpu_parity:
+            if not gpu_avail_runs:
+                logger.info("[%s] %s (%d rows): GPU not available in this environment", "INFO" if all(not t.get("gpu_available", True) for t in run_times) else "PASS", label, data_rows)
+                continue
 
-        if avg_current > 0:
-            overall_speedup = avg_backup / avg_current
-            if overall_speedup > 1:
-                overall_str = f"{overall_speedup:.2f}x FASTER"
-            elif overall_speedup < 1:
-                overall_str = f"{1/overall_speedup:.2f}x SLOWER"
+            cpu_times = [t["cpu_seconds"] for t in gpu_avail_runs]
+            gpu_times_list = [t["gpu_seconds"] for t in gpu_avail_runs]
+            speedups = [t["speedup"] for t in gpu_avail_runs]
+
+            avg_cpu = sum(cpu_times) / len(cpu_times)
+            avg_gpu = sum(gpu_times_list) / len(gpu_times_list)
+            avg_speedup = sum(speedups) / len(speedups)
+            min_speedup = min(speedups)
+            max_speedup = max(speedups)
+
+            if avg_gpu > 0:
+                overall_speedup = avg_cpu / avg_gpu
+                if overall_speedup > 1:
+                    overall_str = f"{overall_speedup:.2f}x FASTER (GPU)"
+                elif overall_speedup < 1:
+                    overall_str = f"{1/overall_speedup:.2f}x SLOWER (GPU)"
+                else:
+                    overall_str = "same speed"
             else:
-                overall_str = "same speed"
-        else:
-            overall_str = "N/A"
+                overall_str = "N/A"
 
-        status = "PASS" if all(t["backup_seconds"] > 0 and t["current_seconds"] > 0 for t in run_times) else "FAIL"
-        logger.info("[%s] %s (%d rows):", status, label, data_rows)
-        logger.info("  Backup:  avg=%.3fs  min=%.3fs  max=%.3fs", avg_backup, min(backup_times), max(backup_times))
-        logger.info("  Current: avg=%.3fs  min=%.3fs  max=%.3fs", avg_current, min(current_times), max(current_times))
-        logger.info("  Speedup: avg=%.2fx  range=[%.2fx – %.2fx]  (%s)", avg_speedup, min_speedup, max_speedup, overall_str)
+            logger.info("[%s] %s (%d rows):", "PASS" if all(t.get("gpu_available", True) for t in run_times) else "INFO", label, data_rows)
+            logger.info("  CPU:   avg=%.3fs  min=%.3fs  max=%.3fs", avg_cpu, min(cpu_times), max(cpu_times))
+            logger.info("  GPU:   avg=%.3fs  min=%.3fs  max=%.3fs", avg_gpu, min(gpu_times_list), max(gpu_times_list))
+            logger.info("  Speedup: avg=%.2fx  range=[%.2fx – %.2fx]  (%s)", avg_speedup, min_speedup, max_speedup, overall_str)
+        else:
+            backup_times = [t["backup_seconds"] for t in run_times]
+            current_times = [t["current_seconds"] for t in run_times]
+            speedups = [t["speedup"] for t in run_times]
+
+            avg_backup = sum(backup_times) / len(backup_times)
+            avg_current = sum(current_times) / len(current_times)
+            avg_speedup = sum(speedups) / len(speedups)
+            min_speedup = min(speedups)
+            max_speedup = max(speedups)
+
+            if avg_current > 0:
+                overall_speedup = avg_backup / avg_current
+                if overall_speedup > 1:
+                    overall_str = f"{overall_speedup:.2f}x FASTER"
+                elif overall_speedup < 1:
+                    overall_str = f"{1/overall_speedup:.2f}x SLOWER"
+                else:
+                    overall_str = "same speed"
+            else:
+                overall_str = "N/A"
+
+            status = "PASS" if all(t["backup_seconds"] > 0 and t["current_seconds"] > 0 for t in run_times) else "FAIL"
+            logger.info("[%s] %s (%d rows):", status, label, data_rows)
+            logger.info("  Backup:  avg=%.3fs  min=%.3fs  max=%.3fs", avg_backup, min(backup_times), max(backup_times))
+            logger.info("  Current: avg=%.3fs  min=%.3fs  max=%.3fs", avg_current, min(current_times), max(current_times))
+            logger.info("  Speedup: avg=%.2fx  range=[%.2fx – %.2fx]  (%s)", avg_speedup, min_speedup, max_speedup, overall_str)
 
     if not all_results:
         logger.error("No tests ran. Check backup files exist.")
