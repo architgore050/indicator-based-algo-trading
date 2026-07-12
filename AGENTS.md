@@ -191,4 +191,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Legacy v2–v5 directories have been retired.** They no longer exist in the workspace. No migration awareness needed.
 
 ---
-*Last updated: 2026-07-11 — Added algorithmic soundness by component section. Phase 4 vision updated from "GPU porting" to "algorithmic optimization — break out of loops." Signal generators now use sparse event loops (100x fewer iterations) + pre-computed reasons. Corrected file locations: PLAN.md at root, removed legacy v2-v5 references, removed non-existent GEMINI.md/definitions_backup.py references, added missing config/data/validation files to architecture table.*
+*Last updated: 2026-07-11 — Added algorithmic soundness by component section. Phase 4 vision updated from "GPU porting" to "algorithmic optimization — break out of loops." Signal generators now use sparse event loops (100x fewer iterations) + pre-computed reasons.*

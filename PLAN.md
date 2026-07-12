@@ -3,7 +3,7 @@
 ## 🚨 CRITICAL INSTRUCTION FOR NEXT AGENT
 If you are reading this, the previous session has ended. You are tasked with continuing the optimization of this project. **Do not start from scratch.** Follow these steps immediately to resume work:
 
-1.  **Read `v6/GEMINI.md`**: This contains the core architecture, strategy logic, and system metadata.
+1.  **Read `AGENTS.md`** (root): This contains the core architecture, strategy logic, and system metadata.
 2.  **Read this `PLAN.md`**: This is your current roadmap and state tracker.
 3.  **Check the "Current Task" section**: See exactly what was being worked on.
 4.  **Verify Environment**: Check if `cudf` or `cupy` are available in the environment to support GPU acceleration.
@@ -47,7 +47,7 @@ This project is a high-performance algorithmic trading system for XAUUSD (Gold).
 ### Phase 3: Validation & Cleanup
 - [x] **Task 3.1: Parity Testing**: Run smoke tests comparing refactored `definitions.py` vs `definitions_backup.py`. — DONE (all 11 helper functions + all 9 indicator functions pass)
 - [x] **Task 3.2: Logging & Output Cleanup**: Add structured logging module with centralized error/warning capture, suppress pandas deprecation warnings at import time, redirect logs to files per window/process. — DONE (`logging_utils.py` created + integrated into all 6 consumer scripts; pandas warnings suppressed; per-worker log files enabled)
-- [x] **Task 3.3: Final Documentation**: Create `GEMINI.md` with all GPU-accelerated function docs, architecture, and lessons learned. — DONE (v6/GEMINI.md created with full project documentation)
+- [x] **Task 3.3: Final Documentation**: Consolidate all GPU-accelerated function docs, architecture, and lessons learned into `AGENTS.md`. — DONE (content merged into root AGENTS.md)
 
 ### Phase 4: Algorithmic Optimization — Breaking Out of Loops
 The bottleneck is no longer indicator math (already vectorized). The real cost comes from row-by-row Python loops in signal generation and backtesting, plus Optuna's Bayesian search overhead. This phase focuses on **algorithmic improvements**, not GPU porting.
@@ -69,7 +69,7 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 ### ✅ Phase 2 & 3 Complete — VRAM Limits, Logging, Cleanup (2026-07-10)
 - **Phase 2 Task 2.2**: VRAM-based worker limits added to `orchestrate_calibration.py` — `detect_available_vram_gb()`, `estimate_vram_per_worker()` (2.0 GB/worker), `compute_safe_worker_count()` (75% safety factor, fallback to 4 workers). Prevents GPU saturation crashes.
 - **Phase 3 Task 3.2**: Structured logging via `logging_utils.py` integrated into all 6 consumer scripts. Pandas deprecation warnings suppressed at import time. Per-worker log files enabled (`worker_1_log.txt`, etc.).
-- **Phase 3 Task 3.3**: `v6/GEMINI.md` created with full project documentation. `shared_history` dead state removed from `orchestrate_calibration.py` (5 locations cleaned up).
+- **Phase 3 Task 3.3**: Project documentation consolidated into root `AGENTS.md`. `shared_history` dead state removed from `orchestrate_calibration.py` (5 locations cleaned up).
 - **Phase 1 Task 1.3**: `v6/gpu_io.py` created with `load_csv_to_gpu()`, `gpu_to_csv()`, `gpu_to_csv_safe()` helpers. Chunked I/O for large files. Atomic writes.
 - **Cleanup**: Deleted stale `v6/data.parquet` (83 MB, violates CSV-only convention). Deleted stale `v6_gpu_venv` (WSL rapids conda env has all needed packages).
 
@@ -158,7 +158,7 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 11. [x] Clean up unused `shared_history` reads in orchestrate_calibration.py — DONE (removed dead state, 5 locations cleaned)
 12. [x] Add structured logging module with centralized error/warning capture, suppress pandas deprecation warnings, redirect logs to files per window/process — DONE (logging_utils.py + integration into all 6 scripts)
 13. [x] Create `v6/gpu_io.py` with `load_csv_to_gpu()` and `gpu_to_csv()` helpers — DONE
-14. [x] Create `v6/GEMINI.md` documentation — DONE
+14. [x] Consolidate all project documentation into root `AGENTS.md` — DONE
 15. [ ] Run GPU parity tests: feed cudf DataFrames into indicator functions, convert results to pandas, compare against pure-pandas outputs for all 11 helpers + 9 indicators (atol=1e-8)
 16. [x] **Phase 4 Task 4.1**: Sparse event loop optimization — `np.where(has_event)[0]` reduces loop iterations from O(n) to O(events) where events are typically 0.1-1% of bars (both VM + TV)
 17. [x] **Phase 4 Task 4.2**: GPU data loading via `--gpu` flag — uses `gpu_io.load_csv_to_gpu()` when available, falls back to pandas. Indicator computation auto-dispatches via definitions.py
@@ -196,7 +196,7 @@ python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --outp
 - Deleted: `v6_gpu_venv` directory (WSL `rapids` conda environment has all needed CPU packages; venv was redundant)
 - Removed: `shared_history` dead state from `orchestrate_calibration.py` (5 locations: function param, 2x .append() calls, manager.list() creation, executor.submit() arg)
 - Created: `v6/gpu_io.py` (GPU I/O helpers: load_csv_to_gpu, gpu_to_csv, gpu_to_csv_safe)
-- Created: `v6/GEMINI.md` (full project documentation)
+- Consolidated all project documentation into root `AGENTS.md`
 - Integrated: `logging_utils.py` into all 6 consumer scripts (suppress_pandas_warnings, setup_root_logger, get_logger)
 - Updated: `PLAN.md` (Phase 1.3, 2.1, 2.2, 3.1, 3.2, 3.3 marked complete; TODO list updated)
 - Updated: `AGENTS.md` (roadmap updated to reflect Phase 4 as current focus)
