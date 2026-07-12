@@ -41,7 +41,10 @@ Two strategies are being tested:
 - **VM** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD
 - **TV** — Inspired by TradingView community indicators (TDI, Loxx, Donutian Bands)
 
-Both use Walk-Forward Validation: annual global parameter search with monthly local fine-tuning.
+Both use Walk-Forward Validation with two calibration layers:
+
+- **Annual calibration** — broad Bayesian optimization across multiple regimes to find generalized parameters that work well in varied market conditions.
+- **Per-window calibration** — focused optimization on the current in-sample window to adapt to the active regime (trending, ranging, volatile, etc.). Each new data window gets its own recalibration so the system stays aligned with present-market dynamics rather than relying solely on historical generalization.
 
 ## Setup
 
