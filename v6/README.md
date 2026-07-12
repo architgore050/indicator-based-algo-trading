@@ -1,5 +1,7 @@
 # XAUUSD Algorithmic Trading System (v6)
 
+**⚠️ This is an active work-in-progress research project — not production code, not a finished product.**
+
 Prototype research system for XAUUSD (Gold) using Walk-Forward Validation with Bayesian Optimization. Not production-ready and currently not profitable in backtesting.
 
 ## What this is
@@ -43,8 +45,8 @@ Two strategies are being tested:
 
 Both use Walk-Forward Validation with two calibration layers:
 
-- **Annual calibration** — broad Bayesian optimization across multiple regimes to find generalized parameters that work well in varied market conditions.
-- **Per-window calibration** — focused optimization on the current in-sample window to adapt to the active regime (trending, ranging, volatile, etc.). Each new data window gets its own recalibration so the system stays aligned with present-market dynamics rather than relying solely on historical generalization.
+- **Annual calibration** — full Bayesian optimization search across multiple regimes to *learn* generalized parameters that work well in varied market conditions. This is the actual parameter-learning step.
+- **Per-window recalibration** — a lightweight nudge, not independent learning. Each new window starts from the annually-calibrated baseline and makes small adjustments to track the current regime (trending, ranging, volatile, etc.). It does *not* learn parameters from scratch — it only refines what annual calibration already established. The in-sample windows used here are too short for meaningful standalone optimization; their purpose is regime alignment, not discovery.
 
 ## Setup
 
