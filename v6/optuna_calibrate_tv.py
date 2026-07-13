@@ -44,37 +44,13 @@ def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
     return (left.shift(1) >= right.shift(1)) & (left < right)
 
 def clean_bool(series: pd.Series) -> pd.Series:
+    """Ensures a series is boolean and fills NaNs with False."""
+    if series.dtype == bool:
+        return series.fillna(False)
     return series.fillna(False).astype(bool)
 
 # We import run_backtest and score_results directly from the backtest script to ensure parity
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
-
-def checkpoint_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> bool:
-    """Returns True if the trial should be pruned (catastrophic failure detected)."""
-    # Truncate data to first 25%
-    limit = int(len(data) * 0.25)
-    subset_data = data.iloc[:limit]
-    subset_signals = signals[signals["timestamp"] <= subset_data["timestamp"].iloc[-1]]
-    
-    if subset_signals.empty:
-        return False
-        
-    trades, equity, _, _ = run_backtest(subset_data, subset_signals)
-    if trades.empty:
-        return False
-        
-    # Check catastrophic failure conditions
-    # 1. Margin Call Check (simplified proxy: equity drops below initial * 0.5)
-    if equity["equity_usd"].iloc[-1] < (CONFIG["backtesting_params"]["initial_capital_usd"] * 0.5):
-        return True
-    
-    # 2. Drawdown Check (>50%)
-    peak = equity["equity_usd"].cummax()
-    dd = (peak - equity["equity_usd"]) / peak
-    if dd.max() > 0.5:
-        return True
-        
-    return False
 
 # ---------------------------------------------------------------------------
 # Logging & Config
@@ -209,7 +185,10 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict) -> pd.DataFrame:
     lx_arr = long_exit.to_numpy()
     sx_arr = short_exit.to_numpy()
 
-    for i in range(len(data)):
+    # Sparse event iteration — only visit bars where something happens
+    all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
+
+    for i in all_event_indices:
         sig, act = None, None
         if position == 0:
             if buy_arr[i]:
@@ -236,17 +215,23 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     if signals.empty:
         return -9999.0
     
-    # Pruning Check: 25% early fail
-    if checkpoint_backtest(data, signals):
-        raise optuna.exceptions.TrialPruned("Catastrophic failure detected in first 25% of data.")
-    
-    # 2. Run Backtest (Silent mode)
-    # We use a custom backtest wrapper that doesn't print or plot
+    # 2. Run Backtest ONCE (checkpoint logic merged here)
     trades, equity, _, _ = run_backtest(data, signals)
     if trades.empty:
         return -8888.0
-
-    # 3. Score Results (Penalty-based)
+    
+    # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
+    limit = int(len(data) * 0.25)
+    early_equity = equity[equity["timestamp"] <= data["timestamp"].iloc[limit]]
+    if not early_equity.empty:
+        if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
+            raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
+        peak = early_equity["equity_usd"].cummax()
+        dd = (peak - early_equity["equity_usd"]) / peak
+        if dd.max() > 0.5:
+            raise optuna.exceptions.TrialPruned("Drawdown >50% in first 25%.")
+    
+    # 4. Score Results (unchanged)
     summary = compute_summary(trades, equity, signals, Path("dummy.csv"), data)
     
     sharpe = summary.get("sharpe_ratio", 0)
@@ -256,25 +241,28 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     trades_per_day = len(trades) / max(1, (data["timestamp"].iloc[-1] - data["timestamp"].iloc[0]).days)
     
     penalty = 0.0
-    # Activity Penalty
     if trades_per_day < CONSTRAINTS["min_trades_per_day"]:
         penalty += (CONSTRAINTS["min_trades_per_day"] - trades_per_day) * CONSTRAINTS["penalty_weight_trades"]
     elif trades_per_day > CONSTRAINTS["max_trades_per_day"]:
         penalty += (trades_per_day - CONSTRAINTS["max_trades_per_day"]) * (CONSTRAINTS["penalty_weight_trades"] / 2.0)
         
-    # Risk Penalty
     if cagr < CONSTRAINTS["min_cagr_pct"]:
         penalty += (CONSTRAINTS["min_cagr_pct"] - cagr) * CONSTRAINTS["penalty_weight_risk"]
     if max_dd > CONSTRAINTS["max_max_drawdown_pct"]:
         penalty += (max_dd - CONSTRAINTS["max_max_drawdown_pct"]) * CONSTRAINTS["penalty_weight_risk"]
         
-    # Balanced SOTA Score
     objective_score = ((sharpe + calmar) / 2.0) - penalty
     return float(objective_score)
 
 # ---------------------------------------------------------------------------
 # Parallel Optimization
 # ---------------------------------------------------------------------------
+
+def get_optimal_n_jobs():
+    """Return optimal parallel workers for Optuna."""
+    cpu_count = multiprocessing.cpu_count()
+    return min(cpu_count, 12)
+
 
 def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None):
     study = optuna.create_study(
@@ -323,7 +311,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
         
         return objective_wrapper(trial_params, data)
 
-    n_jobs = 4
+    n_jobs = get_optimal_n_jobs()
     for attempt in range(3):
         try:
             study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)

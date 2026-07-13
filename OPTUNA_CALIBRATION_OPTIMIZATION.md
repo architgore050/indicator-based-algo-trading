@@ -50,16 +50,18 @@ for i in all_event_indices:
 ```
 
 ### VM-specific notes (`optuna_calibrate_vm.py`)
-- Lines 192-221: The loop with `tqdm` wrapper. Replace entirely.
+- Lines 192-221: The loop with `tqdm` wrapper. Replace entirely. retain progress bar aesthetics for output
 - Keep the `buy_arr`, `sell_arr`, `lx_arr`, `sx_arr` boolean numpy arrays — they're already computed correctly above the loop.
-- Remove the outer `tqdm(total=5)` around indicator steps if you keep them; indicators are vectorized and fast. The progress bar is cosmetic overhead.
+- Remove the outer `tqdm(total=5)`, this is hardcoded. apply more dynamic programming throughout the script
 
 ### TV-specific notes (`optuna_calibrate_tv.py`)
 - Lines 203-226: Same pattern, different variable names (`lx_arr` = `long_exit`, `sx_arr` = `short_exit`).
 - Note: TV uses `"SELLBACK"` and `"BUYBACK"` as signal strings — preserve these exactly.
 
 ### Verification
-Run both scripts with `--smoke --end-row 50000` and diff the output signal CSVs against baseline runs. Signal count, timestamps, and actions must match exactly.
+- make backup files before makign any changes so you can test for parity against backup code
+- Write parity testing script that tests for similar output (within tollerance) and measures speeds to check for improvements in computation speed.
+- Run both scripts with `--smoke --end-row 50000` and diff the output signal CSVs against baseline runs. Signal count, timestamps, and actions must match exactly.
 
 ---
 
@@ -123,6 +125,7 @@ def objective_wrapper(params, data, trial_id="trial"):
 ```
 
 **Recommendation:** Option B preserves exact pruning semantics and eliminates the redundant backtest call. Apply to both files.
+But again, this suggestion is bad code as it has various hard coded valuesd and is not dynamic coding, it only shows example logic. look at `v6/config.json` to check for pre defined values for you to use throughout the code.
 
 ---
 
@@ -201,7 +204,7 @@ def calculate_with_cache(func_name, func, data_hash, params):
 **Important:** Cache key must include `data_hash` (hash of data shape + first/last timestamp) to avoid cross-window contamination. Clear cache between WFV windows if needed.
 
 ### Scope
-This is a pure optimization — no correctness risk since the underlying functions are deterministic. Apply to both scripts' signal generation wrappers.
+This is a pure optimization — no correctness risk since the underlying functions are deterministic. Apply to both scripts' signal generation wrappers. However, re-read this section of the code to check for bugs or logical discrepencies yourself.
 
 ---
 
@@ -333,8 +336,11 @@ Merge into a single section:
 
 Update both scripts to reference the unified section consistently. Remove the `"phases"` key entirely.
 
+### Caution
+Some of the content in config.json is belongign to legacy systems and has redundant naming conventions. naming is missleadign and you must apply search tools using powershell or bash tools to find what part of the config is beign used where for what to actually check the function of each parameter.
+
 ### Verification
-No behavioral change expected. Just ensure all config references in both scripts resolve correctly after merge.
+No behavioral change expected. Just ensure all config references in both scripts resolve correctly after merge. Make sure to re-read your own work to get sa qualitative verification fo correctness since quantitative correctness checking is unsuitable for this use case.
 
 ---
 
@@ -360,6 +366,8 @@ Then pass `--gpu` from the orchestrator when spawning calibration subprocesses.
 - GPU path requires `cupy` and CUDA availability via WSL. The orchestrator should detect this before passing `--gpu`.
 - The state machine loop (now sparse, per P0) remains CPU-bound — only indicator math moves to GPU.
 - Expect 20-40% speedup in the indicator phase, which is called O(trials) times per calibration run.
+- Your agentic environment tools suffer at usign wsl correctly, and various scripts are meant for humans, generating long unstructured outputs. it is best to come back to user for testing. user is a vibe coder, he does no know exact command on how to use the scripts, you will have to tell him.
+- GPU based infrastructure requires passing around `cudf.DataFrame` objects instead of `pandas.DataFrame` objects, although they still can work with pandas objects. the other scripts in this code base are designed to do cpu based inference when receaving pandas dataframes and gpu based inference when receaving cudf based dataframes.
 
 ### Verification
 Run with and without `--gpu` on a smoke test. Compare signal outputs — they must match within floating-point tolerance (`atol=1e-8`).

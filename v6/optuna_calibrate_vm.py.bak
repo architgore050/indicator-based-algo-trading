@@ -47,18 +47,38 @@ def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
 
 def clean_bool(series: pd.Series) -> pd.Series:
     """Ensures a series is boolean and fills NaNs with False."""
-    if series.dtype == bool:
-        return series.fillna(False)
     return series.fillna(False).astype(bool)
 
 def recent(series: pd.Series, bars: int) -> pd.Series:
     """Returns True if any value in the lookback period is True."""
     return clean_bool(series).rolling(max(1, int(bars)), min_periods=1).max().astype(bool)
 
-def get_optimal_n_jobs():
-    """Return optimal parallel workers for Optuna."""
-    cpu_count = multiprocessing.cpu_count()
-    return min(cpu_count, 12)
+def checkpoint_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> bool:
+    """Returns True if the trial should be pruned (catastrophic failure detected)."""
+    # Truncate data to first 25%
+    limit = int(len(data) * 0.25)
+    subset_data = data.iloc[:limit]
+    subset_signals = signals[signals["timestamp"] <= subset_data["timestamp"].iloc[-1]]
+    
+    if subset_signals.empty:
+        return False
+        
+    trades, equity, _, _ = run_backtest(subset_data, subset_signals)
+    if trades.empty:
+        return False
+        
+    # Check catastrophic failure conditions
+    # 1. Margin Call Check (simplified proxy: equity drops below initial * 0.5)
+    if equity["equity_usd"].iloc[-1] < (CONFIG["backtesting_params"]["initial_capital_usd"] * 0.5):
+        return True
+    
+    # 2. Drawdown Check (>50%)
+    peak = equity["equity_usd"].cummax()
+    dd = (peak - equity["equity_usd"]) / peak
+    if dd.max() > 0.5:
+        return True
+        
+    return False
 
 # ---------------------------------------------------------------------------
 # Logging & Config
@@ -111,7 +131,7 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
 def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
     p = {**VM_DEFAULTS, **params}
     
-    with tqdm(total=4, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
+    with tqdm(total=5, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
         multi_rsi = calculate_multi_rsi_plus(
             data, 
             p1=p["multi_rsi_p1"], 
@@ -178,10 +198,7 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
         lx_arr = clean_bool(long_exit).to_numpy()
         sx_arr = clean_bool(short_exit).to_numpy()
 
-        # Sparse event iteration — only visit bars where something happens
-        all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
-
-        for i in all_event_indices:
+        for i in tqdm(range(len(data)), desc=f"Trial {trial_id} signal scan", unit="bar", leave=False):
             sig, act = None, None
             if position == 0:
                 if buy_arr[i]:
@@ -201,7 +218,6 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
             
             if sig:
                 rows.append({"timestamp": timestamps[i], "signal": sig, "action": act})
-
         pbar.update()
 
     return pd.DataFrame(rows)
@@ -216,23 +232,16 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
     if signals.empty:
         return -9999.0
     
-    # 2. Run Backtest ONCE (checkpoint logic merged here)
+    # Pruning Check: 25% early fail
+    if checkpoint_backtest(data, signals):
+        raise optuna.exceptions.TrialPruned("Catastrophic failure detected in first 25% of data.")
+    
+    # 2. Run Backtest
     trades, equity, _, _ = run_backtest(data, signals)
     if trades.empty:
         return -8888.0
-    
-    # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
-    limit = int(len(data) * 0.25)
-    early_equity = equity[equity["timestamp"] <= data["timestamp"].iloc[limit]]
-    if not early_equity.empty:
-        if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
-            raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
-        peak = early_equity["equity_usd"].cummax()
-        dd = (peak - early_equity["equity_usd"]) / peak
-        if dd.max() > 0.5:
-            raise optuna.exceptions.TrialPruned("Drawdown >50% in first 25%.")
-    
-    # 4. Score Results (unchanged)
+
+    # 3. Score Results (Penalty-based)
     summary = compute_summary(trades, equity, signals, Path("dummy.csv"), data)
     
     sharpe = summary.get("sharpe_ratio", 0)
@@ -242,16 +251,19 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
     trades_per_day = len(trades) / max(1, (data["timestamp"].iloc[-1] - data["timestamp"].iloc[0]).days)
     
     penalty = 0.0
+    # Activity Penalty
     if trades_per_day < CONSTRAINTS["min_trades_per_day"]:
         penalty += (CONSTRAINTS["min_trades_per_day"] - trades_per_day) * CONSTRAINTS["penalty_weight_trades"]
     elif trades_per_day > CONSTRAINTS["max_trades_per_day"]:
         penalty += (trades_per_day - CONSTRAINTS["max_trades_per_day"]) * (CONSTRAINTS["penalty_weight_trades"] / 2.0)
         
+    # Risk Penalty
     if cagr < CONSTRAINTS["min_cagr_pct"]:
         penalty += (CONSTRAINTS["min_cagr_pct"] - cagr) * CONSTRAINTS["penalty_weight_risk"]
     if max_dd > CONSTRAINTS["max_max_drawdown_pct"]:
         penalty += (max_dd - CONSTRAINTS["max_max_drawdown_pct"]) * CONSTRAINTS["penalty_weight_risk"]
         
+    # Balanced SOTA Score
     objective_score = ((sharpe + calmar) / 2.0) - penalty
     return float(objective_score)
 
@@ -278,10 +290,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     def objective(trial):
         trial_params = {}
         for k, v in ranges.items():
-            if k in ("use_fast_stoch_exit", "use_slow_stoch_exit"):
-                # Binary params: force integer suggestion (0 or 1) → proper bool
-                trial_params[k] = bool(trial.suggest_int(k, int(v[0]), int(v[1])))
-            elif isinstance(v[0], int) and isinstance(v[1], int):
+            if isinstance(v[0], int) and isinstance(v[1], int):
                 if current_best and phase >= 2:
                     width = v[1] - v[0]
                     refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
@@ -304,7 +313,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
         
         return objective_wrapper(trial_params, data, trial_id=str(trial.number))
 
-    n_jobs = get_optimal_n_jobs()
+    n_jobs = 4
     for attempt in range(3):
         try:
             study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
