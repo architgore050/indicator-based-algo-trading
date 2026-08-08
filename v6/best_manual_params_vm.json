@@ -1,4 +1,8 @@
 {
+  "_meta": {
+    "purpose": "Manual tuning reference — stores the parameter set that performed best through manual experimentation. NOT a pipeline config file. All scripts load config.json exclusively. Do not delete; this is a personal reference for tracking which parameters worked well.",
+    "not_consumed_by": "No Python scripts read this file. It is a developer reference only."
+  },
   "backtesting_params": {
     "initial_capital_usd": 100000.0,
     "standard_lot_oz": 100.0,

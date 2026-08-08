@@ -28,13 +28,13 @@ The active codebase lives in `v6/`. It consists of:
 | Component | Files | Purpose |
 |---|---|---|
 | **Indicator Engine** | `definitions.py`, `gpu_io.py` | Vectorized indicator math with GPU dispatch paths; CSV↔GPU I/O helpers |
-| **Calibration Pipeline** | `orchestrate_calibration.py`, `optuna_calibrate_*.py`, `calibrate_*_strategy.py` | WFV orchestrator + Bayesian optimization per strategy |
+| **Calibration Pipeline** | `orchestrate_calibration.py`, `optuna_calibrate_*.py` | WFV orchestrator + Bayesian optimization per strategy |
 | **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py` | Produce window-specific signal CSVs from calibrated parameters |
 | **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals with realistic risk management |
 | **Collation** | `collate_wfv_results.py` | Aggregate WFV results across windows |
 | **Utilities** | `logging_utils.py`, `data_download.py` | Structured logging, 1-minute XAUUSD data ingestion |
-| **Validation** | `parity_test_signal_generators.py` | Parity tests comparing refactored vs backup signal generators |
-| **Configuration** | `config.json`, `backtesting_params_vm.json`, `calibration_results_vm.json` | Baseline parameters, strategy-specific backtesting params, calibration overrides |
+| **Validation** | `parity_test_optuna_calibrate.py` | Parity test for Optuna calibration pipeline. `parity_test_signal_generators.py` does not yet exist — needs to be created for signal generator parity testing. |
+| **Configuration** | `config.json`, `best_manual_params_vm.json`, `calibration_results_vm.json` | Baseline parameters (DO NOT MODIFY), manual tuning reference, calibration overrides |
 | **Data** | `data.csv` | Raw 1-minute XAUUSD OHLCV data |
 
 Two strategies are implemented:
@@ -43,6 +43,7 @@ Two strategies are implemented:
 
 ## Legacy Systems (Retired)
 All legacy version directories (v2–v5) have been removed. Only `v6/` remains as the active codebase. No migration awareness or cross-version comparison is needed.
+- `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` were deleted — they imported nonexistent `scorer.py` and were legacy fallback references. Git history can recover them if needed.
 
 ## Environment Setup (WSL + RAPIDS)
 GPU-related code runs through WSL Ubuntu with the `rapids` conda environment:
@@ -57,7 +58,7 @@ The `rapids` conda environment contains cudf, cupy, and all CUDA dependencies. E
 - **Headless execution:** Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless WSL.
 - **cudf inspection:** Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
 - **Vectorization:** Use pandas/numpy/cudf vectorized operations exclusively; NEVER use loops over data rows for indicator calculations.
-- **Protected files:** Do NOT delete testing scripts (`*test*.py`, `*_signals_test.csv`), backups (`.bak`/`.backup` files). These are critical for validation.
+- **Protected files:** Do NOT delete testing scripts (`*test*.py`, `*_signals_test.csv`), backups (`.bak`/`.backup` files). `.bak` files are specifically required for parity testing scripts at runtime. These are critical for validation.
 
 ## Orchestrator Behavior — Subagent Delegation
 When given a multi-part task, delegate subtasks to parallel subagents rather than doing them yourself:
@@ -123,9 +124,9 @@ Function signatures are preserved across all tiers to ensure zero breaking chang
 - **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with VRAM-based worker limits. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
 
 ### Configuration Management
-- `config.json` holds baseline parameters.
+- `config.json` holds baseline parameters consumed by all scripts. **DO NOT MODIFY without explicit developer approval.** Contains delicately tuned values from months of manual experimentation. If a subagent determines that a task is best solved through config changes, it should do nothing and report back rather than making changes.
 - `calibration_results_*.json` files are runtime overrides produced by calibration runs.
-- Strategy-specific backtesting params live in `backtesting_params_vm.json`.
+- `best_manual_params_vm.json` (formerly `backtesting_params_vm.json`) is a **developer reference only** — it stores the parameter set that performed best through manual experimentation. No Python scripts read this file. All scripts load `config.json` exclusively.
 
 ## Roadmap & Current Status
 See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
@@ -135,6 +136,36 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
 - **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
 - **Phase 4 (Algorithmic Optimization):** IN PROGRESS — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. GPU data loading via `--gpu` flag. Backtesting loop-breaking and Optuna search space reduction remain.
+
+## Active Issues from External Review
+
+See `docs/external_review_response.md` for detailed analysis of each finding.
+
+### Priority 1 — Must Fix Before Full Run
+- **Issue 1: Reward function mismatch.** The scoring function in `optuna_calibrate_*.py` maximizes `((sharpe + calmar) / 2.0) - penalty` but the documented design (and `config.json`'s `min_sharpe`/`min_calmar` fields) intends CAGR as the primary objective with Sharpe/Calmar as hard-constraint penalties. **The docs are right, the code is wrong.** Fixing this will also activate the unused `min_sharpe`/`min_calmar` config keys (Issue 7).
+- **Issue 2: Parity test for signal generators.** The `.bak` file has a pandas 3.0 dtype bug in the edge detector; the current code fixes it with `.astype(bool)`. A parity test comparing current code vs `.bak` should exist but `parity_test_signal_generators.py` does not exist in the repo. The only parity test is `parity_test_optuna_calibrate.py` (tests Optuna calibration, not signal generators). Needs to be created or restored.
+
+### Priority 2 — Low Effort, Low Risk
+- **Issue 5: Dead legacy scripts.** `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` are non-functional (import nonexistent `scorer.py`). They were kept as legacy fallback references during WFV development but are no longer needed — git history can recover them if necessary. Can be deleted.
+- **Issue 4: `backtesting_params_vm.json` renamed to `best_manual_params_vm.json`.** Added `_meta` key explaining it is a developer reference file, not a pipeline config. All docs updated to reflect the new name and purpose.
+
+### Priority 3 — Deferred
+- **Issue 3: "Not production-ready" disclaimer.** Full-scale calibration runs are deferred until optimization changes (Issue 1) are complete. A full WFV run on 4M rows takes half a day or more; running with the current suboptimal objective function wastes computational resources. This is intentional, not a problem.
+- **Issue 6: Config schema debris.** `config.json` has overlapping `optuna_config` and `phases` sub-dicts. Some values have been manually tuned over months. **DO NOT TOUCH config.json without explicit developer approval.** Requires careful investigation before any changes.
+- **Issue 8: `data_download.py` v2 path fossil.** Minor issue in a standalone download script. Can be fixed later when preparing for the final data update.
+- **Issue 9: `plt.show()` in plotting functions.** `matplotlib.use('Agg')` is set unconditionally at import time, making `plt.show()` a no-op in headless mode. Some plots are intentionally shown during interactive development. Needs deeper investigation before changes.
+
+### Confirmed — Keep As-Is
+- **Issue 10: `.bak` files.** Must be kept. Parity testing scripts depend on them being present in the directory at runtime. Git history can recover old versions, but parity tests need the backup files present in the working directory.
+
+## Full-Run Deferral Policy
+
+**Full-scale WFV calibration runs on 4M-row datasets are intentionally deferred** until the following optimization changes are complete:
+- Issue 1: Reward function refactored to match documented philosophy (CAGR as primary objective).
+- Issue 2: Parity test infrastructure restored/created for signal generators.
+- Any other Phase 4 algorithmic optimization changes.
+
+Running a full calibration with the current suboptimal objective function would waste ~half a day of GPU compute time and produce parameters that will need to be re-optimized anyway. Smoke mode (`--smoke`) and test mode (`--mode test`) should be used for all development iterations.
 
 ---
 
@@ -191,4 +222,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Legacy v2–v5 directories have been retired.** They no longer exist in the workspace. No migration awareness needed.
 
 ---
-*Last updated: 2026-07-11 — Added algorithmic soundness by component section. Phase 4 vision updated from "GPU porting" to "algorithmic optimization — break out of loops." Signal generators now use sparse event loops (100x fewer iterations) + pre-computed reasons.*
+*Last updated: 2026-08-08 — Added external review issues & status section. `backtesting_params_vm.json` renamed to `best_manual_params_vm.json` with `_meta` purpose doc. Legacy `calibrate_*_strategy.py` files removed. Full-run deferral policy documented. .bak files purpose clarified.*
