@@ -155,13 +155,13 @@ Document in AGENTS.md that `.bak` files are required for parity testing and must
 
 | # | Issue | Verdict | Status | Priority |
 |---|---|---|---|---|
-| 1 | Reward function: code maximizes Sharpe+Calmar, docs say CAGR | Code is buggy | OPEN | HIGH |
+| 1 | Reward function: code maximizes Sharpe+Calmar, docs say CAGR | Code is buggy | **FIXED** | HIGH |
 | 2 | Parity test: .bak has pandas bug, current code fixes it | Partially correct | OPEN | MEDIUM |
 | 3 | "Not production-ready" claim | Not an issue | NO ACTION | — |
-| 4 | `backtesting_params_vm.json` orphaned config | Misleading name | OPEN | LOW |
+| 4 | `backtesting_params_vm.json` orphaned config | Misleading name | **FIXED** | LOW |
 | 5 | Dead `calibrate_*_strategy.py` files | Correct | CAN DELETE | LOW |
 | 6 | Config schema debris (parallel sub-dicts) | Delicate | DEFERRED | DO NOT TOUCH |
-| 7 | `min_sharpe`/`min_calmar` unused | Tied to Issue 1 | OPEN | TIED TO #1 |
+| 7 | `min_sharpe`/`min_calmar` unused | Tied to Issue 1 | **FIXED** | TIED TO #1 |
 | 8 | `data_download.py` v2 path fossil | Minor | DEFERRED | VERY LOW |
 | 9 | `plt.show()` in plotting functions | Needs investigation | OPEN | LOW |
 | 10 | `.bak` files in version control | Reviewer wrong | NO ACTION | N/A (keep) |

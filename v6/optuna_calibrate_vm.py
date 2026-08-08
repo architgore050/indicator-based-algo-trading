@@ -252,7 +252,12 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
     if max_dd > CONSTRAINTS["max_max_drawdown_pct"]:
         penalty += (max_dd - CONSTRAINTS["max_max_drawdown_pct"]) * CONSTRAINTS["penalty_weight_risk"]
         
-    objective_score = ((sharpe + calmar) / 2.0) - penalty
+    objective_score = cagr
+    if sharpe < CONSTRAINTS["min_sharpe"]:
+        objective_score -= (CONSTRAINTS["min_sharpe"] - sharpe) * CONSTRAINTS["penalty_weight_risk"]
+    if calmar < CONSTRAINTS["min_calmar"]:
+        objective_score -= (CONSTRAINTS["min_calmar"] - calmar) * CONSTRAINTS["penalty_weight_risk"]
+    objective_score -= penalty
     return float(objective_score)
 
 # ---------------------------------------------------------------------------

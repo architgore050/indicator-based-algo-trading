@@ -142,12 +142,12 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 See `docs/external_review_response.md` for detailed analysis of each finding.
 
 ### Priority 1 — Must Fix Before Full Run
-- **Issue 1: Reward function mismatch.** The scoring function in `optuna_calibrate_*.py` maximizes `((sharpe + calmar) / 2.0) - penalty` but the documented design (and `config.json`'s `min_sharpe`/`min_calmar` fields) intends CAGR as the primary objective with Sharpe/Calmar as hard-constraint penalties. **The docs are right, the code is wrong.** Fixing this will also activate the unused `min_sharpe`/`min_calmar` config keys (Issue 7).
+- **Issue 1: Reward function mismatch — FIXED** (2026-08-08). Scoring function in `optuna_calibrate_*.py` now uses CAGR as primary objective with Sharpe/Calmar as hard-constraint penalties, matching the documented design. `min_sharpe`/`min_calmar` config keys are now active (fixes Issue 7).
 - **Issue 2: Parity test for signal generators.** The `.bak` file has a pandas 3.0 dtype bug in the edge detector; the current code fixes it with `.astype(bool)`. A parity test comparing current code vs `.bak` should exist but `parity_test_signal_generators.py` does not exist in the repo. The only parity test is `parity_test_optuna_calibrate.py` (tests Optuna calibration, not signal generators). Needs to be created or restored.
 
 ### Priority 2 — Low Effort, Low Risk
 - **Issue 5: Dead legacy scripts.** `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` are non-functional (import nonexistent `scorer.py`). They were kept as legacy fallback references during WFV development but are no longer needed — git history can recover them if necessary. Can be deleted.
-- **Issue 4: `backtesting_params_vm.json` renamed to `best_manual_params_vm.json`.** Added `_meta` key explaining it is a developer reference file, not a pipeline config. All docs updated to reflect the new name and purpose.
+- **Issue 4: `backtesting_params_vm.json` renamed to `best_manual_params_vm.json` — FIXED** (2026-08-08). Added `_meta` key explaining it is a developer reference file, not a pipeline config. All docs updated to reflect the new name and purpose.
 
 ### Priority 3 — Deferred
 - **Issue 3: "Not production-ready" disclaimer.** Full-scale calibration runs are deferred until optimization changes (Issue 1) are complete. A full WFV run on 4M rows takes half a day or more; running with the current suboptimal objective function wastes computational resources. This is intentional, not a problem.
@@ -161,7 +161,6 @@ See `docs/external_review_response.md` for detailed analysis of each finding.
 ## Full-Run Deferral Policy
 
 **Full-scale WFV calibration runs on 4M-row datasets are intentionally deferred** until the following optimization changes are complete:
-- Issue 1: Reward function refactored to match documented philosophy (CAGR as primary objective).
 - Issue 2: Parity test infrastructure restored/created for signal generators.
 - Any other Phase 4 algorithmic optimization changes.
 
