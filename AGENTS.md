@@ -143,20 +143,20 @@ See `docs/external_review_response.md` for detailed analysis of each finding.
 
 ### Priority 1 — Must Fix Before Full Run
 - **Issue 1: Reward function mismatch — FIXED** (2026-08-08). Scoring function in `optuna_calibrate_*.py` now uses CAGR as primary objective with Sharpe/Calmar as hard-constraint penalties, matching the documented design. `min_sharpe`/`min_calmar` config keys are now active (fixes Issue 7).
-- **Issue 2: Parity test for signal generators.** The `.bak` file has a pandas 3.0 dtype bug in the edge detector; the current code fixes it with `.astype(bool)`. A parity test comparing current code vs `.bak` should exist but `parity_test_signal_generators.py` does not exist in the repo. The only parity test is `parity_test_optuna_calibrate.py` (tests Optuna calibration, not signal generators). Needs to be created or restored.
+- **Issue 2: Parity test for signal generators — NO ACTION** (2026-08-08). Git history handles version preservation for signal generator scripts. No active parity test for signal generators is being developed. If a future task requires changing signal generation code, a parity test can be written on-demand. The `.bak` files are kept for parity testing scripts that exist at runtime.
 
 ### Priority 2 — Low Effort, Low Risk
-- **Issue 5: Dead legacy scripts.** `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` are non-functional (import nonexistent `scorer.py`). They were kept as legacy fallback references during WFV development but are no longer needed — git history can recover them if necessary. Can be deleted.
+- **Issue 5: Dead legacy scripts — FIXED** (2026-08-08). `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` deleted. No `.bak` files for them exist.
 - **Issue 4: `backtesting_params_vm.json` renamed to `best_manual_params_vm.json` — FIXED** (2026-08-08). Added `_meta` key explaining it is a developer reference file, not a pipeline config. All docs updated to reflect the new name and purpose.
 
 ### Priority 3 — Deferred
 - **Issue 3: "Not production-ready" disclaimer.** Full-scale calibration runs are deferred until optimization changes (Issue 1) are complete. A full WFV run on 4M rows takes half a day or more; running with the current suboptimal objective function wastes computational resources. This is intentional, not a problem.
 - **Issue 6: Config schema debris.** `config.json` has overlapping `optuna_config` and `phases` sub-dicts. Some values have been manually tuned over months. **DO NOT TOUCH config.json without explicit developer approval.** Requires careful investigation before any changes.
 - **Issue 8: `data_download.py` v2 path fossil.** Minor issue in a standalone download script. Can be fixed later when preparing for the final data update.
-- **Issue 9: `plt.show()` in plotting functions.** `matplotlib.use('Agg')` is set unconditionally at import time, making `plt.show()` a no-op in headless mode. Some plots are intentionally shown during interactive development. Needs deeper investigation before changes.
+- **Issue 9: `plt.show()` in plotting functions — RESOLVED** (2026-08-08). External verification was wrong — this issue never existed. `matplotlib.use('Agg')` is set unconditionally at import time (line 10 of `backtest_xauusd_signal_csv.py`), making all 6 `plt.show()` calls harmless no-ops. The `--headless` flag is kept as-is for explicit documentation of headless intent and backward compatibility. No code changes.
 
 ### Confirmed — Keep As-Is
-- **Issue 10: `.bak` files.** Must be kept. Parity testing scripts depend on them being present in the directory at runtime. Git history can recover old versions, but parity tests need the backup files present in the working directory.
+- **Issue 10: `.bak` files — RESOLVED** (2026-08-08). External verification was wrong. `.bak` files must be kept. Parity testing scripts depend on them being present in the directory at runtime. Git history can recover old versions, but parity tests need the backup files present in the working directory.
 
 ## Full-Run Deferral Policy
 
@@ -221,4 +221,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Legacy v2–v5 directories have been retired.** They no longer exist in the workspace. No migration awareness needed.
 
 ---
-*Last updated: 2026-08-08 — Added external review issues & status section. `backtesting_params_vm.json` renamed to `best_manual_params_vm.json` with `_meta` purpose doc. Legacy `calibrate_*_strategy.py` files removed. Full-run deferral policy documented. .bak files purpose clarified.*
+*Last updated: 2026-08-08 — Issue 1 (reward function) fixed. Issue 4 (orphaned config) renamed to best_manual_params_vm.json with _meta. Issue 5 (dead legacy scripts) deleted. Issue 7 (unused min_sharpe/min_calmar) resolved with Issue 1. Issue 9 (plt.show()) resolved — external verification was wrong, issue never existed. Full-run deferral policy documented. .bak files purpose clarified.*
