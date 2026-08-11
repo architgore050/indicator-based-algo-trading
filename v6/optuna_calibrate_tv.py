@@ -269,6 +269,23 @@ def get_optimal_n_jobs():
     return min(cpu_count, 12)
 
 
+def enqueue_top_trials(study, ranges: dict, n: int = None):
+    """Enqueue the top-N trials from a study as warm-start candidates."""
+    if n is None:
+        n = OPTUNA_CONF["top_n_to_enqueue"]
+    trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else -np.inf, reverse=True)
+    enqueued = 0
+    for trial in trials:
+        if enqueued >= n:
+            break
+        params = {k: v for k, v in trial.params.items() if k in ranges}
+        if params:
+            study.enqueue_trial(params)
+            enqueued += 1
+    if enqueued > 0:
+        logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
+
+
 def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None):
     study = optuna.create_study(
         study_name=study_name,
@@ -295,7 +312,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 if current_best and phase >= 2:
                     # Narrow refinement around best
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = max(1, int(width * refine_pct))
                     low = max(v[0], current_best[k] - r_width // 2)
                     high = min(v[1], current_best[k] + r_width // 2)
@@ -306,7 +323,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 # Float param
                 if current_best and phase >= 2:
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = width * refine_pct
                     low = max(v[0], current_best[k] - r_width / 2.0)
                     high = min(v[1], current_best[k] + r_width / 2.0)
@@ -393,18 +410,24 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
             
+            # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
+            enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
+            
             # PHASE 2
             logger.info("PHASE 2: Bayesian (TPE) Refinement...")
             p2_trials = OPTUNA_CONF["phase2_trials"]
-            study = run_study(2, p2_trials, TPESampler(n_startup_trials=0), data, "tv_discovery", storage_path, current_best=current_best)
+            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
             
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
+            
+            # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
+            enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
     
     # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=0), data, "tv_discovery", storage_path, current_best=current_best)
+    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
     
     # Survival of the Fittest Check
     best_score = study.best_value

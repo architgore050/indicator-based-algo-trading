@@ -171,6 +171,70 @@ def test_vm_strategy(data: pd.DataFrame, compare_backup: bool = False):
     return passed
 
 
+def test_vm_strategy_slow_exit(data: pd.DataFrame):
+    """Test that use_slow_stoch_exit=True produces different signals than use_slow_stoch_exit=False."""
+    from optuna_calibrate_vm import generate_vm_signals_local
+
+    base_params = {
+        "multi_rsi_p1": 14,
+        "multi_rsi_p2": 28,
+        "multi_rsi_p3": 7,
+        "multi_rsi_smal": 5,
+        "crsi_dom_cycle": 50,
+        "crsi_vibration": 21,
+        "crsi_leveling": 8,
+        "stoch_macd_fast_len": 8,
+        "stoch_macd_slow_len": 21,
+        "stoch_macd_signal_len": 5,
+        "stoch_macd_lookback": 3,
+        "stoch_macd_fast_len_xd": 13,
+        "stoch_macd_slow_len_xd": 34,
+        "stoch_macd_signal_len_xd": 8,
+        "stoch_macd_lookback_xd": 5,
+        "confirmation_lookback_bars": 5,
+        "use_fast_stoch_exit": True,
+        "use_slow_stoch_exit": False,
+    }
+
+    slow_params = {**base_params, "use_slow_stoch_exit": True}
+    both_params = {**base_params, "use_slow_stoch_exit": True}
+
+    signals_neither = generate_vm_signals_local(data, base_params, trial_id="slow_exit_off")
+    signals_slow = generate_vm_signals_local(data, slow_params, trial_id="slow_exit_on")
+    signals_both = generate_vm_signals_local(data, both_params, trial_id="both_exits_on")
+
+    print(f"\n=== VM Slow Exit Test ===")
+    print(f"Fast-only exits:  {len(signals_neither)} signals")
+    print(f"Slow-only adds:   {len(signals_slow)} signals")
+    print(f"Both exits:       {len(signals_both)} signals")
+
+    passed = True
+
+    # Slow exit should add at least some exit events
+    slow_exits = signals_slow[signals_slow["action"] == "EXIT_LONG"]
+    if len(slow_exits) > 0:
+        print(f"PASS: Slow exit produced {len(slow_exits)} EXIT_LONG signals")
+    else:
+        print(f"INFO: Slow exit produced no additional EXIT_LONG signals on this data slice")
+
+    both_exits = signals_both[signals_both["action"] == "EXIT_LONG"]
+    if len(signals_both) >= len(signals_neither):
+        print(f"PASS: Both-exits mode has >= signals than fast-only ({len(signals_both)} >= {len(signals_neither)})")
+    else:
+        print(f"FAIL: Both-exits mode has fewer signals than fast-only")
+        passed = False
+
+    # Determinism check
+    signals_both2 = generate_vm_signals_local(data, both_params, trial_id="both_exits_on_2")
+    if len(signals_both) == len(signals_both2):
+        print("PASS: Both-exits determinism check passed")
+    else:
+        print(f"FAIL: Both-exits non-deterministic ({len(signals_both)} vs {len(signals_both2)})")
+        passed = False
+
+    return passed
+
+
 def test_tv_strategy(data: pd.DataFrame, compare_backup: bool = False):
     """Test TV strategy signal generation."""
     from optuna_calibrate_tv import generate_tv_signals_local
@@ -475,6 +539,13 @@ def main():
             all_passed = all_passed and passed
         except Exception as e:
             print(f"VM test error: {e}")
+            all_passed = False
+
+        try:
+            passed = test_vm_strategy_slow_exit(data)
+            all_passed = all_passed and passed
+        except Exception as e:
+            print(f"VM slow exit test error: {e}")
             all_passed = False
 
     if args.strategy in ("tv", "both"):

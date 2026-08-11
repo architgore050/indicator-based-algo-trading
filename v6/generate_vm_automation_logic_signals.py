@@ -389,17 +389,34 @@ def generate_signals(
             sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
         sell_setup = sell_setup_raw & (~sell_fill)
 
-        # Exit Logic
+        # Exit Logic — Fast exit on Fast MACD cross, Slow exit on Slow MACD cross
+        # When both are True, exit on EITHER condition (parallel triggers, first to fire wins)
         if params["use_fast_stoch_exit"]:
-            long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-            short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        elif _is_cudf(data):
-            import cudf as _cudf_local
-            long_exit = _cudf_local.Series(False, index=data.index)
-            short_exit = _cudf_local.Series(False, index=data.index)
+            fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
+            fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
         else:
-            long_exit = pd.Series(False, index=data.index)
-            short_exit = pd.Series(False, index=data.index)
+            if _is_cudf(data):
+                import cudf as _cudf_local
+                fast_long_exit = _cudf_local.Series(False, index=data.index)
+                fast_short_exit = _cudf_local.Series(False, index=data.index)
+            else:
+                fast_long_exit = pd.Series(False, index=data.index)
+                fast_short_exit = pd.Series(False, index=data.index)
+
+        if params["use_slow_stoch_exit"]:
+            slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+            slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+        else:
+            if _is_cudf(data):
+                import cudf as _cudf_local
+                slow_long_exit = _cudf_local.Series(False, index=data.index)
+                slow_short_exit = _cudf_local.Series(False, index=data.index)
+            else:
+                slow_long_exit = pd.Series(False, index=data.index)
+                slow_short_exit = pd.Series(False, index=data.index)
+
+        long_exit = fast_long_exit | slow_long_exit
+        short_exit = fast_short_exit | slow_short_exit
 
         signals = build_signal_rows(
             data=data,

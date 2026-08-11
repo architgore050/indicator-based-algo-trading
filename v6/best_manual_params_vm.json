@@ -87,7 +87,7 @@
   },
   "calibration_params": {
     "calibration_rows_per_trial": 3000,
-    "phases": {
+    "optuna_config": {
       "phase1_trials": 100,
       "phase2_trials_per_candidate": 20,
       "phase3_trials": 25,

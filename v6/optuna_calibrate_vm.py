@@ -164,9 +164,24 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
         sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
         sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
 
-        # Exit Logic
-        long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"]) if p["use_fast_stoch_exit"] else pd.Series(False, index=data.index)
-        short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"]) if p["use_fast_stoch_exit"] else pd.Series(False, index=data.index)
+        # Exit Logic — Fast exit on Fast MACD cross, Slow exit on Slow MACD cross
+        # When both are True, exit on EITHER condition (parallel triggers, first to fire wins)
+        if p["use_fast_stoch_exit"]:
+            fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
+            fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
+        else:
+            fast_long_exit = pd.Series(False, index=data.index)
+            fast_short_exit = pd.Series(False, index=data.index)
+
+        if p["use_slow_stoch_exit"]:
+            slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+            slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+        else:
+            slow_long_exit = pd.Series(False, index=data.index)
+            slow_short_exit = pd.Series(False, index=data.index)
+
+        long_exit = fast_long_exit | slow_long_exit
+        short_exit = fast_short_exit | slow_short_exit
         pbar.update()
 
         rows = []
@@ -264,6 +279,23 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
 # Parallel Optimization
 # ---------------------------------------------------------------------------
 
+def enqueue_top_trials(study, ranges: dict, n: int = None):
+    """Enqueue the top-N trials from a study as warm-start candidates."""
+    if n is None:
+        n = OPTUNA_CONF["top_n_to_enqueue"]
+    trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else -np.inf, reverse=True)
+    enqueued = 0
+    for trial in trials:
+        if enqueued >= n:
+            break
+        params = {k: v for k, v in trial.params.items() if k in ranges}
+        if params:
+            study.enqueue_trial(params)
+            enqueued += 1
+    if enqueued > 0:
+        logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
+
+
 def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None):
     study = optuna.create_study(
         study_name=study_name,
@@ -276,7 +308,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     
     ranges = CALIB_PARAMS["vm_ranges"]
 
-    # Port over the distribution/warm start by enqueuing the current best
+    # Port over the distribution/warm start by enqueuing the best trial
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
     
@@ -289,7 +321,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
             elif isinstance(v[0], int) and isinstance(v[1], int):
                 if current_best and phase >= 2:
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = max(1, int(width * refine_pct))
                     low = max(v[0], current_best[k] - r_width // 2)
                     high = min(v[1], current_best[k] + r_width // 2)
@@ -299,7 +331,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
             else:
                 if current_best and phase >= 2:
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = width * refine_pct
                     low = max(v[0], current_best[k] - r_width / 2.0)
                     high = min(v[1], current_best[k] + r_width / 2.0)
@@ -395,7 +427,7 @@ def main():
             sampler = QMCSampler()
         except Exception:
             logger.warning("QMCSampler unavailable (scipy missing). Falling back to TPESampler.")
-            sampler = TPESampler(n_startup_trials=0)
+            sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"])
         study = run_study(1, p1_trials, sampler, data, "vm_discovery", storage_path)
         
         if args.smoke:
@@ -405,18 +437,24 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
             
+            # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
+            enqueue_top_trials(study, CALIB_PARAMS["vm_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
+            
             # PHASE 2
             logger.info("PHASE 2: Bayesian (TPE) Refinement...")
             p2_trials = OPTUNA_CONF["phase2_trials"]
-            study = run_study(2, p2_trials, TPESampler(n_startup_trials=0), data, "vm_discovery", storage_path, current_best=current_best)
+            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "vm_discovery", storage_path, current_best=current_best)
             
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
+            
+            # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
+            enqueue_top_trials(study, CALIB_PARAMS["vm_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
     
     # PHASE 3
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=0), data, "vm_discovery", storage_path, current_best=current_best)
+    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "vm_discovery", storage_path, current_best=current_best)
     
     # Survival of the Fittest Check
     best_score = study.best_value
