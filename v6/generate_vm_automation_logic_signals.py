@@ -30,6 +30,13 @@ OUTPUT_CSV = PROJECT_DIR / "vm_automation_logic_signals.csv"
 CONFIG_PATH = PROJECT_DIR / "config.json"
 CALIBRATION_PATH = PROJECT_DIR / "calibration_results_vm.json"
 
+def load_config():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+CONF = load_config()
+DATA_CONF = CONF["data_config"]
+
 def load_params(calibration_path=None):
     # Load defaults from config.json
     with open(CONFIG_PATH, "r") as f:
@@ -119,9 +126,9 @@ def load_data(
     elif mode == "smoke":
         read_kwargs["nrows"] = 50_000
     elif mode == "test":
-        # 3M to 4M (rows 3,000,001 to 4,000,000) — skip calibration set
-        read_kwargs["skiprows"] = range(1, 3_000_001)
-        read_kwargs["nrows"] = 1_000_000
+        # calibration_rows to total_rows (held-out OOS set)
+        read_kwargs["skiprows"] = range(1, DATA_CONF["calibration_rows"] + 1)
+        read_kwargs["nrows"] = DATA_CONF["testing_rows"]
 
     if use_gpu and gpu_io_available():
         logger.info("Loading %s via GPU (cudf)", source)
