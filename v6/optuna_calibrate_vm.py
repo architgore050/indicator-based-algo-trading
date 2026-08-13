@@ -28,10 +28,21 @@ from definitions import (
     calculate_stochastic_macd
 )
 # We import run_backtest and score_results directly from the backtest script to ensure parity
+try:
+    import cudf
+    from gpu_io import load_csv_to_gpu
+    GPU_AVAILABLE = True
+except ImportError:
+    cudf = None
+    load_csv_to_gpu = None
+    GPU_AVAILABLE = False
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
 suppress_pandas_warnings()
+
+# GPU data cache — keeps cudf DataFrame alive across trial evaluations
+_GPU_DATA_CACHE = None
 
 # ---------------------------------------------------------------------------
 # Helpers (Native)
@@ -47,8 +58,9 @@ def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
 
 def clean_bool(series: pd.Series) -> pd.Series:
     """Ensures a series is boolean and fills NaNs with False."""
-    if series.dtype == bool:
-        return series.fillna(False)
+    if hasattr(series, 'dtype'):
+        if str(series.dtype) in ('bool', 'boolean', 'bool_'):
+            return series.fillna(False)
     return series.fillna(False).astype(bool)
 
 def recent(series: pd.Series, bars: int) -> pd.Series:
@@ -88,28 +100,50 @@ DATA_CONFIG = CONFIG["data_config"]
 # Data Loading Helper
 # ---------------------------------------------------------------------------
 
-def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None) -> pd.DataFrame:
+def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None, use_gpu: bool = False) -> pd.DataFrame:
     source = data_csv_path if data_csv_path else str(DATA_CSV)
     skip = max(0, end_at_row - rows_to_load)
-    header = pd.read_csv(source, nrows=0).columns
-    read_kwargs = {
-        "nrows": rows_to_load,
-        "parse_dates": ["timestamp"],
-    }
-    if skip > 0:
-        read_kwargs["skiprows"] = range(1, skip + 1)
-        
-    data = pd.read_csv(source, **read_kwargs)
-    data.columns = [col.strip().lower() for col in header]
-    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
-    return data.sort_values("timestamp").reset_index(drop=True)
+    
+    if use_gpu and GPU_AVAILABLE and cudf is not None:
+        gpu_df = load_csv_to_gpu(source)
+        if skip > 0:
+            gpu_df = gpu_df.iloc[skip:end_at_row] if end_at_row != float('inf') else gpu_df.iloc[skip:]
+        elif end_at_row != float('inf'):
+            gpu_df = gpu_df.iloc[:end_at_row]
+        # Return cudf DataFrame as-is — indicator functions auto-dispatch to GPU
+        # Convert to pandas only after indicators complete (inside generate_vm_signals_local)
+        global _GPU_DATA_CACHE
+        _GPU_DATA_CACHE = gpu_df
+        return gpu_df
+    else:
+        header = pd.read_csv(source, nrows=0).columns
+        read_kwargs = {
+            "nrows": rows_to_load,
+            "parse_dates": ["timestamp"],
+        }
+        if skip > 0:
+            read_kwargs["skiprows"] = range(1, skip + 1)
+            
+        data = pd.read_csv(source, **read_kwargs)
+        data.columns = [col.strip().lower() for col in header]
+        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+        return data.sort_values("timestamp").reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Signal Generation (VM Strategy Wrapper)
 # ---------------------------------------------------------------------------
 
-def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
+def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = "trial", use_gpu: bool = False) -> pd.DataFrame:
     p = {**VM_DEFAULTS, **params}
+    
+    # Track if data is cudf for proper false-Series creation and final conversion
+    is_cudf_input = cudf is not None and isinstance(data, cudf.DataFrame)
+    
+    def _false_series():
+        """Create a False Series matching the input type."""
+        if is_cudf_input:
+            return cudf.Series(False, index=data.index)
+        return pd.Series(False, index=data.index)
     
     with tqdm(total=4, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
         multi_rsi = calculate_multi_rsi_plus(
@@ -170,20 +204,28 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
             fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
             fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
         else:
-            fast_long_exit = pd.Series(False, index=data.index)
-            fast_short_exit = pd.Series(False, index=data.index)
+            fast_long_exit = _false_series()
+            fast_short_exit = _false_series()
 
         if p["use_slow_stoch_exit"]:
             slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
             slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
         else:
-            slow_long_exit = pd.Series(False, index=data.index)
-            slow_short_exit = pd.Series(False, index=data.index)
+            slow_long_exit = _false_series()
+            slow_short_exit = _false_series()
 
         long_exit = fast_long_exit | slow_long_exit
         short_exit = fast_short_exit | slow_short_exit
         pbar.update()
 
+        # Convert to pandas/numpy for the state machine loop (inherently sequential, not vectorizable)
+        if is_cudf_input:
+            data = data.to_pandas()
+            buy_setup = buy_setup.to_pandas()
+            sell_setup = sell_setup.to_pandas()
+            long_exit = long_exit.to_pandas()
+            short_exit = short_exit.to_pandas()
+        
         rows = []
         position = 0
         timestamps = data["timestamp"].to_numpy()
@@ -225,9 +267,9 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial", use_gpu: bool = False) -> float:
     # 1. Generate Signals
-    signals = generate_vm_signals_local(data, params, trial_id=trial_id)
+    signals = generate_vm_signals_local(data, params, trial_id=trial_id, use_gpu=use_gpu)
     if signals.empty:
         return -9999.0
     
@@ -296,7 +338,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
         logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None):
+def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None, use_gpu: bool = False):
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -312,7 +354,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
     
-    def objective(trial):
+    def objective(trial, _use_gpu=use_gpu):
         trial_params = {}
         for k, v in ranges.items():
             if k in ("use_fast_stoch_exit", "use_slow_stoch_exit"):
@@ -339,7 +381,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
         
-        return objective_wrapper(trial_params, data, trial_id=str(trial.number))
+        return objective_wrapper(trial_params, data, trial_id=str(trial.number), use_gpu=_use_gpu)
 
     n_jobs = get_optimal_n_jobs()
     for attempt in range(3):
@@ -364,6 +406,7 @@ def main():
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_vm.json).")
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration via cudf/cupy.")
     args = parser.parse_args()
     
     # Override results path for per-window isolation (parallel WFV safety)
@@ -381,7 +424,7 @@ def main():
         trial_rows = end_row - args.start_row
 
     logger.info(f"SOTA VM Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
-    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
+    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv, use_gpu=args.gpu)
     
     # Ensure storage directory exists
     db_dir = PROJECT_DIR / "optuna_db"
