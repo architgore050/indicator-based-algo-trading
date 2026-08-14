@@ -969,6 +969,7 @@ def main() -> None:
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--headless", action="store_true", help="Don't show plots, only save them.")
     parser.add_argument("--output-dir", type=str, default=None, help="Explicit output directory.")
+    parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
     args = parser.parse_args()
 
     if args.headless:
@@ -976,19 +977,22 @@ def main() -> None:
         matplotlib.use('Agg')
 
     # Dynamic path selection
-    if args.strategy == "tv":
-        base_file = "tv_strategy1_signals.csv"
+    if args.signals:
+        signal_path = Path(args.signals)
     else:
-        base_file = "vm_automation_logic_signals.csv"
+        if args.strategy == "tv":
+            base_file = "tv_strategy1_signals.csv"
+        else:
+            base_file = "vm_automation_logic_signals.csv"
 
-    if args.mode == "smoke":
-        signal_file = base_file.replace(".csv", "_smoke.csv")
-    elif args.mode == "test":
-        signal_file = base_file.replace(".csv", "_test.csv")
-    else:
-        signal_file = base_file
+        if args.mode == "smoke":
+            signal_file = base_file.replace(".csv", "_smoke.csv")
+        elif args.mode == "test":
+            signal_file = base_file.replace(".csv", "_test.csv")
+        else:
+            signal_file = base_file
 
-    signal_path = PROJECT_DIR / signal_file
+        signal_path = PROJECT_DIR / signal_file
     
     if not signal_path.exists():
         print(f"Error: {signal_path.name} not found. Generate signals first with '--mode {args.mode}'")

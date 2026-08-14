@@ -265,6 +265,18 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
 
     # 6. Backtest (OOS)
     backtest_dir = current_dir / "backtest_results"
+    
+    # Determine signal file name for this window
+    if args.smoke:
+        sig_suffix = "_smoke.csv"
+    else:
+        sig_suffix = "_test.csv"
+    if strategy == "tv":
+        base_sig = "tv_strategy1_signals"
+    else:
+        base_sig = "vm_automation_logic_signals"
+    signal_file_path = current_dir / f"{base_sig}{sig_suffix}"
+    
     run_step([
         PYTHON, "backtest_xauusd_signal_csv.py",
         "--strategy", strategy,
@@ -273,7 +285,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         "--start-row", "0",
         "--end-row", str(oos_window_size),
         "--headless",
-        "--output-dir", str(backtest_dir)
+        "--output-dir", str(backtest_dir),
+        "--signals", str(signal_file_path)
     ])
 
     # 7. Record Performance
