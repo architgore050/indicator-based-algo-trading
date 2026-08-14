@@ -257,7 +257,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         "--mode", "smoke" if args.smoke else "test",
         "--data-csv", row_to_chunk[(oos_start, oos_end)],
         "--start-row", "0",
-        "--end-row", str(oos_window_size)
+        "--end-row", str(oos_window_size),
+        "--output-dir", str(current_dir)
     ]
     if window_cal.exists():
         signal_cmd.extend(["--calibration", str(window_cal)])

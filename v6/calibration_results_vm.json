@@ -1,30 +1,30 @@
 {
   "best_parameters": {
-    "multi_rsi_p1": 22,
-    "multi_rsi_p2": 96,
-    "multi_rsi_p3": 163,
-    "multi_rsi_smal": 10,
-    "crsi_dom_cycle": 5,
-    "crsi_vibration": 58,
-    "crsi_leveling": 45.05709736974272,
-    "stoch_macd_fast_len": 18,
-    "stoch_macd_slow_len": 211,
-    "stoch_macd_signal_len": 76,
-    "stoch_macd_lookback": 175,
-    "stoch_macd_fast_len_xd": 3,
-    "stoch_macd_slow_len_xd": 31,
-    "stoch_macd_signal_len_xd": 40,
-    "stoch_macd_lookback_xd": 12,
-    "confirmation_lookback_bars": 20,
+    "multi_rsi_p1": 15,
+    "multi_rsi_p2": 56,
+    "multi_rsi_p3": 179,
+    "multi_rsi_smal": 4,
+    "crsi_dom_cycle": 24,
+    "crsi_vibration": 36,
+    "crsi_leveling": 32.494653922780216,
+    "stoch_macd_fast_len": 13,
+    "stoch_macd_slow_len": 215,
+    "stoch_macd_signal_len": 78,
+    "stoch_macd_lookback": 115,
+    "stoch_macd_fast_len_xd": 11,
+    "stoch_macd_slow_len_xd": 65,
+    "stoch_macd_signal_len_xd": 28,
+    "stoch_macd_lookback_xd": 105,
+    "confirmation_lookback_bars": 5,
     "use_fast_stoch_exit": 0,
-    "use_slow_stoch_exit": 0
+    "use_slow_stoch_exit": 1
   },
-  "best_score": 18.229545304942206,
-  "calibration_date": "2026-08-14T00:37:43.108418",
+  "best_score": -39.66410360594812,
+  "calibration_date": "2026-08-14T08:26:49.847933",
   "dataset_info": {
     "rows_used": 1000,
     "strategy": "vm",
-    "end_row": 1001
+    "end_row": 28001
   },
   "optimization_type": "optuna_sota_parallel"
 }

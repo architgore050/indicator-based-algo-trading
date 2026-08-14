@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -996,7 +997,7 @@ def main() -> None:
     
     if not signal_path.exists():
         print(f"Error: {signal_path.name} not found. Generate signals first with '--mode {args.mode}'")
-        return
+        sys.exit(1)
 
     out_dir = output_subdir(signal_path, args.mode, override_dir=Path(args.output_dir) if args.output_dir else None)
 

@@ -323,8 +323,12 @@ def generate_signals(
     end_row: int = 4000000,
     data_csv_path: str = None,
     use_gpu: bool = False,
+    output_dir: str = None,
 ) -> Path:
-    output_csv = with_mode_suffix(OUTPUT_CSV, mode)
+    base_csv = OUTPUT_CSV
+    if output_dir:
+        base_csv = Path(output_dir) / base_csv.name
+    output_csv = with_mode_suffix(base_csv, mode)
 
     with tqdm(total=5, desc="VM Automation Logic", unit="step") as pbar:
         data, is_gpu_mode = load_data(mode, start_row, end_row, data_csv_path=data_csv_path, use_gpu=use_gpu)
@@ -452,6 +456,7 @@ def main() -> None:
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
     parser.add_argument("--gpu", action="store_true", help="Load data via GPU (cudf) for accelerated indicator computation.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
     args = parser.parse_args()
 
     # Load params AFTER arg parsing so --calibration is respected before any module-level work
@@ -460,6 +465,7 @@ def main() -> None:
     output_path = generate_signals(
         params, args.mode, args.start_row, args.end_row,
         data_csv_path=args.data_csv, use_gpu=args.gpu,
+        output_dir=args.output_dir,
     )
     print(f"Wrote {output_path}")
 
