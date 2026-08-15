@@ -108,7 +108,7 @@ def load_market_data(mode: str, start_row: int = 0, end_row: int = 4000000, data
         header = pd.read_csv(source, nrows=0).columns
         data.columns = [col.strip().lower() for col in header]
 
-    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
     return data.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -127,7 +127,7 @@ def load_signals(path: Path) -> pd.DataFrame:
     missing = required.difference(signals.columns)
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-    signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True)
+    signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True).dt.tz_localize(None)
     signals["signal"] = signals["signal"].astype(str).str.upper()
     signals["action"] = signals["action"].astype(str).str.upper()
     if "reason" not in signals.columns:

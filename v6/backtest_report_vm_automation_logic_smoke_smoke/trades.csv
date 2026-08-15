@@ -1,1 +1,1 @@
-
+entry_time,exit_time,side,entry_signal,exit_signal,entry_reason,exit_reason,lots,units_oz,entry_mid,entry_fill,exit_mid,exit_fill,gross_pnl_usd,swap_usd,commission_usd,spread_slippage_cost_usd,net_pnl_usd,net_pnl_inr,return_on_margin_pct,entry_bar,bars_held,hours_held,mfe_usd,mae_usd

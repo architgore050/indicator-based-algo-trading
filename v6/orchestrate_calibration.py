@@ -371,7 +371,7 @@ def main():
     unique_ranges = sorted(set(row_ranges))
     
     logger.info(f"Pre-slicing data.csv into {len(unique_ranges)} chunks...")
-    for s, e in unique_ranges:
+    for s, e in tqdm(unique_ranges, desc="Chunking data", unit="chunk"):
         chunk_path = SLICED_DIR / f"rows_{s}_{e}.csv"
         if not chunk_path.exists():
             slice_data_csv(str(DATA_CSV), s, e, chunk_path)

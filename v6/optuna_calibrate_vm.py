@@ -126,7 +126,7 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
             
         data = pd.read_csv(source, **read_kwargs)
         data.columns = [col.strip().lower() for col in header]
-        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
         return data.sort_values("timestamp").reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
