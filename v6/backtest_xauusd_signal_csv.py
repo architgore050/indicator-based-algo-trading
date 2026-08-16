@@ -11,8 +11,10 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend for ALL imports
 import matplotlib.pyplot as plt
+import cupy as cp
 import numpy as np
 import pandas as pd
+import cudf
 from tqdm import tqdm
 
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
@@ -333,17 +335,21 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
     rng = np.random.default_rng(BP["random_seed"])
     state = BacktestState()
 
+    # Pre-extract data to cupy arrays for GPU-native computation
+    # Timestamps stay as numpy (cupy doesn't support datetime64)
+    timestamps_np = data["timestamp"].to_numpy()
+    opens = cp.asarray(data["open"].to_numpy().astype(np.float64))
+    highs = cp.asarray(data["high"].to_numpy().astype(np.float64))
+    lows = cp.asarray(data["low"].to_numpy().astype(np.float64))
+    closes = cp.asarray(data["close"].to_numpy().astype(np.float64))
+
+    # Pre-compute dates array for swap accrual (avoids repeated pd.Timestamp() in loop)
+    dates = np.array([pd.Timestamp(ts).date() for ts in timestamps_np], dtype=object)
+
     signal_events = signals.groupby("timestamp", sort=True).apply(lambda frame: frame.to_dict("records"), include_groups=False)
     signal_lookup = signal_events.to_dict()
     equity_rows: list[dict[str, object]] = []
     execution_log: list[dict[str, object]] = []
-
-    # === A. Pre-extract numpy arrays for fast indexing ===
-    timestamps = data["timestamp"].values
-    opens = data["open"].values.astype(np.float64)
-    highs = data["high"].values.astype(np.float64)
-    lows = data["low"].values.astype(np.float64)
-    closes = data["close"].values.astype(np.float64)
 
     # === B. Cache BP config values into locals ===
     warmup_bars = BP["warmup_bars"]
@@ -370,13 +376,13 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
     n = len(data)
 
     for i in tqdm(range(n), desc="Backtest bars", unit="bar"):
-        ts = pd.Timestamp(timestamps[i])
+        ts = pd.Timestamp(timestamps_np[i])
 
         # === C. Accrue swap and inline update_excursions when position is open ===
         if state.position is not None:
             pos = state.position
-            # Inline accrue_swap
-            current_date = ts.date()
+            # Inline accrue_swap (use pre-computed dates array)
+            current_date = dates[i]
             if pos.last_swap_date is not None:
                 elapsed_days = max(0, (current_date - pos.last_swap_date).days)
                 if elapsed_days > 0:
@@ -411,7 +417,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
             pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
 
         # === D. Signal processing (always runs, including during warmup) ===
-        source_ts = data.iloc[i - 1]["timestamp"] if execute_on_next and i > 0 else ts
+        source_ts = pd.Timestamp(timestamps_np[i - 1]) if execute_on_next and i > 0 else ts
         execution_mid = opens[i] if execute_on_next else closes[i]
 
         actions_taken = set()

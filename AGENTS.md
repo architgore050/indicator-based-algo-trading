@@ -120,7 +120,7 @@ Function signatures are preserved across all tiers to ensure zero breaking chang
 ### Algorithmic Soundness by Component
 - **Indicator Engine (`definitions.py`):** Fully vectorized. All 9 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
 - **Signal Generation (`generate_*_signals.py`):** State machine loop replaced with sparse event iteration — `np.where(has_event)[0]` reduces iterations from O(n) to O(events) where events are typically 0.1-1% of bars. Reasons pre-computed via numpy column_stack. Remaining loop is fundamentally sequential (position at t depends on position at t-1) but over sparse events only. GPU data loading available via `--gpu` flag.
-- **Backtesting (`backtest_xauusd_signal_csv.py`):** Still uses per-bar state machine loop with sequential equity compounding. This is the next target for algorithmic optimization — trade-level vectorization to eliminate O(n) loop.
+- **Backtesting (`backtest_xauusd_signal_csv.py`):** Per-bar state machine loop with sequential equity compounding. Numeric data (OHLCV) pre-extracted to cupy arrays before the loop. Timestamps remain as numpy (cupy doesn't support datetime64). The sequential loop remains — trade-level vectorization is the next optimization target. See `docs/gpu_migration/M09_backtest_migration.md`.
 - **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with VRAM-based worker limits. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
 
 ### Configuration Management
@@ -135,7 +135,7 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 - **Phase 1 (GPU Shift):** COMPLETE — cudf/cupy dispatch paths in all helper functions + indicator functions in `definitions.py`. GPU I/O helpers in `gpu_io.py`.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
 - **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
-- **Phase 4 (Algorithmic Optimization):** IN PROGRESS — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. GPU data loading via `--gpu` flag. Backtesting loop-breaking and Optuna search space reduction remain.
+- **Phase 4 (Algorithmic Optimization):** IN PROGRESS — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. GPU data loading via `--gpu` flag. Backtester numeric arrays converted to cupy (M09). Backtesting loop-breaking and Optuna search space reduction remain.
 
 ## Active Issues from External Review
 
@@ -214,11 +214,14 @@ This section captures lessons learned from actual implementation experience. It 
 - **Empty signal files crash backtests.** Signal CSVs with headers but no data rows cause `pd.read_csv()` to raise `EmptyDataError`. Always check file size and wrap reads in try/except, returning an empty DataFrame gracefully.
 - **Pandas deprecation warnings flood terminal output during WFV.** They come from internal pandas operations inside indicator calculations. Suppress at import time (`import warnings; warnings.filterwarnings("ignore", category=FutureWarning)`) rather than hunting individual sources — the noise outweighs the signal.
 - **Pre-slicing data.csv prevents OOM in parallel workers.** When all WFV workers call `pd.read_csv("data.csv")` simultaneously on a 4M-row file, memory spikes and disk I/O contention causes crashes. Slice once upfront into per-window chunks; each worker reads only its small CSV.
+- **Backtester cupy arrays from pandas input work seamlessly.** When converting pandas DataFrames to cupy arrays in `run_backtest()`, use `cp.asarray(data["col"].to_numpy())` — not `data["col"].to_pandas()` (which requires cudf input). Parity test passes with identical results and 300-800% speedup.
 
 ### What to Avoid
 - **Do not hardcode concurrency limits in AGENTS.md.** The right number of workers depends on data size, VRAM availability, GPU saturation state, and whether the task prioritizes throughput or stability. Let the model assess this contextually using the hardware facts provided here as input, not as a formula to apply.
 - **Do not add new intermediate file formats.** CSV is the canonical format. If performance is an issue, optimize the in-memory computation (GPU), not the disk format.
 - **Legacy v2–v5 directories have been retired.** They no longer exist in the workspace. No migration awareness needed.
+- **Cupy does not support datetime64 dtype.** Never try to put datetime arrays into cupy. Keep timestamps as numpy and only convert numeric columns to cupy.
+- **Converting cudf→pandas requires an active CUDA context.** If the CUDA context is unavailable (e.g., in certain test environments), `cudf.DataFrame.to_pandas()` will fail. Prefer extracting data directly from pandas when the input is already a pandas DataFrame.
 
 ---
-*Last updated: 2026-08-08 — Issue 1 (reward function) fixed. Issue 4 (orphaned config) renamed to best_manual_params_vm.json with _meta. Issue 5 (dead legacy scripts) deleted. Issue 7 (unused min_sharpe/min_calmar) resolved with Issue 1. Issue 9 (plt.show()) resolved — external verification was wrong, issue never existed. Full-run deferral policy documented. .bak files purpose clarified.*
+*Last updated: 2026-08-16 — M09 backtester cudf migration complete. Parity test passes with 300-800% speedup. All .bak files refreshed.*

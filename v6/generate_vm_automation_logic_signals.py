@@ -6,12 +6,14 @@ import logging
 import warnings
 from pathlib import Path
 
+import cupy as cp
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from definitions import calculate_cyclic_rsi, calculate_multi_rsi_plus, calculate_stochastic_macd, _is_cudf
-from gpu_io import gpu_io_available, load_csv_to_gpu
+import cudf
+from definitions import calculate_cyclic_rsi, calculate_multi_rsi_plus, calculate_stochastic_macd
+from gpu_io import load_csv
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
 suppress_pandas_warnings()
@@ -70,11 +72,8 @@ def crossed_below(left, right):
 
 
 def clean_bool(series):
-    """Fill NaN with False and cast to bool. Works with both pandas and cudf Series."""
-    filled = series.fillna(False)
-    if _is_cudf(filled):
-        return filled.astype(bool)
-    return filled.astype(bool)
+    """Fill NaN with False and cast to bool. Works with cudf Series."""
+    return series.fillna(False).astype(bool)
 
 
 def recent(series, bars):
@@ -107,68 +106,35 @@ def load_data(
     start_row: int = 0,
     end_row: int = 4000000,
     data_csv_path: str = None,
-    use_gpu: bool = False,
 ):
-    """Load CSV data.
-
-    Returns (df, is_gpu_mode) where df is a pandas DataFrame in CPU mode
-    or a cudf DataFrame in GPU mode.  In GPU mode the timestamp column is
-    stored as int64 epoch milliseconds so that cudf does not need to handle
-    datetime64[ns, UTC].
-    """
+    """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps."""
     source = data_csv_path if data_csv_path else DATA_CSV
     read_kwargs = {"parse_dates": ["timestamp"]}
 
-    # Allow manual override if start_row/end_row provided (WFV sliced CSV)
     if start_row != 0 or end_row != 4000000:
         read_kwargs["skiprows"] = range(1, start_row + 1)
         read_kwargs["nrows"] = end_row - start_row
     elif mode == "smoke":
         read_kwargs["nrows"] = 50_000
     elif mode == "test":
-        # calibration_rows to total_rows (held-out OOS set)
         read_kwargs["skiprows"] = range(1, DATA_CONF["calibration_rows"] + 1)
         read_kwargs["nrows"] = DATA_CONF["testing_rows"]
 
-    if use_gpu and gpu_io_available():
-        logger.info("Loading %s via GPU (cudf)", source)
-        gpu_df = load_csv_to_gpu(str(source))
+    gpu_df = load_csv(str(source))
 
-        # Convert timestamp to int64 epoch ms on-GPU so cudf doesn't need
-        # datetime64[ns, UTC] which it handles inconsistently.
-        if "timestamp" in gpu_df.columns:
-            ts_col = gpu_df["timestamp"]
-            try:
-                # If already datetime-like, convert to int64 epoch ms on GPU
-                ts_int = (ts_col.astype("int64") // 1_000_000).astype("int64")
-            except (TypeError, ValueError):
-                # Already numeric — use as-is
-                ts_int = ts_col.astype("int64")
-            gpu_df = gpu_df.drop(columns=["timestamp"])
-            gpu_df.insert(0, "timestamp", ts_int)
+    # Convert timestamp to int64 epoch ms on-GPU
+    if "timestamp" in gpu_df.columns:
+        ts_col = gpu_df["timestamp"]
+        ts_int = (ts_col.astype("int64") // 1_000_000).astype("int64")
+        gpu_df = gpu_df.drop(columns=["timestamp"])
+        gpu_df.insert(0, "timestamp", ts_int)
 
-        # Strip/normalize column names using cudf methods
-        gpu_df.columns = [col.strip().lower() for col in gpu_df.columns]
-
-        required = {"timestamp", "open", "high", "low", "close"}
-        missing = required.difference(set(gpu_df.columns))
-        if missing:
-            raise ValueError(f"{source} is missing columns: {sorted(missing)}")
-
-        # Sort by timestamp (int64) and reset index — works on cudf
-        gpu_df = gpu_df.sort_values("timestamp").reset_index(drop=True)
-        return gpu_df, True
-    else:
-        data = pd.read_csv(source, **read_kwargs)
-
-    data.columns = [col.strip().lower() for col in data.columns]
     required = {"timestamp", "open", "high", "low", "close"}
-    missing = required.difference(data.columns)
+    missing = required.difference(set(gpu_df.columns))
     if missing:
         raise ValueError(f"{source} is missing columns: {sorted(missing)}")
 
-    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
-    return data.sort_values("timestamp").reset_index(drop=True), False
+    return gpu_df.sort_values("timestamp").reset_index(drop=True)
 
 
 def _active_names(row_idx: int, checks: list[tuple[str, np.ndarray]]) -> str:
@@ -193,9 +159,10 @@ def _precompute_reasons(check_arrs: list[tuple[str, np.ndarray]], indices: np.nd
 
 
 def _to_numpy(series):
-    """Convert pandas or cudf Series to numpy array."""
-    if _is_cudf(series):
-        return series.to_pandas().to_numpy()
+    """Convert cudf or pandas Series to numpy array.
+    Uses cupy for cudf Series to avoid numba/cudf context bugs."""
+    if hasattr(series, 'to_pandas'):
+        return cp.asnumpy(cp.asarray(series))
     return series.to_numpy()
 
 
@@ -222,35 +189,24 @@ def build_signal_rows(
     short_exit_arr = clean_bool(short_exit)
 
     # Convert to numpy at the boundary (once per series)
-    if _is_cudf(buy_arr):
-        buy_arr_np = buy_arr.to_pandas().to_numpy()
-        sell_arr_np = sell_arr.to_pandas().to_numpy()
-        long_exit_arr_np = long_exit_arr.to_pandas().to_numpy()
-        short_exit_arr_np = short_exit_arr.to_pandas().to_numpy()
-    else:
-        buy_arr_np = buy_arr.to_numpy()
-        sell_arr_np = sell_arr.to_numpy()
-        long_exit_arr_np = long_exit_arr.to_numpy()
-        short_exit_arr_np = short_exit_arr.to_numpy()
+    buy_arr_np = _to_numpy(buy_arr)
+    sell_arr_np = _to_numpy(sell_arr)
+    long_exit_arr_np = _to_numpy(long_exit_arr)
+    short_exit_arr_np = _to_numpy(short_exit_arr)
 
     buy_check_arrs = []
     for name, values in buy_checks:
         cb = clean_bool(values)
-        arr = cb.to_pandas().to_numpy() if _is_cudf(cb) else cb.to_numpy()
-        buy_check_arrs.append((name, arr))
+        buy_check_arrs.append((name, _to_numpy(cb)))
 
     sell_check_arrs = []
     for name, values in sell_checks:
         cb = clean_bool(values)
-        arr = cb.to_pandas().to_numpy() if _is_cudf(cb) else cb.to_numpy()
-        sell_check_arrs.append((name, arr))
+        sell_check_arrs.append((name, _to_numpy(cb)))
 
-    # Timestamps — handle both pandas and cudf
-    ts_col = data["timestamp"]
-    timestamps_np = ts_col.to_pandas().to_numpy() if _is_cudf(ts_col) else ts_col.to_numpy()
-
-    close_col = data["close"]
-    close_prices = close_col.to_pandas().to_numpy() if _is_cudf(close_col) else close_col.to_numpy()
+    # Timestamps and close prices — convert from cudf/pandas to numpy
+    timestamps_np = _to_numpy(data["timestamp"])
+    close_prices = _to_numpy(data["close"])
 
     # Fast numpy: find which bars have ANY signal event
     has_event = buy_arr_np | sell_arr_np | long_exit_arr_np | short_exit_arr_np
@@ -322,7 +278,6 @@ def generate_signals(
     start_row: int = 0,
     end_row: int = 4000000,
     data_csv_path: str = None,
-    use_gpu: bool = False,
     output_dir: str = None,
 ) -> Path:
     base_csv = OUTPUT_CSV
@@ -331,12 +286,12 @@ def generate_signals(
     output_csv = with_mode_suffix(base_csv, mode)
 
     with tqdm(total=5, desc="VM Automation Logic", unit="step") as pbar:
-        data, is_gpu_mode = load_data(mode, start_row, end_row, data_csv_path=data_csv_path, use_gpu=use_gpu)
-        pbar.set_postfix_str(f"rows={len(data):,}")
+        data_gdf = load_data(mode, start_row, end_row, data_csv_path=data_csv_path)
+        pbar.set_postfix_str(f"rows={len(data_gdf):,}")
         pbar.update()
 
         multi_rsi = calculate_multi_rsi_plus(
-            data, 
+            data_gdf, 
             p1=params["multi_rsi_p1"], 
             p2=params["multi_rsi_p2"], 
             p3=params["multi_rsi_p3"], 
@@ -345,7 +300,7 @@ def generate_signals(
         pbar.update()
 
         cyclic_rsi = calculate_cyclic_rsi(
-            data, 
+            data_gdf, 
             dom_cycle=params["crsi_dom_cycle"], 
             vibration=params["crsi_vibration"], 
             leveling=params["crsi_leveling"]
@@ -353,7 +308,7 @@ def generate_signals(
         pbar.update()
 
         stoch_macd = calculate_stochastic_macd(
-            data, 
+            data_gdf, 
             fast_len=params["stoch_macd_fast_len"], 
             slow_len=params["stoch_macd_slow_len"], 
             signal_len=params["stoch_macd_signal_len"], 
@@ -399,31 +354,21 @@ def generate_signals(
             fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
             fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
         else:
-            if _is_cudf(data):
-                import cudf as _cudf_local
-                fast_long_exit = _cudf_local.Series(False, index=data.index)
-                fast_short_exit = _cudf_local.Series(False, index=data.index)
-            else:
-                fast_long_exit = pd.Series(False, index=data.index)
-                fast_short_exit = pd.Series(False, index=data.index)
+            fast_long_exit = cudf.Series(False, index=data_gdf.index)
+            fast_short_exit = cudf.Series(False, index=data_gdf.index)
 
         if params["use_slow_stoch_exit"]:
             slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
             slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
         else:
-            if _is_cudf(data):
-                import cudf as _cudf_local
-                slow_long_exit = _cudf_local.Series(False, index=data.index)
-                slow_short_exit = _cudf_local.Series(False, index=data.index)
-            else:
-                slow_long_exit = pd.Series(False, index=data.index)
-                slow_short_exit = pd.Series(False, index=data.index)
+            slow_long_exit = cudf.Series(False, index=data_gdf.index)
+            slow_short_exit = cudf.Series(False, index=data_gdf.index)
 
         long_exit = fast_long_exit | slow_long_exit
         short_exit = fast_short_exit | slow_short_exit
 
         signals = build_signal_rows(
-            data=data,
+            data=data_gdf,
             multi_rsi=multi_rsi,
             cyclic_rsi=cyclic_rsi,
             stoch_macd=stoch_macd,
@@ -435,8 +380,8 @@ def generate_signals(
             sell_checks=[("multi_bear", multi_bear), ("stoch_bear", stoch_bear), ("cyclic_bear", cyclic_bear)],
         )
 
-        # Convert int64 timestamps back to datetime for CSV output (GPU mode)
-        if is_gpu_mode and not signals.empty:
+        # Convert int64 timestamps back to datetime for CSV output
+        if not signals.empty:
             ts_col = signals["timestamp"]
             if ts_col.dtype in ("int64", "int32"):
                 signals["timestamp"] = pd.to_datetime(ts_col, unit="ms", utc=True)
@@ -455,7 +400,6 @@ def main() -> None:
     parser.add_argument("--end-row", type=int, default=4000000)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
-    parser.add_argument("--gpu", action="store_true", help="Load data via GPU (cudf) for accelerated indicator computation.")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
     args = parser.parse_args()
 
@@ -464,7 +408,7 @@ def main() -> None:
 
     output_path = generate_signals(
         params, args.mode, args.start_row, args.end_row,
-        data_csv_path=args.data_csv, use_gpu=args.gpu,
+        data_csv_path=args.data_csv,
         output_dir=args.output_dir,
     )
     print(f"Wrote {output_path}")

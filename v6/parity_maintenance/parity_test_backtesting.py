@@ -5,6 +5,11 @@ import sys
 import time
 from pathlib import Path
 
+# Ensure v6/ is on the path so 'import backtest_xauusd_signal_csv' works
+_project_dir = Path(__file__).resolve().parent.parent
+if str(_project_dir) not in sys.path:
+    sys.path.insert(0, str(_project_dir))
+
 import matplotlib
 matplotlib.use('Agg')
 import numpy as np
@@ -13,7 +18,7 @@ import pandas as pd
 
 def load_data(end_row: int = 50000) -> pd.DataFrame:
     """Load a small data window for fast parity testing."""
-    project_dir = Path(__file__).resolve().parent
+    project_dir = Path(__file__).resolve().parent.parent
     data_csv = project_dir / "data.csv"
 
     header = pd.read_csv(data_csv, nrows=0).columns
@@ -41,6 +46,13 @@ def _load_module_from_bak(bak_path: Path, module_name: str):
     live_mod = importlib.import_module(live_mod_name)
 
     code = bak_path.read_text(encoding="utf-8")
+    # Force PROJECT_DIR to v6/ so config.json and data.csv resolve correctly
+    v6_dir = Path(__file__).resolve().parent.parent
+    # Replace PROJECT_DIR assignment in backup code (it uses __file__ which points to parity_maintenance/)
+    code = code.replace(
+        "PROJECT_DIR = Path(__file__).resolve().parent",
+        f"PROJECT_DIR = Path({repr(str(v6_dir))})"
+    )
     ns = {
         "__name__": module_name,
         "__file__": str(bak_path),
@@ -302,7 +314,7 @@ def test_against_backup(data, signals, bak_path, signal_name="test"):
         return True
 
     try:
-        original_mod = _load_module_from_bak(bak_path, "backtest_xauusd_signal_csv_bak")
+        original_mod = _load_module_from_bak(bak_path, "backtest_xauusd_signal_csv")
         # Import the live (optimized) module
         import importlib
         live_mod = importlib.import_module("backtest_xauusd_signal_csv")
@@ -335,15 +347,16 @@ def main():
     print(f"Loaded {len(data)} rows.")
 
     project_dir = Path(__file__).resolve().parent
+    v6_dir = project_dir.parent
 
     for strategy in ["vm", "tv"]:
         if args.strategy not in ("both", strategy):
             continue
 
         if strategy == "vm":
-            signal_file = project_dir / "vm_automation_logic_signals_smoke.csv"
+            signal_file = v6_dir / "vm_automation_logic_signals_smoke.csv"
         else:
-            signal_file = project_dir / "tv_strategy1_signals_smoke.csv"
+            signal_file = v6_dir / "tv_strategy1_signals_smoke.csv"
 
         if not signal_file.exists():
             print(f"\nWARN: Signal file {signal_file.name} not found, skipping {strategy.upper()}")
@@ -369,6 +382,29 @@ def main():
         # Filter signals to data timeframe
         start, end = data["timestamp"].min(), data["timestamp"].max()
         signals = signals[(signals["timestamp"] >= start) & (signals["timestamp"] <= end)].reset_index(drop=True)
+
+        # If no signals overlap with data, generate synthetic signals for testing
+        if len(signals) == 0:
+            print(f"  INFO: No signal/data overlap, generating synthetic signals...")
+            np.random.seed(42)
+            n = len(data)
+            signal_indices = np.sort(np.random.choice(n, size=50, replace=False))
+            synth_signals = []
+            for idx in signal_indices:
+                row = data.iloc[idx]
+                action_type = "ENTER" if idx % 2 == 0 else "EXIT"
+                side = "BUY" if idx % 3 != 1 else "SELL"
+                synth_signals.append({
+                    "timestamp": row["timestamp"],
+                    "signal": side,
+                    "action": f"{action_type}_{side}",
+                    "reason": f"synthetic_test_signal_{idx}",
+                })
+            signals = pd.DataFrame(synth_signals)
+            signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True)
+            signals["signal"] = signals["signal"].astype(str).str.upper()
+            signals["action"] = signals["action"].astype(str).str.upper()
+            signals = signals.sort_values("timestamp").reset_index(drop=True)
 
         print(f"Signals: {len(signals)}")
         print(f"Data: {len(data)} bars")

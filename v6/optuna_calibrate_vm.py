@@ -27,15 +27,8 @@ from definitions import (
     calculate_multi_rsi_plus, 
     calculate_stochastic_macd
 )
-# We import run_backtest and score_results directly from the backtest script to ensure parity
-try:
-    import cudf
-    from gpu_io import load_csv_to_gpu
-    GPU_AVAILABLE = True
-except ImportError:
-    cudf = None
-    load_csv_to_gpu = None
-    GPU_AVAILABLE = False
+import cudf
+from gpu_io import load_csv
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
@@ -100,51 +93,22 @@ DATA_CONFIG = CONFIG["data_config"]
 # Data Loading Helper
 # ---------------------------------------------------------------------------
 
-def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None, use_gpu: bool = False) -> pd.DataFrame:
+def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None) -> cudf.DataFrame:
     source = data_csv_path if data_csv_path else str(DATA_CSV)
     skip = max(0, end_at_row - rows_to_load)
     
-    if use_gpu and GPU_AVAILABLE and cudf is not None:
-        gpu_df = load_csv_to_gpu(source)
-        if skip > 0:
-            gpu_df = gpu_df.iloc[skip:end_at_row] if end_at_row != float('inf') else gpu_df.iloc[skip:]
-        elif end_at_row != float('inf'):
-            gpu_df = gpu_df.iloc[:end_at_row]
-        # Return cudf DataFrame as-is — indicator functions auto-dispatch to GPU
-        # Convert to pandas only after indicators complete (inside generate_vm_signals_local)
-        global _GPU_DATA_CACHE
-        _GPU_DATA_CACHE = gpu_df
-        return gpu_df
-    else:
-        header = pd.read_csv(source, nrows=0).columns
-        read_kwargs = {
-            "nrows": rows_to_load,
-            "parse_dates": ["timestamp"],
-        }
-        if skip > 0:
-            read_kwargs["skiprows"] = range(1, skip + 1)
-            
-        data = pd.read_csv(source, **read_kwargs)
-        data.columns = [col.strip().lower() for col in header]
-        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
-        return data.sort_values("timestamp").reset_index(drop=True)
+    gpu_df = load_csv(source, skiprows=skip, nrows=rows_to_load)
+    global _GPU_DATA_CACHE
+    _GPU_DATA_CACHE = gpu_df
+    return gpu_df
 
 # ---------------------------------------------------------------------------
 # Signal Generation (VM Strategy Wrapper)
 # ---------------------------------------------------------------------------
 
-def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = "trial", use_gpu: bool = False) -> pd.DataFrame:
+def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
     p = {**VM_DEFAULTS, **params}
-    
-    # Track if data is cudf for proper false-Series creation and final conversion
-    is_cudf_input = cudf is not None and isinstance(data, cudf.DataFrame)
-    
-    def _false_series():
-        """Create a False Series matching the input type."""
-        if is_cudf_input:
-            return cudf.Series(False, index=data.index)
-        return pd.Series(False, index=data.index)
-    
+
     with tqdm(total=4, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
         multi_rsi = calculate_multi_rsi_plus(
             data, 
@@ -204,36 +168,35 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
             fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
             fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
         else:
-            fast_long_exit = _false_series()
-            fast_short_exit = _false_series()
+            fast_long_exit = cudf.Series(False, index=data.index)
+            fast_short_exit = cudf.Series(False, index=data.index)
 
         if p["use_slow_stoch_exit"]:
             slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
             slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
         else:
-            slow_long_exit = _false_series()
-            slow_short_exit = _false_series()
+            slow_long_exit = cudf.Series(False, index=data.index)
+            slow_short_exit = cudf.Series(False, index=data.index)
 
         long_exit = fast_long_exit | slow_long_exit
         short_exit = fast_short_exit | slow_short_exit
         pbar.update()
 
-        # Convert to pandas/numpy for the state machine loop (inherently sequential, not vectorizable)
-        if is_cudf_input:
-            data = data.to_pandas()
-            buy_setup = buy_setup.to_pandas()
-            sell_setup = sell_setup.to_pandas()
-            long_exit = long_exit.to_pandas()
-            short_exit = short_exit.to_pandas()
+        # Convert to pandas/numpy for the state machine loop (inherently sequential)
+        data_pd = data.to_arrow().to_pandas()
+        buy_setup_pd = buy_setup.to_arrow().to_pandas()
+        sell_setup_pd = sell_setup.to_arrow().to_pandas()
+        long_exit_pd = long_exit.to_arrow().to_pandas()
+        short_exit_pd = short_exit.to_arrow().to_pandas()
         
         rows = []
         position = 0
-        timestamps = data["timestamp"].to_numpy()
+        timestamps = data_pd["timestamp"].to_numpy()
         
-        buy_arr = clean_bool(buy_setup).to_numpy()
-        sell_arr = clean_bool(sell_setup).to_numpy()
-        lx_arr = clean_bool(long_exit).to_numpy()
-        sx_arr = clean_bool(short_exit).to_numpy()
+        buy_arr = clean_bool(buy_setup_pd).to_numpy()
+        sell_arr = clean_bool(sell_setup_pd).to_numpy()
+        lx_arr = clean_bool(long_exit_pd).to_numpy()
+        sx_arr = clean_bool(short_exit_pd).to_numpy()
 
         # Sparse event iteration — only visit bars where something happens
         all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
@@ -267,9 +230,9 @@ def generate_vm_signals_local(data: pd.DataFrame, params: dict, trial_id: str = 
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial", use_gpu: bool = False) -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
     # 1. Generate Signals
-    signals = generate_vm_signals_local(data, params, trial_id=trial_id, use_gpu=use_gpu)
+    signals = generate_vm_signals_local(data, params, trial_id=trial_id)
     if signals.empty:
         return -9999.0
     
@@ -280,7 +243,14 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial",
     
     # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
     limit = int(len(data) * 0.25)
-    early_equity = equity[equity["timestamp"] <= data["timestamp"].iloc[limit]]
+    limit_ts = pd.Timestamp(data["timestamp"].iloc[limit])
+    # Ensure both timestamps are tz-naive before comparison
+    if limit_ts.tz is not None:
+        limit_ts = limit_ts.tz_localize(None)
+    equity_ts = equity["timestamp"]
+    if str(equity_ts.dtype).startswith("datetime") and equity_ts.dt.tz is not None:
+        equity_ts = equity_ts.dt.tz_localize(None)
+    early_equity = equity[equity_ts <= limit_ts]
     if not early_equity.empty:
         if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
             raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
@@ -338,7 +308,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
         logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None, use_gpu: bool = False):
+def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study_name: str, storage: str, current_best: dict = None):
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -354,7 +324,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
     
-    def objective(trial, _use_gpu=use_gpu):
+    def objective(trial):
         trial_params = {}
         for k, v in ranges.items():
             if k in ("use_fast_stoch_exit", "use_slow_stoch_exit"):
@@ -381,7 +351,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
         
-        return objective_wrapper(trial_params, data, trial_id=str(trial.number), use_gpu=_use_gpu)
+        return objective_wrapper(trial_params, data, trial_id=str(trial.number))
 
     n_jobs = get_optimal_n_jobs()
     for attempt in range(3):
@@ -406,7 +376,6 @@ def main():
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_vm.json).")
-    parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration via cudf/cupy.")
     args = parser.parse_args()
     
     # Override results path for per-window isolation (parallel WFV safety)
@@ -424,7 +393,7 @@ def main():
         trial_rows = end_row - args.start_row
 
     logger.info(f"SOTA VM Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
-    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv, use_gpu=args.gpu)
+    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
     
     # Ensure storage directory exists
     db_dir = PROJECT_DIR / "optuna_db"

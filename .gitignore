@@ -20,3 +20,4 @@ optuna_db/
 .idea/
 .DS_Store
 Thumbs.db
+AGENTS.md

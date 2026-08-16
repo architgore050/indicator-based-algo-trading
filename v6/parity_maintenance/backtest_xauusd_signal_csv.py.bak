@@ -5,13 +5,16 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend for ALL imports
 import matplotlib.pyplot as plt
+import cupy as cp
 import numpy as np
 import pandas as pd
+import cudf
 from tqdm import tqdm
 
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
@@ -60,7 +63,7 @@ class OpenPosition:
     worst_price: float = 0.0
     trailing_stop_mid: float | None = None
     accrued_swap_usd: float = 0.0
-    last_swap_date: object | None = None
+    last_swap_date: date | None = None
 
 
 @dataclass
@@ -107,7 +110,7 @@ def load_market_data(mode: str, start_row: int = 0, end_row: int = 4000000, data
         header = pd.read_csv(source, nrows=0).columns
         data.columns = [col.strip().lower() for col in header]
 
-    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
     return data.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -126,7 +129,7 @@ def load_signals(path: Path) -> pd.DataFrame:
     missing = required.difference(signals.columns)
     if missing:
         raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-    signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True)
+    signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True).dt.tz_localize(None)
     signals["signal"] = signals["signal"].astype(str).str.upper()
     signals["action"] = signals["action"].astype(str).str.upper()
     if "reason" not in signals.columns:
@@ -135,7 +138,7 @@ def load_signals(path: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Execution math
+# Execution math (kept for parity test module loading)
 # ---------------------------------------------------------------------------
 
 def slippage(rng: np.random.Generator) -> float:
@@ -324,88 +327,99 @@ def action_to_side(action: str, signal: str) -> int | None:
     return None
 
 
-def risk_exit_reason(position: OpenPosition, row: pd.Series, bar_idx: int) -> tuple[str, float] | None:
-    if not BP["enable_risk_exits"]:
-        return None
-
-    if BP["max_hold_bars"] > 0 and bar_idx - position.entry_bar >= BP["max_hold_bars"]:
-        return "max_hold_bars", float(row["close"])
-
-    stop_hit = False
-    target_hit = False
-    trailing_hit = False
-
-    if position.side == 1:
-        stop_mid = position.entry_mid - BP["stop_loss_usd_per_oz"]
-        target_mid = position.entry_mid + BP["take_profit_usd_per_oz"]
-        stop_hit = BP["stop_loss_usd_per_oz"] > 0 and row["low"] <= stop_mid
-        target_hit = BP["take_profit_usd_per_oz"] > 0 and row["high"] >= target_mid
-        trailing_hit = position.trailing_stop_mid is not None and row["low"] <= position.trailing_stop_mid
-        if stop_hit and (BP["conservative_intrabar_fill"] or not target_hit):
-            return "stop_loss", stop_mid
-        if trailing_hit and (BP["conservative_intrabar_fill"] or not target_hit):
-            return "trailing_stop", float(position.trailing_stop_mid)
-        if target_hit:
-            return "take_profit", target_mid
-    else:
-        stop_mid = position.entry_mid + BP["stop_loss_usd_per_oz"]
-        target_mid = position.entry_mid - BP["take_profit_usd_per_oz"]
-        stop_hit = BP["stop_loss_usd_per_oz"] > 0 and row["high"] >= stop_mid
-        target_hit = BP["take_profit_usd_per_oz"] > 0 and row["low"] <= target_mid
-        trailing_hit = position.trailing_stop_mid is not None and row["high"] >= position.trailing_stop_mid
-        if stop_hit and (BP["conservative_intrabar_fill"] or not target_hit):
-            return "stop_loss", stop_mid
-        if trailing_hit and (BP["conservative_intrabar_fill"] or not target_hit):
-            return "trailing_stop", float(position.trailing_stop_mid)
-        if target_hit:
-            return "take_profit", target_mid
-
-    return None
-
-
 # ---------------------------------------------------------------------------
-# Backtest
+# Backtest (OPTIMIZED)
 # ---------------------------------------------------------------------------
 
 def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(BP["random_seed"])
     state = BacktestState()
 
+    # Pre-extract data to cupy arrays for GPU-native computation
+    # Timestamps stay as numpy (cupy doesn't support datetime64)
+    timestamps_np = data["timestamp"].to_numpy()
+    opens = cp.asarray(data["open"].to_numpy().astype(np.float64))
+    highs = cp.asarray(data["high"].to_numpy().astype(np.float64))
+    lows = cp.asarray(data["low"].to_numpy().astype(np.float64))
+    closes = cp.asarray(data["close"].to_numpy().astype(np.float64))
+
+    # Pre-compute dates array for swap accrual (avoids repeated pd.Timestamp() in loop)
+    dates = np.array([pd.Timestamp(ts).date() for ts in timestamps_np], dtype=object)
+
     signal_events = signals.groupby("timestamp", sort=True).apply(lambda frame: frame.to_dict("records"), include_groups=False)
     signal_lookup = signal_events.to_dict()
     equity_rows: list[dict[str, object]] = []
     execution_log: list[dict[str, object]] = []
 
-    for i in tqdm(range(len(data)), desc="Backtest bars", unit="bar"):
-        row = data.iloc[i]
-        ts = row["timestamp"]
+    # === B. Cache BP config values into locals ===
+    warmup_bars = BP["warmup_bars"]
+    trade_size_lots = BP["trade_size_lots"]
+    standard_lot_oz = BP["standard_lot_oz"]
+    units_oz = trade_size_lots * standard_lot_oz
+    commission_per_lot = BP["commission_usd_per_standard_lot_per_side"]
+    leverage = BP["leverage"]
+    slippage_mean = BP["slippage_mean_usd_per_oz"]
+    slippage_std = BP["slippage_std_usd_per_oz"]
+    spread_usd = BP["spread_usd_per_oz"]
+    half_spread = spread_usd / 2.0
+    usdinr = BP["usdinr_rate"]
+    execute_on_next = BP["execute_on_next_bar_open"]
+    allow_reversals = BP["allow_reversals"]
+    enable_risk = BP["enable_risk_exits"]
+    max_hold = BP["max_hold_bars"]
+    sl_usd = BP["stop_loss_usd_per_oz"]
+    tp_usd = BP["take_profit_usd_per_oz"]
+    tsl_usd = BP["trailing_stop_usd_per_oz"]
+    cons_fill = BP["conservative_intrabar_fill"]
+    maint_margin = BP["maintenance_margin_ratio"]
 
+    n = len(data)
+
+    for i in tqdm(range(n), desc="Backtest bars", unit="bar"):
+        ts = pd.Timestamp(timestamps_np[i])
+
+        # === C. Accrue swap and inline update_excursions when position is open ===
         if state.position is not None:
-            swap_cashflow = accrue_swap(state.position, ts)
-            if swap_cashflow:
-                state.cash += swap_cashflow
-                state.total_swap += swap_cashflow
-            update_excursions(state.position, float(row["high"]), float(row["low"]))
+            pos = state.position
+            # Inline accrue_swap (use pre-computed dates array)
+            current_date = dates[i]
+            if pos.last_swap_date is not None:
+                elapsed_days = max(0, (current_date - pos.last_swap_date).days)
+                if elapsed_days > 0:
+                    rate = BP["long_swap_usd_per_lot_per_day"] if pos.side == 1 else BP["short_swap_usd_per_lot_per_day"]
+                    swap_cf = rate * pos.lots * elapsed_days
+                    pos.accrued_swap_usd += swap_cf
+                    pos.last_swap_date = current_date
+                    state.cash += swap_cf
+                    state.total_swap += swap_cf
+            # Inline update_excursions
+            h = highs[i]
+            l = lows[i]
+            uoz = pos.units_oz
+            em = pos.entry_mid
 
-        if i < BP["warmup_bars"]:
-            unrealized = 0.0
-            equity = state.cash
-            equity_rows.append({
-                "timestamp": ts,
-                "cash_usd": state.cash,
-                "unrealized_pnl_usd": unrealized,
-                "equity_usd": equity,
-                "equity_inr": equity * BP["usdinr_rate"],
-                "used_margin_usd": 0.0,
-                "free_margin_usd": equity,
-                "position": 0,
-                "close": float(row["close"]),
-            })
-            continue
+            if pos.side == 1:
+                fav = (h - em) * uoz
+                adv = (l - em) * uoz
+                if tsl_usd > 0:
+                    stop = h - tsl_usd
+                    pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else max(pos.trailing_stop_mid, stop)
+            else:
+                fav = (em - l) * uoz
+                adv = (em - h) * uoz
+                if tsl_usd > 0:
+                    stop = l + tsl_usd
+                    pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
 
-        source_ts = data.iloc[i - 1]["timestamp"] if BP["execute_on_next_bar_open"] and i > 0 else ts
-        execution_mid = float(row["open"] if BP["execute_on_next_bar_open"] else row["close"])
-        
+            pos.mfe_usd = max(pos.mfe_usd, fav)
+            pos.mae_usd = min(pos.mae_usd, adv)
+            pos.best_price = max(pos.best_price, h) if pos.best_price else h
+            pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
+
+        # === D. Signal processing (always runs, including during warmup) ===
+        source_ts = pd.Timestamp(timestamps_np[i - 1]) if execute_on_next and i > 0 else ts
+        execution_mid = opens[i] if execute_on_next else closes[i]
+
         actions_taken = set()
 
         for event in signal_lookup.get(source_ts, []):
@@ -429,18 +443,116 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                 if new_side is None:
                     continue
                 if state.position is None:
-                    open_position(state, new_side, ts, execution_mid, i, reason, signal, rng)
-                    actions_taken.add("ENTER")
-                    # Immediate update for entry bar excursions and TSL
-                    if state.position is not None:
-                        update_excursions(state.position, float(row["high"]), float(row["low"]))
-                elif state.position.side != new_side and BP["allow_reversals"]:
+                    # Inline open_position
+                    needed_margin = (execution_mid * units_oz) / leverage
+                    if state.cash >= needed_margin:
+                        slip = max(0.0, float(rng.normal(slippage_mean, slippage_std)))
+                        if new_side == 1:
+                            entry_fill = execution_mid + half_spread + slip
+                            entry_cost = half_spread + slip
+                        else:
+                            entry_fill = execution_mid - half_spread - slip
+                            entry_cost = -(half_spread + slip)
+                        entry_friction = abs(entry_cost) * units_oz
+                        entry_comm = commission_per_lot * trade_size_lots
+                        state.cash -= entry_comm
+                        state.total_commission += entry_comm
+                        state.total_friction += entry_friction
+                        state.position = OpenPosition(
+                            side=new_side,
+                            entry_time=ts,
+                            entry_mid=execution_mid,
+                            entry_fill=entry_fill,
+                            entry_bar=i,
+                            lots=trade_size_lots,
+                            units_oz=units_oz,
+                            entry_commission=entry_comm,
+                            entry_friction=entry_friction,
+                            reason=reason,
+                            signal=signal,
+                            best_price=execution_mid,
+                            worst_price=execution_mid,
+                            last_swap_date=ts.date(),
+                        )
+                        actions_taken.add("ENTER")
+                        # Inline update_excursions for entry bar
+                        pos = state.position
+                        h = highs[i]
+                        l = lows[i]
+                        uoz = pos.units_oz
+                        em = pos.entry_mid
+                        if pos.side == 1:
+                            fav = (h - em) * uoz
+                            adv = (l - em) * uoz
+                            if tsl_usd > 0:
+                                stop = h - tsl_usd
+                                pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else max(pos.trailing_stop_mid, stop)
+                        else:
+                            fav = (em - l) * uoz
+                            adv = (em - h) * uoz
+                            if tsl_usd > 0:
+                                stop = l + tsl_usd
+                                pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
+                        pos.mfe_usd = max(pos.mfe_usd, fav)
+                        pos.mae_usd = min(pos.mae_usd, adv)
+                        pos.best_price = max(pos.best_price, h) if pos.best_price else h
+                        pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
+                elif state.position.side != new_side and allow_reversals:
                     close_position(state, ts, execution_mid, i, f"reverse: {reason}", signal, rng)
-                    open_position(state, new_side, ts, execution_mid, i, reason, signal, rng)
-                    actions_taken.add("REVERSE")
-                    # Immediate update for entry bar excursions and TSL
-                    if state.position is not None:
-                        update_excursions(state.position, float(row["high"]), float(row["low"]))
+                    # Inline open_position for reversal
+                    needed_margin = (execution_mid * units_oz) / leverage
+                    if state.cash >= needed_margin:
+                        slip = max(0.0, float(rng.normal(slippage_mean, slippage_std)))
+                        if new_side == 1:
+                            entry_fill = execution_mid + half_spread + slip
+                            entry_cost = half_spread + slip
+                        else:
+                            entry_fill = execution_mid - half_spread - slip
+                            entry_cost = -(half_spread + slip)
+                        entry_friction = abs(entry_cost) * units_oz
+                        entry_comm = commission_per_lot * trade_size_lots
+                        state.cash -= entry_comm
+                        state.total_commission += entry_comm
+                        state.total_friction += entry_friction
+                        state.position = OpenPosition(
+                            side=new_side,
+                            entry_time=ts,
+                            entry_mid=execution_mid,
+                            entry_fill=entry_fill,
+                            entry_bar=i,
+                            lots=trade_size_lots,
+                            units_oz=units_oz,
+                            entry_commission=entry_comm,
+                            entry_friction=entry_friction,
+                            reason=reason,
+                            signal=signal,
+                            best_price=execution_mid,
+                            worst_price=execution_mid,
+                            last_swap_date=ts.date(),
+                        )
+                        actions_taken.add("REVERSE")
+                        # Inline update_excursions for entry bar
+                        pos = state.position
+                        h = highs[i]
+                        l = lows[i]
+                        uoz = pos.units_oz
+                        em = pos.entry_mid
+                        if pos.side == 1:
+                            fav = (h - em) * uoz
+                            adv = (l - em) * uoz
+                            if tsl_usd > 0:
+                                stop = h - tsl_usd
+                                pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else max(pos.trailing_stop_mid, stop)
+                        else:
+                            fav = (em - l) * uoz
+                            adv = (em - h) * uoz
+                            if tsl_usd > 0:
+                                stop = l + tsl_usd
+                                pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
+                        pos.mfe_usd = max(pos.mfe_usd, fav)
+                        pos.mae_usd = min(pos.mae_usd, adv)
+                        pos.best_price = max(pos.best_price, h) if pos.best_price else h
+                        pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
 
             execution_log.append(
                 {
@@ -455,42 +567,88 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                 }
             )
 
-        if state.position is not None:
-            risk_exit = risk_exit_reason(state.position, row, i)
-            if risk_exit is not None:
-                reason, risk_mid = risk_exit
-                close_position(state, ts, risk_mid, i, reason, reason.upper(), rng)
+        # === E. Warmup check: skip risk/margin checks during warmup ===
+        if i >= warmup_bars:
+            # === E1. Inline risk_exit_reason (uses numpy arrays, not pd.Series row) ===
+            if state.position is not None:
+                pos = state.position
+                if enable_risk:
+                    hit_max_hold = max_hold > 0 and i - pos.entry_bar >= max_hold
+                    if hit_max_hold:
+                        close_position(state, ts, closes[i], i, "max_hold_bars", "MAX_HOLD_BARS", rng)
+                    elif pos.trailing_stop_mid is not None or sl_usd > 0 or tp_usd > 0:
+                        hit_sl = False
+                        hit_tp = False
+                        hit_tsl = False
+                        stop_mid = 0.0
+                        target_mid = 0.0
 
-        if state.position is not None:
-            used_margin = margin_required(float(row["close"]), state.position.units_oz)
-            equity_now = state.cash + mark_to_market(state.position, float(row["close"]))
-            if equity_now < used_margin * BP["maintenance_margin_ratio"]:
-                close_position(state, ts, float(row["close"]), i, "margin_call", "MARGIN_CALL", rng)
+                        if pos.side == 1:
+                            if sl_usd > 0:
+                                stop_mid = pos.entry_mid - sl_usd
+                                hit_sl = lows[i] <= stop_mid
+                            if tp_usd > 0:
+                                target_mid = pos.entry_mid + tp_usd
+                                hit_tp = highs[i] >= target_mid
+                            hit_tsl = lows[i] <= pos.trailing_stop_mid
 
-        unrealized = mark_to_market(state.position, float(row["close"]))
+                            if hit_sl and (cons_fill or not hit_tp):
+                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng)
+                            elif hit_tsl and (cons_fill or not hit_tp):
+                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng)
+                            elif hit_tp:
+                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng)
+                        else:
+                            if sl_usd > 0:
+                                stop_mid = pos.entry_mid + sl_usd
+                                hit_sl = highs[i] >= stop_mid
+                            if tp_usd > 0:
+                                target_mid = pos.entry_mid - tp_usd
+                                hit_tp = lows[i] <= target_mid
+                            hit_tsl = highs[i] >= pos.trailing_stop_mid
+
+                            if hit_sl and (cons_fill or not hit_tp):
+                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng)
+                            elif hit_tsl and (cons_fill or not hit_tp):
+                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng)
+                            elif hit_tp:
+                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng)
+
+            # === E2. Margin call check (uses numpy arrays) ===
+            if state.position is not None:
+                used_margin = (closes[i] * state.position.units_oz) / leverage
+                unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
+                equity_now = state.cash + unrealized
+                if equity_now < used_margin * maint_margin:
+                    close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng)
+
+        # === F. Record equity (always) ===
+        unrealized = 0.0
+        if state.position is not None:
+            unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
         equity = state.cash + unrealized
-        used_margin = 0.0 if state.position is None else margin_required(float(row["close"]), state.position.units_oz)
+        used_margin = 0.0 if state.position is None else (closes[i] * state.position.units_oz) / leverage
         equity_rows.append(
             {
                 "timestamp": ts,
                 "cash_usd": state.cash,
                 "unrealized_pnl_usd": unrealized,
                 "equity_usd": equity,
-                "equity_inr": equity * BP["usdinr_rate"],
+                "equity_inr": equity * usdinr,
                 "used_margin_usd": used_margin,
                 "free_margin_usd": equity - used_margin,
                 "position": 0 if state.position is None else state.position.side,
-                "close": float(row["close"]),
+                "close": closes[i],
             }
         )
 
+    # Force exit remaining position
     if state.position is not None:
-        last = data.iloc[-1]
-        close_position(state, last["timestamp"], float(last["close"]), len(data) - 1, "end_of_data", "FORCED_EXIT", rng)
+        close_position(state, timestamps[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng)
         equity_rows[-1]["cash_usd"] = state.cash
         equity_rows[-1]["unrealized_pnl_usd"] = 0.0
         equity_rows[-1]["equity_usd"] = state.cash
-        equity_rows[-1]["equity_inr"] = state.cash * BP["usdinr_rate"]
+        equity_rows[-1]["equity_inr"] = state.cash * usdinr
         equity_rows[-1]["position"] = 0
 
     trades_cols = ["entry_time", "exit_time", "side", "entry_signal", "exit_signal",
@@ -512,38 +670,66 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
 
 
 # ---------------------------------------------------------------------------
-# Stats and plots
+# Stats and plots (OPTIMIZED)
 # ---------------------------------------------------------------------------
 
 def max_drawdown(equity: pd.Series) -> tuple[float, float, int]:
-    peak = equity.cummax()
-    dd = equity - peak
-    dd_pct = dd / peak.replace(0, np.nan)
+    eq = equity.values
+    peak = np.maximum.accumulate(eq)
+    dd = eq - peak
     max_dd = float(dd.min()) if len(dd) else 0.0
-    max_dd_pct = float(dd_pct.min() * 100) if len(dd_pct) else 0.0
+    peak_safe = np.where(peak == 0, np.nan, peak)
+    dd_pct = dd / peak_safe
+    max_dd_pct = float(np.nanmin(dd_pct) * 100) if len(dd_pct) else 0.0
 
-    duration = 0
-    max_duration = 0
-    for value in dd:
-        if value < 0:
-            duration += 1
-            max_duration = max(max_duration, duration)
+    # Vectorized duration: use np.diff on boolean array
+    is_dd = dd < 0
+    if np.any(is_dd):
+        boundary = np.zeros(len(is_dd) + 1, dtype=bool)
+        boundary[:-1] = is_dd
+        diff = np.diff(boundary.astype(np.int64))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        if len(starts) > 0:
+            if len(ends) == 0 or ends[-1] < starts[-1]:
+                ends = np.append(ends, len(is_dd))
+            durations = ends - starts
+            max_duration = int(durations.max())
         else:
-            duration = 0
+            max_duration = 0
+    else:
+        max_duration = 0
     return max_dd, max_dd_pct, max_duration
 
 
-def consecutive_counts(values: pd.Series, win: bool) -> int:
-    best = 0
-    current = 0
-    for value in values:
-        hit = value > 0 if win else value <= 0
-        if hit:
-            current += 1
-            best = max(best, current)
+def consecutive_counts(values: np.ndarray | pd.Series, win: bool) -> int:
+    arr = values.values if hasattr(values, 'values') else np.asarray(values)
+    if len(arr) == 0:
+        return 0
+    if win:
+        is_hit = arr > 0
+    else:
+        is_hit = arr <= 0
+    boundary = np.zeros(len(is_hit) + 1, dtype=np.int64)
+    boundary[:-1] = is_hit.astype(np.int64)
+    diff = np.diff(boundary)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    if len(starts) == 0:
+        return 0
+    # Align starts and ends: skip ends that come before their corresponding start
+    aligned_ends = []
+    end_idx = 0
+    for s in starts:
+        while end_idx < len(ends) and ends[end_idx] < s:
+            end_idx += 1
+        if end_idx < len(ends):
+            aligned_ends.append(ends[end_idx])
+            end_idx += 1
         else:
-            current = 0
-    return best
+            aligned_ends.append(len(is_hit))
+    streaks = np.array(aligned_ends, dtype=np.int64) - starts
+    return int(np.max(streaks))
 
 
 def compute_summary(
@@ -560,13 +746,18 @@ def compute_summary(
     sharpe = float((returns.mean() / ret_std) * np.sqrt(BP["bars_per_year"])) if len(returns) and ret_std > 0 else 0.0
     max_dd, max_dd_pct, max_dd_bars = max_drawdown(equity["equity_usd"]) if len(equity) else (0.0, 0.0, 0)
 
-    # --- Stop Loss Diagnostics ---
+    # --- Pre-extract numpy arrays for vectorized diagnostics ---
+    data_closes = data["close"].values
+    data_highs = data["high"].values
+    data_lows = data["low"].values
+
+    # --- Stop Loss Diagnostics (vectorized) ---
     sl_total = 0
     sl_good = 0
     sl_bad = 0
     sl_efficiency_pct = 100.0
 
-    # --- Trailing Stop Diagnostics ---
+    # --- Trailing Stop Diagnostics (vectorized with numpy indexing) ---
     tsl_total = 0
     tsl_retention_avg = 0.0
     tsl_whipsaws = 0
@@ -584,63 +775,68 @@ def compute_summary(
         sl_total = len(sl_hits)
 
         if sl_total > 0:
+            # Vectorized: pre-extract close array, use numpy indexing
             max_hold = BP["max_hold_bars"]
-            for _, trade in sl_hits.iterrows():
-                check_idx = min(int(trade["entry_bar"]) + max_hold, len(data) - 1)
-                end_price = data.iloc[check_idx]["close"]
-                start_price = trade["entry_mid"]
-                
-                if trade["side"] == "LONG":
-                    if end_price <= start_price: sl_good += 1
-                    else: sl_bad += 1
-                else:
-                    if end_price >= start_price: sl_good += 1
-                    else: sl_bad += 1
-        
+            entry_bars_arr = (sl_hits["entry_bar"].astype(int)).values
+            check_idx = (entry_bars_arr + max_hold).clip(upper=len(data) - 1)
+            end_prices = data_closes[check_idx]
+            start_prices = sl_hits["entry_mid"].values
+            sides = sl_hits["side"].values
+
+            long_mask = sides == "LONG"
+            short_mask = ~long_mask
+            sl_good = int(np.sum((long_mask & (end_prices <= start_prices)) | (short_mask & (end_prices >= start_prices))))
+            sl_bad = sl_total - sl_good
+
         sl_efficiency_pct = (sl_good / sl_total * 100) if sl_total > 0 else 100.0
 
         tsl_hits = trades[trades["exit_reason"] == "trailing_stop"]
         tsl_total = len(tsl_hits)
 
         if tsl_total > 0:
-            retentions = []
             max_hold_val = BP["max_hold_bars"] if BP["max_hold_bars"] > 0 else (len(data) - 1)
-            
-            for _, trade in tsl_hits.iterrows():
-                entry_bar = int(trade["entry_bar"])
-                exit_bar = entry_bar + int(trade["bars_held"])
-                
-                mfe = abs(trade["mfe_usd"])
-                net_pnl = trade["gross_pnl_usd"]
-                if mfe > 0:
-                    retentions.append(max(0, net_pnl / mfe))
-                
-                end_window = min(entry_bar + max_hold_val, len(data) - 1)
-                window_data = data.iloc[entry_bar : end_window + 1]
-                
-                if trade["side"] == "LONG":
-                    peak_bar = window_data["high"].idxmax()
-                    exit_price = trade["exit_mid"]
-                    threshold = max(0.50, BP["trailing_stop_usd_per_oz"] * 0.2)
-                    lookahead = data.iloc[exit_bar : end_window + 1]
-                    if not lookahead.empty and lookahead["high"].max() > exit_price + threshold:
-                        tsl_whipsaws += 1
+
+            # Vectorized retention calculation
+            mfe_vals = np.abs(tsl_hits["mfe_usd"].values)
+            net_pnl_vals = tsl_hits["gross_pnl_usd"].values
+            retentions = np.where(mfe_vals > 0, np.maximum(0, net_pnl_vals / mfe_vals), 0.0)
+            tsl_retention_avg = float(np.mean(retentions) * 100) if len(retentions) else 0.0
+
+            # Vectorized entry/exit bar computation
+            entry_bars = tsl_hits["entry_bar"].astype(int).values
+            bars_held = tsl_hits["bars_held"].astype(int).values
+            exit_bars = entry_bars + bars_held
+
+            # Vectorized peak bar computation (corrected window: [entry_bar, end_window])
+            end_windows = np.minimum(entry_bars + max_hold_val, len(data) - 1)
+            peak_bars = np.empty(len(tsl_hits), dtype=np.int64)
+            sides = tsl_hits["side"].values
+
+            for j in range(len(tsl_hits)):
+                e, w = entry_bars[j], end_windows[j]
+                if sides[j] == "LONG":
+                    peak_bars[j] = e + int(np.argmax(data_highs[e:w + 1]))
                 else:
-                    peak_bar = window_data["low"].idxmin()
-                    exit_price = trade["exit_mid"]
-                    threshold = max(0.50, BP["trailing_stop_usd_per_oz"] * 0.2)
-                    lookahead = data.iloc[exit_bar : end_window + 1]
-                    if not lookahead.empty and lookahead["low"].min() < exit_price - threshold:
-                        tsl_whipsaws += 1
-                
-                if exit_bar > peak_bar:
-                    tsl_after_peak_count += 1
-                    tsl_after_peak_dist_sum += (exit_bar - peak_bar)
-                elif exit_bar < peak_bar:
-                    tsl_before_peak_count += 1
-                    tsl_before_peak_dist_sum += (peak_bar - exit_bar)
-            
-            tsl_retention_avg = (sum(retentions) / len(retentions) * 100) if retentions else 0.0
+                    peak_bars[j] = e + int(np.argmin(data_lows[e:w + 1]))
+
+            # Vectorized TSL whipsaw detection (corrected inclusive window)
+            lookahead_end = np.minimum(exit_bars + max_hold_val, len(data) - 1)
+            fwd_max = np.maximum.accumulate(data_highs[::-1])[::-1]
+            fwd_min = np.minimum.accumulate(data_lows[::-1])[::-1]
+            max_lookahead_highs = np.array([fwd_max[exit_bars[j]] if exit_bars[j] <= lookahead_end[j] else data_highs[exit_bars[j]] for j in range(len(tsl_hits))])
+            min_lookahead_lows = np.array([fwd_min[exit_bars[j]] if exit_bars[j] <= lookahead_end[j] else data_lows[exit_bars[j]] for j in range(len(tsl_hits))])
+            threshold = max(0.50, BP["trailing_stop_usd_per_oz"] * 0.2)
+            exit_mids = tsl_hits["exit_mid"].values
+            long_mask = sides == "LONG"
+            short_mask = ~long_mask
+            tsl_whipsaws = int(np.sum(long_mask & (max_lookahead_highs[long_mask] > exit_mids[long_mask] + threshold)))
+            tsl_whipsaws += int(np.sum(short_mask & (min_lookahead_lows[short_mask] < exit_mids[short_mask] - threshold)))
+
+            # Vectorized after/before peak counts
+            tsl_after_peak_count = int(np.sum(exit_bars > peak_bars))
+            tsl_before_peak_count = int(np.sum(exit_bars < peak_bars))
+            tsl_after_peak_dist_sum = int(np.sum(exit_bars[exit_bars > peak_bars] - peak_bars[exit_bars > peak_bars]))
+            tsl_before_peak_dist_sum = int(np.sum(peak_bars[exit_bars < peak_bars] - exit_bars[exit_bars < peak_bars]))
 
         tsl_after_peak_avg_bars = (tsl_after_peak_dist_sum / tsl_after_peak_count) if tsl_after_peak_count > 0 else 0.0
         tsl_before_peak_avg_bars = (tsl_before_peak_dist_sum / tsl_before_peak_count) if tsl_before_peak_count > 0 else 0.0

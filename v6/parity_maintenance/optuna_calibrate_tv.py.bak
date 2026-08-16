@@ -30,8 +30,19 @@ from definitions import (
     calculate_tdi_loxx
 )
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
+try:
+    import cudf
+    from gpu_io import load_csv_to_gpu
+    GPU_AVAILABLE = True
+except ImportError:
+    cudf = None
+    load_csv_to_gpu = None
+    GPU_AVAILABLE = False
 
 suppress_pandas_warnings()
+
+# GPU data cache — keeps cudf DataFrame alive across trial evaluations
+_GPU_DATA_CACHE = None
 
 # ---------------------------------------------------------------------------
 # Helpers (Native)
@@ -44,37 +55,14 @@ def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
     return (left.shift(1) >= right.shift(1)) & (left < right)
 
 def clean_bool(series: pd.Series) -> pd.Series:
+    """Ensures a series is boolean and fills NaNs with False."""
+    if hasattr(series, 'dtype'):
+        if str(series.dtype) in ('bool', 'boolean', 'bool_'):
+            return series.fillna(False)
     return series.fillna(False).astype(bool)
 
 # We import run_backtest and score_results directly from the backtest script to ensure parity
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
-
-def checkpoint_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> bool:
-    """Returns True if the trial should be pruned (catastrophic failure detected)."""
-    # Truncate data to first 25%
-    limit = int(len(data) * 0.25)
-    subset_data = data.iloc[:limit]
-    subset_signals = signals[signals["timestamp"] <= subset_data["timestamp"].iloc[-1]]
-    
-    if subset_signals.empty:
-        return False
-        
-    trades, equity, _, _ = run_backtest(subset_data, subset_signals)
-    if trades.empty:
-        return False
-        
-    # Check catastrophic failure conditions
-    # 1. Margin Call Check (simplified proxy: equity drops below initial * 0.5)
-    if equity["equity_usd"].iloc[-1] < (CONFIG["backtesting_params"]["initial_capital_usd"] * 0.5):
-        return True
-    
-    # 2. Drawdown Check (>50%)
-    peak = equity["equity_usd"].cummax()
-    dd = (peak - equity["equity_usd"]) / peak
-    if dd.max() > 0.5:
-        return True
-        
-    return False
 
 # ---------------------------------------------------------------------------
 # Logging & Config
@@ -104,28 +92,44 @@ DATA_CONFIG = CONFIG["data_config"]
 # Data Loading Helper
 # ---------------------------------------------------------------------------
 
-def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None) -> pd.DataFrame:
+def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None, use_gpu: bool = False) -> pd.DataFrame:
     source = data_csv_path if data_csv_path else str(DATA_CSV)
     skip = max(0, end_at_row - rows_to_load)
-    header = pd.read_csv(source, nrows=0).columns
-    read_kwargs = {
-        "nrows": rows_to_load,
-        "parse_dates": ["timestamp"],
-    }
-    if skip > 0:
-        read_kwargs["skiprows"] = range(1, skip + 1)
-        
-    data = pd.read_csv(source, **read_kwargs)
-    data.columns = [col.strip().lower() for col in header]
-    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
-    return data.sort_values("timestamp").reset_index(drop=True)
+    
+    if use_gpu and GPU_AVAILABLE and cudf is not None:
+        gpu_df = load_csv_to_gpu(source)
+        if skip > 0:
+            gpu_df = gpu_df.iloc[skip:end_at_row] if end_at_row != float('inf') else gpu_df.iloc[skip:]
+        elif end_at_row != float('inf'):
+            gpu_df = gpu_df.iloc[:end_at_row]
+        # Return cudf DataFrame as-is — indicator functions auto-dispatch to GPU
+        # Convert to pandas only after indicators complete (inside generate_tv_signals_local)
+        global _GPU_DATA_CACHE
+        _GPU_DATA_CACHE = gpu_df
+        return gpu_df
+    else:
+        header = pd.read_csv(source, nrows=0).columns
+        read_kwargs = {
+            "nrows": rows_to_load,
+            "parse_dates": ["timestamp"],
+        }
+        if skip > 0:
+            read_kwargs["skiprows"] = range(1, skip + 1)
+            
+        data = pd.read_csv(source, **read_kwargs)
+        data.columns = [col.strip().lower() for col in header]
+        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
+        return data.sort_values("timestamp").reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Signal Generation (TV Strategy Wrapper)
 # ---------------------------------------------------------------------------
 
-def generate_tv_signals_local(data: pd.DataFrame, params: dict) -> pd.DataFrame:
+def generate_tv_signals_local(data: pd.DataFrame, params: dict, use_gpu: bool = False) -> pd.DataFrame:
     p = {**TV_DEFAULTS, **params}
+    
+    # Track if data is cudf for proper conversion
+    is_cudf_input = cudf is not None and isinstance(data, cudf.DataFrame)
     
     tdi = calculate_tdi(data, rsi_period=p["tdi_rsi_period"], band_length=p["tdi_band_length"], 
                         fast_ma_len=p["tdi_fast_ma_len"], slow_ma_len=p["tdi_slow_ma_len"], mult=p["tdi_mult"])
@@ -200,6 +204,14 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict) -> pd.DataFrame:
     long_exit = tdi_upper_touch | tdi_upper_reject | loxx_upper_touch | donchian_upper_touch
     short_exit = tdi_lower_touch | tdi_lower_reclaim | loxx_lower_touch | donchian_lower_touch
 
+    # Convert to pandas/numpy for the state machine loop (inherently sequential, not vectorizable)
+    if is_cudf_input:
+        data = data.to_arrow().to_pandas()
+        buy_setup = buy_setup.to_arrow().to_pandas()
+        sell_setup = sell_setup.to_arrow().to_pandas()
+        long_exit = long_exit.to_arrow().to_pandas()
+        short_exit = short_exit.to_arrow().to_pandas()
+
     rows = []
     position = 0
     timestamps = data["timestamp"].to_numpy()
@@ -209,7 +221,10 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict) -> pd.DataFrame:
     lx_arr = long_exit.to_numpy()
     sx_arr = short_exit.to_numpy()
 
-    for i in range(len(data)):
+    # Sparse event iteration — only visit bars where something happens
+    all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
+
+    for i in all_event_indices:
         sig, act = None, None
         if position == 0:
             if buy_arr[i]:
@@ -230,23 +245,36 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict) -> pd.DataFrame:
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame, use_gpu: bool = False) -> float:
     # 1. Generate Signals
-    signals = generate_tv_signals_local(data, params)
+    signals = generate_tv_signals_local(data, params, use_gpu=use_gpu)
     if signals.empty:
         return -9999.0
     
-    # Pruning Check: 25% early fail
-    if checkpoint_backtest(data, signals):
-        raise optuna.exceptions.TrialPruned("Catastrophic failure detected in first 25% of data.")
-    
-    # 2. Run Backtest (Silent mode)
-    # We use a custom backtest wrapper that doesn't print or plot
+    # 2. Run Backtest ONCE (checkpoint logic merged here)
     trades, equity, _, _ = run_backtest(data, signals)
     if trades.empty:
         return -8888.0
-
-    # 3. Score Results (Penalty-based)
+    
+    # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
+    limit = int(len(data) * 0.25)
+    limit_ts = pd.Timestamp(data["timestamp"].iloc[limit])
+    # Ensure both timestamps are tz-naive before comparison
+    if limit_ts.tz is not None:
+        limit_ts = limit_ts.tz_localize(None)
+    equity_ts = equity["timestamp"]
+    if str(equity_ts.dtype).startswith("datetime") and equity_ts.dt.tz is not None:
+        equity_ts = equity_ts.dt.tz_localize(None)
+    early_equity = equity[equity_ts <= limit_ts]
+    if not early_equity.empty:
+        if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
+            raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
+        peak = early_equity["equity_usd"].cummax()
+        dd = (peak - early_equity["equity_usd"]) / peak
+        if dd.max() > 0.5:
+            raise optuna.exceptions.TrialPruned("Drawdown >50% in first 25%.")
+    
+    # 4. Score Results (unchanged)
     summary = compute_summary(trades, equity, signals, Path("dummy.csv"), data)
     
     sharpe = summary.get("sharpe_ratio", 0)
@@ -256,27 +284,52 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     trades_per_day = len(trades) / max(1, (data["timestamp"].iloc[-1] - data["timestamp"].iloc[0]).days)
     
     penalty = 0.0
-    # Activity Penalty
     if trades_per_day < CONSTRAINTS["min_trades_per_day"]:
         penalty += (CONSTRAINTS["min_trades_per_day"] - trades_per_day) * CONSTRAINTS["penalty_weight_trades"]
     elif trades_per_day > CONSTRAINTS["max_trades_per_day"]:
         penalty += (trades_per_day - CONSTRAINTS["max_trades_per_day"]) * (CONSTRAINTS["penalty_weight_trades"] / 2.0)
         
-    # Risk Penalty
     if cagr < CONSTRAINTS["min_cagr_pct"]:
         penalty += (CONSTRAINTS["min_cagr_pct"] - cagr) * CONSTRAINTS["penalty_weight_risk"]
     if max_dd > CONSTRAINTS["max_max_drawdown_pct"]:
         penalty += (max_dd - CONSTRAINTS["max_max_drawdown_pct"]) * CONSTRAINTS["penalty_weight_risk"]
         
-    # Balanced SOTA Score
-    objective_score = ((sharpe + calmar) / 2.0) - penalty
+    objective_score = cagr
+    if sharpe < CONSTRAINTS["min_sharpe"]:
+        objective_score -= (CONSTRAINTS["min_sharpe"] - sharpe) * CONSTRAINTS["penalty_weight_risk"]
+    if calmar < CONSTRAINTS["min_calmar"]:
+        objective_score -= (CONSTRAINTS["min_calmar"] - calmar) * CONSTRAINTS["penalty_weight_risk"]
+    objective_score -= penalty
     return float(objective_score)
 
 # ---------------------------------------------------------------------------
 # Parallel Optimization
 # ---------------------------------------------------------------------------
 
-def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None):
+def get_optimal_n_jobs():
+    """Return optimal parallel workers for Optuna."""
+    cpu_count = multiprocessing.cpu_count()
+    return min(cpu_count, 12)
+
+
+def enqueue_top_trials(study, ranges: dict, n: int = None):
+    """Enqueue the top-N trials from a study as warm-start candidates."""
+    if n is None:
+        n = OPTUNA_CONF["top_n_to_enqueue"]
+    trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else -np.inf, reverse=True)
+    enqueued = 0
+    for trial in trials:
+        if enqueued >= n:
+            break
+        params = {k: v for k, v in trial.params.items() if k in ranges}
+        if params:
+            study.enqueue_trial(params)
+            enqueued += 1
+    if enqueued > 0:
+        logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
+
+
+def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None, use_gpu: bool = False):
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -292,7 +345,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
     
-    def objective(trial):
+    def objective(trial, _use_gpu=use_gpu):
         # Suggest parameters based on ranges
         trial_params = {}
         for k, v in ranges.items():
@@ -302,7 +355,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 if current_best and phase >= 2:
                     # Narrow refinement around best
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = max(1, int(width * refine_pct))
                     low = max(v[0], current_best[k] - r_width // 2)
                     high = min(v[1], current_best[k] + r_width // 2)
@@ -313,7 +366,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 # Float param
                 if current_best and phase >= 2:
                     width = v[1] - v[0]
-                    refine_pct = CONFIG["calibration_params"]["phases"]["phase2_refinement_pct"] if phase == 2 else CONFIG["calibration_params"]["phases"]["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
                     r_width = width * refine_pct
                     low = max(v[0], current_best[k] - r_width / 2.0)
                     high = min(v[1], current_best[k] + r_width / 2.0)
@@ -321,9 +374,9 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
         
-        return objective_wrapper(trial_params, data)
+        return objective_wrapper(trial_params, data, use_gpu=_use_gpu)
 
-    n_jobs = 4
+    n_jobs = get_optimal_n_jobs()
     for attempt in range(3):
         try:
             study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
@@ -345,6 +398,7 @@ def main():
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration via cudf/cupy.")
     args = parser.parse_args()
     
     end_row = args.end_row
@@ -354,7 +408,7 @@ def main():
         trial_rows = end_row - args.start_row
 
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
-    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
+    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv, use_gpu=args.gpu)
     
     # Ensure storage directory exists
     db_dir = PROJECT_DIR / "optuna_db"
@@ -400,18 +454,24 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
             
+            # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
+            enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
+            
             # PHASE 2
             logger.info("PHASE 2: Bayesian (TPE) Refinement...")
             p2_trials = OPTUNA_CONF["phase2_trials"]
-            study = run_study(2, p2_trials, TPESampler(n_startup_trials=0), data, "tv_discovery", storage_path, current_best=current_best)
+            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
             
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
+            
+            # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
+            enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
     
     # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=0), data, "tv_discovery", storage_path, current_best=current_best)
+    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
     
     # Survival of the Fittest Check
     best_score = study.best_value

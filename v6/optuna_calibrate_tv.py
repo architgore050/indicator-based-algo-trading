@@ -30,14 +30,9 @@ from definitions import (
     calculate_tdi_loxx
 )
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
-try:
-    import cudf
-    from gpu_io import load_csv_to_gpu
-    GPU_AVAILABLE = True
-except ImportError:
-    cudf = None
-    load_csv_to_gpu = None
-    GPU_AVAILABLE = False
+import cudf
+from gpu_io import load_csv
+from backtest_xauusd_signal_csv import run_backtest, compute_summary
 
 suppress_pandas_warnings()
 
@@ -92,44 +87,21 @@ DATA_CONFIG = CONFIG["data_config"]
 # Data Loading Helper
 # ---------------------------------------------------------------------------
 
-def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None, use_gpu: bool = False) -> pd.DataFrame:
+def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str = None) -> cudf.DataFrame:
     source = data_csv_path if data_csv_path else str(DATA_CSV)
     skip = max(0, end_at_row - rows_to_load)
     
-    if use_gpu and GPU_AVAILABLE and cudf is not None:
-        gpu_df = load_csv_to_gpu(source)
-        if skip > 0:
-            gpu_df = gpu_df.iloc[skip:end_at_row] if end_at_row != float('inf') else gpu_df.iloc[skip:]
-        elif end_at_row != float('inf'):
-            gpu_df = gpu_df.iloc[:end_at_row]
-        # Return cudf DataFrame as-is — indicator functions auto-dispatch to GPU
-        # Convert to pandas only after indicators complete (inside generate_tv_signals_local)
-        global _GPU_DATA_CACHE
-        _GPU_DATA_CACHE = gpu_df
-        return gpu_df
-    else:
-        header = pd.read_csv(source, nrows=0).columns
-        read_kwargs = {
-            "nrows": rows_to_load,
-            "parse_dates": ["timestamp"],
-        }
-        if skip > 0:
-            read_kwargs["skiprows"] = range(1, skip + 1)
-            
-        data = pd.read_csv(source, **read_kwargs)
-        data.columns = [col.strip().lower() for col in header]
-        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_localize(None)
-        return data.sort_values("timestamp").reset_index(drop=True)
+    gpu_df = load_csv(source, skiprows=skip, nrows=rows_to_load)
+    global _GPU_DATA_CACHE
+    _GPU_DATA_CACHE = gpu_df
+    return gpu_df
 
 # ---------------------------------------------------------------------------
 # Signal Generation (TV Strategy Wrapper)
 # ---------------------------------------------------------------------------
 
-def generate_tv_signals_local(data: pd.DataFrame, params: dict, use_gpu: bool = False) -> pd.DataFrame:
+def generate_tv_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
     p = {**TV_DEFAULTS, **params}
-    
-    # Track if data is cudf for proper conversion
-    is_cudf_input = cudf is not None and isinstance(data, cudf.DataFrame)
     
     tdi = calculate_tdi(data, rsi_period=p["tdi_rsi_period"], band_length=p["tdi_band_length"], 
                         fast_ma_len=p["tdi_fast_ma_len"], slow_ma_len=p["tdi_slow_ma_len"], mult=p["tdi_mult"])
@@ -204,22 +176,21 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict, use_gpu: bool = 
     long_exit = tdi_upper_touch | tdi_upper_reject | loxx_upper_touch | donchian_upper_touch
     short_exit = tdi_lower_touch | tdi_lower_reclaim | loxx_lower_touch | donchian_lower_touch
 
-    # Convert to pandas/numpy for the state machine loop (inherently sequential, not vectorizable)
-    if is_cudf_input:
-        data = data.to_pandas()
-        buy_setup = buy_setup.to_pandas()
-        sell_setup = sell_setup.to_pandas()
-        long_exit = long_exit.to_pandas()
-        short_exit = short_exit.to_pandas()
+    # Convert to pandas/numpy for the state machine loop (inherently sequential)
+    data_pd = data.to_arrow().to_pandas()
+    buy_setup_pd = buy_setup.to_arrow().to_pandas()
+    sell_setup_pd = sell_setup.to_arrow().to_pandas()
+    long_exit_pd = long_exit.to_arrow().to_pandas()
+    short_exit_pd = short_exit.to_arrow().to_pandas()
 
     rows = []
     position = 0
-    timestamps = data["timestamp"].to_numpy()
+    timestamps = data_pd["timestamp"].to_numpy()
     
-    buy_arr = buy_setup.to_numpy()
-    sell_arr = sell_setup.to_numpy()
-    lx_arr = long_exit.to_numpy()
-    sx_arr = short_exit.to_numpy()
+    buy_arr = np.asarray(buy_setup_pd, dtype=bool)
+    sell_arr = np.asarray(sell_setup_pd, dtype=bool)
+    lx_arr = np.asarray(long_exit_pd, dtype=bool)
+    sx_arr = np.asarray(short_exit_pd, dtype=bool)
 
     # Sparse event iteration — only visit bars where something happens
     all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
@@ -245,9 +216,9 @@ def generate_tv_signals_local(data: pd.DataFrame, params: dict, use_gpu: bool = 
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame, use_gpu: bool = False) -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     # 1. Generate Signals
-    signals = generate_tv_signals_local(data, params, use_gpu=use_gpu)
+    signals = generate_tv_signals_local(data, params)
     if signals.empty:
         return -9999.0
     
@@ -258,7 +229,14 @@ def objective_wrapper(params: dict, data: pd.DataFrame, use_gpu: bool = False) -
     
     # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
     limit = int(len(data) * 0.25)
-    early_equity = equity[equity["timestamp"] <= data["timestamp"].iloc[limit]]
+    limit_ts = pd.Timestamp(data["timestamp"].iloc[limit])
+    # Ensure both timestamps are tz-naive before comparison
+    if limit_ts.tz is not None:
+        limit_ts = limit_ts.tz_localize(None)
+    equity_ts = equity["timestamp"]
+    if str(equity_ts.dtype).startswith("datetime") and equity_ts.dt.tz is not None:
+        equity_ts = equity_ts.dt.tz_localize(None)
+    early_equity = equity[equity_ts <= limit_ts]
     if not early_equity.empty:
         if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
             raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
@@ -322,7 +300,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
         logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name: str, storage: str, current_best: dict = None, use_gpu: bool = False):
+def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study_name: str, storage: str, current_best: dict = None):
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
@@ -338,7 +316,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
     
-    def objective(trial, _use_gpu=use_gpu):
+    def objective(trial):
         # Suggest parameters based on ranges
         trial_params = {}
         for k, v in ranges.items():
@@ -367,7 +345,7 @@ def run_study(phase: int, n_trials: int, sampler, data: pd.DataFrame, study_name
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
         
-        return objective_wrapper(trial_params, data, use_gpu=_use_gpu)
+        return objective_wrapper(trial_params, data)
 
     n_jobs = get_optimal_n_jobs()
     for attempt in range(3):
@@ -391,7 +369,6 @@ def main():
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
-    parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration via cudf/cupy.")
     args = parser.parse_args()
     
     end_row = args.end_row
@@ -401,7 +378,7 @@ def main():
         trial_rows = end_row - args.start_row
 
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
-    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv, use_gpu=args.gpu)
+    data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
     
     # Ensure storage directory exists
     db_dir = PROJECT_DIR / "optuna_db"
@@ -442,7 +419,12 @@ def main():
         if args.smoke:
             logger.info("Smoke test complete.")
             # Even in smoke, we want to save something so PHASE 3 doesn't crash if we test the flow
-            current_best = study.best_params
+            try:
+                current_best = study.best_params
+            except ValueError:
+                # All trials returned -9999 (empty signals) — use defaults
+                logger.warning("All trials returned -9999. Using default parameters.")
+                current_best = None
         else:
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
@@ -467,8 +449,13 @@ def main():
     study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
     
     # Survival of the Fittest Check
-    best_score = study.best_value
-    best_params = study.best_params
+    try:
+        best_score = study.best_value
+        best_params = study.best_params
+    except ValueError:
+        logger.warning("No valid trials found. Using default parameters.")
+        best_score = -9999.0
+        best_params = {}
     
     if args.annual_baseline and baseline_annual_score > best_score:
         logger.info(f"Survival Check: Refined params ({best_score:.4f}) FAILED to beat annual baseline ({baseline_annual_score:.4f}). Reverting to annual params.")
