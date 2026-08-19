@@ -266,7 +266,9 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
     calmar = summary.get("calmar_ratio", 0)
     cagr = summary.get("cagr_pct", -100)
     max_dd = summary.get("max_drawdown_pct", 100)
-    trades_per_day = len(trades) / max(1, (data["timestamp"].iloc[-1] - data["timestamp"].iloc[0]).days)
+    # Wrap timedelta in pd.Timedelta to handle numpy.timedelta64 from cudf
+    _td = pd.Timedelta(data["timestamp"].iloc[-1] - data["timestamp"].iloc[0])
+    trades_per_day = len(trades) / max(1, _td.days)
     
     penalty = 0.0
     if trades_per_day < CONSTRAINTS["min_trades_per_day"]:

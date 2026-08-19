@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import sys
@@ -337,11 +338,22 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
 
     # Pre-extract data to cupy arrays for GPU-native computation
     # Timestamps stay as numpy (cupy doesn't support datetime64)
-    timestamps_np = data["timestamp"].to_numpy()
-    opens = cp.asarray(data["open"].to_numpy().astype(np.float64))
-    highs = cp.asarray(data["high"].to_numpy().astype(np.float64))
-    lows = cp.asarray(data["low"].to_numpy().astype(np.float64))
-    closes = cp.asarray(data["close"].to_numpy().astype(np.float64))
+    # Convert via pandas bridge to avoid cudf.to_numpy() CUDA context issues
+    if hasattr(data, "to_arrow"):
+        timestamps_np = data["timestamp"].to_arrow().to_pandas().to_numpy()
+    else:
+        timestamps_np = data["timestamp"].to_numpy()
+    # Convert via pandas bridge to avoid cudf.to_numpy() CUDA context issues
+    if hasattr(data, "to_arrow"):
+        opens = cp.asarray(data["open"].to_arrow().to_pandas().to_numpy().astype(np.float64))
+        highs = cp.asarray(data["high"].to_arrow().to_pandas().to_numpy().astype(np.float64))
+        lows = cp.asarray(data["low"].to_arrow().to_pandas().to_numpy().astype(np.float64))
+        closes = cp.asarray(data["close"].to_arrow().to_pandas().to_numpy().astype(np.float64))
+    else:
+        opens = cp.asarray(data["open"].to_numpy().astype(np.float64))
+        highs = cp.asarray(data["high"].to_numpy().astype(np.float64))
+        lows = cp.asarray(data["low"].to_numpy().astype(np.float64))
+        closes = cp.asarray(data["close"].to_numpy().astype(np.float64))
 
     # Pre-compute dates array for swap accrual (avoids repeated pd.Timestamp() in loop)
     dates = np.array([pd.Timestamp(ts).date() for ts in timestamps_np], dtype=object)
@@ -623,11 +635,12 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                     close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng)
 
         # === F. Record equity (always) ===
+        close_i = float(closes[i])
         unrealized = 0.0
         if state.position is not None:
-            unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
-        equity = state.cash + unrealized
-        used_margin = 0.0 if state.position is None else (closes[i] * state.position.units_oz) / leverage
+            unrealized = float((closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side)
+        equity = float(state.cash + unrealized)
+        used_margin = 0.0 if state.position is None else float(close_i * state.position.units_oz) / leverage
         equity_rows.append(
             {
                 "timestamp": ts,
@@ -638,13 +651,13 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                 "used_margin_usd": used_margin,
                 "free_margin_usd": equity - used_margin,
                 "position": 0 if state.position is None else state.position.side,
-                "close": closes[i],
+                "close": close_i,
             }
         )
 
     # Force exit remaining position
     if state.position is not None:
-        close_position(state, timestamps[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng)
+        close_position(state, timestamps_np[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng)
         equity_rows[-1]["cash_usd"] = state.cash
         equity_rows[-1]["unrealized_pnl_usd"] = 0.0
         equity_rows[-1]["equity_usd"] = state.cash
@@ -747,9 +760,15 @@ def compute_summary(
     max_dd, max_dd_pct, max_dd_bars = max_drawdown(equity["equity_usd"]) if len(equity) else (0.0, 0.0, 0)
 
     # --- Pre-extract numpy arrays for vectorized diagnostics ---
-    data_closes = data["close"].values
-    data_highs = data["high"].values
-    data_lows = data["low"].values
+    # Convert via pandas bridge to avoid cudf CUDA context issues
+    if hasattr(data, "to_arrow"):
+        data_closes = data["close"].to_arrow().to_pandas().to_numpy()
+        data_highs = data["high"].to_arrow().to_pandas().to_numpy()
+        data_lows = data["low"].to_arrow().to_pandas().to_numpy()
+    else:
+        data_closes = data["close"].values
+        data_highs = data["high"].values
+        data_lows = data["low"].values
 
     # --- Stop Loss Diagnostics (vectorized) ---
     sl_total = 0
@@ -1153,19 +1172,28 @@ def plot_price_trades(data: pd.DataFrame, trades: pd.DataFrame, out_dir: Path) -
 
 
 def save_plots(data: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, out_dir: Path) -> None:
-    with tqdm(total=6, desc="Saving plots", unit="plot") as pbar:
-        plot_equity(equity, out_dir)
-        pbar.update()
-        plot_drawdown(equity, out_dir)
-        pbar.update()
-        plot_trade_histogram(trades, out_dir)
-        pbar.update()
-        plot_duration_scatter(trades, out_dir)
-        pbar.update()
-        plot_monthly_returns(equity, out_dir)
-        pbar.update()
-        plot_price_trades(data, trades, out_dir)
-        pbar.update()
+    # File-lock to prevent concurrent matplotlib/PIL savefig races across parallel backtests
+    lock_path = out_dir / ".plot_lock"
+    lock_path.touch(exist_ok=True)
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        with tqdm(total=6, desc="Saving plots", unit="plot") as pbar:
+            plot_equity(equity, out_dir)
+            pbar.update()
+            plot_drawdown(equity, out_dir)
+            pbar.update()
+            plot_trade_histogram(trades, out_dir)
+            pbar.update()
+            plot_duration_scatter(trades, out_dir)
+            pbar.update()
+            plot_monthly_returns(equity, out_dir)
+            pbar.update()
+            plot_price_trades(data, trades, out_dir)
+            pbar.update()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 def main() -> None:
@@ -1228,7 +1256,7 @@ def main() -> None:
         pbar.update()
         skipped.to_csv(out_dir / "skipped_signals.csv", index=False)
         pbar.update()
-        daily = equity.set_index("timestamp")["equity_usd"].resample("D").last().pct_change().dropna()
+        daily = equity.set_index("timestamp")["equity_usd"].resample("D").last().pct_change(fill_method=None).dropna()
         daily.to_frame("daily_return").to_csv(out_dir / "daily_returns.csv")
         pbar.update()
         save_summary(summary, out_dir)

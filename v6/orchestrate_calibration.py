@@ -1,15 +1,16 @@
+import argparse
 import json
 import logging
-import shutil
-import argparse
 import multiprocessing
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import math
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 from tqdm import tqdm
 
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
@@ -17,6 +18,26 @@ from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logge
 PYTHON = sys.executable
 
 suppress_pandas_warnings()
+
+
+# ---------------------------------------------------------------------------
+# WSL-aware environment activation for subprocess spawning
+# ---------------------------------------------------------------------------
+
+def get_env_activation():
+    """Return environment activation prefix for subprocesses.
+
+    When running inside WSL (already in rapids env): return "" — subprocesses inherit the environment.
+    When running on Windows: return the wsl bash -c wrapper.
+    """
+    if os.path.exists("/proc/version"):
+        try:
+            with open("/proc/version", "r") as f:
+                if "microsoft" in f.read().lower():
+                    return ""  # Already in WSL + rapids, no activation needed
+        except Exception:
+            pass
+    return 'wsl bash -c "cd /mnt/c/Users/gorea/Desktop/indicator\\\\ based\\\\ algo\\\\ trading/indicator\\\\ based\\\\ algo\\\\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && '
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +121,8 @@ def compute_max_rows_per_window(args, full_cal_rows: int, rows_per_window: int, 
     """
     # Annual IS: 1000 rows in smoke, full_cal_rows otherwise
     annual_is = 1000 if args.smoke else full_cal_rows
-    # Monthly IS: recal_windows_count * rows_per_window (same for smoke and full)
-    monthly_is = recal_windows_count * rows_per_window
+    # Monthly IS: reduced to 1000 in smoke, recal_windows_count * rows_per_window otherwise
+    monthly_is = 1000 if args.smoke else recal_windows_count * rows_per_window
     # OOS is always one window
     oos = rows_per_window
 
@@ -163,6 +184,11 @@ CALIB_PARAMS = CONFIG["calibration_params"]
 DATA_CONF = CONFIG["data_config"]
 
 def setup_wfv_dirs():
+    # Close file handlers on the root logger before rmtree to avoid
+    # PermissionError on Windows when main_log.txt is locked.
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
     if WFV_DIR.exists():
         shutil.rmtree(WFV_DIR)
     WFV_DIR.mkdir()
@@ -174,9 +200,14 @@ def get_signal_script(strategy: str) -> str:
     return f"generate_{'tv_strategy1' if strategy == 'tv' else 'vm_automation_logic'}_signals.py"
 
 def run_step(cmd):
-    logger.info(f"Running: {' '.join(cmd)}")
-    import subprocess
-    subprocess.run(cmd, check=True)
+    env_activation = get_env_activation()
+    inner_cmd = shlex.join(cmd) if isinstance(cmd, list) else cmd
+    if env_activation:
+        cmd_str = f'{env_activation}{inner_cmd}"'
+    else:
+        cmd_str = inner_cmd
+    logger.info(f"Running: {cmd_str}")
+    subprocess.run(cmd_str, shell=True, check=True)
 
 # ---------------------------------------------------------------------------
 # Window Processing Logic (The Worker)
@@ -204,7 +235,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     if is_annual:
         is_start = is_end - (1000 if args.smoke else full_cal_rows)
     else:
-        is_start = is_end - (rows_per_window * recal_windows_count)
+        is_start = is_end - (1000 if args.smoke else rows_per_window * recal_windows_count)
 
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
@@ -220,7 +251,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     if trigger_refinement:
         window_cal_output = str(current_dir / f"calibration_results_{strategy}.json")
         cal_cmd = [
-            PYTHON, get_calibration_script(strategy),
+            PYTHON, str(PROJECT_DIR / get_calibration_script(strategy)),
             "--data-csv", row_to_chunk[(is_start, is_end)],
             "--start-row", "0",
             "--end-row", str(is_end - is_start + 1),
@@ -233,10 +264,15 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             if yearly_best_path and yearly_best_path.exists():
                 cal_cmd.extend(["--annual-baseline", str(yearly_best_path)])
 
-        worker_logger.info(f"Calibration Command: {' '.join(cal_cmd)}")
+        env_activation = get_env_activation()
+        cal_cmd_str = (
+            f'{env_activation}{shlex.join(cal_cmd)}"'
+            if env_activation
+            else shlex.join(cal_cmd)
+        )
+        worker_logger.info(f"Calibration Command: {cal_cmd_str}")
         try:
-            import subprocess
-            subprocess.run(cal_cmd, check=True)
+            subprocess.run(cal_cmd_str, shell=True, check=True)
         except Exception as e:
             worker_logger.error(f"Calibration failed for window {i}: {e}")
             return False
@@ -253,7 +289,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     window_cal = current_dir / f"calibration_results_{strategy}.json"
     oos_window_size = oos_end - oos_start + 1
     signal_cmd = [
-        PYTHON, get_signal_script(strategy),
+        PYTHON, str(PROJECT_DIR / get_signal_script(strategy)),
         "--mode", "smoke" if args.smoke else "test",
         "--data-csv", row_to_chunk[(oos_start, oos_end)],
         "--start-row", "0",
@@ -279,7 +315,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     signal_file_path = current_dir / f"{base_sig}{sig_suffix}"
     
     run_step([
-        PYTHON, "backtest_xauusd_signal_csv.py",
+        PYTHON, str(PROJECT_DIR / "backtest_xauusd_signal_csv.py"),
         "--strategy", strategy,
         "--mode", "smoke" if args.smoke else "test",
         "--data-csv", row_to_chunk[(oos_start, oos_end)],
@@ -340,9 +376,20 @@ def main():
         logger.info(f"[{mode_label}] VRAM-aware worker limit: {safe_count} workers (total VRAM: {total_vram:.1f}GB, est per worker: {vram_per_worker:.2f}GB)")
     else:
         logger.info(f"[{mode_label}] VRAM detection unavailable — using conservative limit: {safe_count} workers")
+
+    # In smoke mode, cap workers aggressively to avoid GPU memory contention
+    if args.smoke:
+        safe_count = min(safe_count, 2)
+        logger.info(f"[{mode_label}] Smoke mode: capping workers to {safe_count}")
+
     args.workers = safe_count
 
     setup_wfv_dirs()
+
+    # In smoke mode, cap the number of windows for fast feedback
+    if args.smoke:
+        total_windows = min(total_windows, 5)
+        logger.info(f"[SMOKE] Capped to {total_windows} windows for fast feedback")
 
     logger.info(f"Starting Parallel WFV for {args.strategy.upper()}. Total Windows: {total_windows}")
     logger.info(f"Using {args.workers} workers.")
@@ -363,7 +410,7 @@ def main():
         if is_annual:
             is_start = is_end - (1000 if args.smoke else full_cal_rows)
         else:
-            is_start = is_end - (rows_per_window * recal_windows_count)
+            is_start = is_end - (1000 if args.smoke else rows_per_window * recal_windows_count)
         row_ranges.append((max(0, is_start), is_end))      # calibration IS range
         row_ranges.append((oos_start, oos_end))             # signal/backtest OOS range
 

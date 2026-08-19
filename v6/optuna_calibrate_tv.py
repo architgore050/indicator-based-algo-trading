@@ -9,6 +9,8 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import multiprocessing
+import os
+import uuid
 
 import matplotlib
 matplotlib.use('Agg')
@@ -252,7 +254,9 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     calmar = summary.get("calmar_ratio", 0)
     cagr = summary.get("cagr_pct", -100)
     max_dd = summary.get("max_drawdown_pct", 100)
-    trades_per_day = len(trades) / max(1, (data["timestamp"].iloc[-1] - data["timestamp"].iloc[0]).days)
+    # Wrap timedelta in pd.Timedelta to handle numpy.timedelta64 from cudf
+    _td = pd.Timedelta(data["timestamp"].iloc[-1] - data["timestamp"].iloc[0])
+    trades_per_day = len(trades) / max(1, _td.days)
     
     penalty = 0.0
     if trades_per_day < CONSTRAINTS["min_trades_per_day"]:
@@ -369,7 +373,15 @@ def main():
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
+    parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_tv.json).")
     args = parser.parse_args()
+    
+    # Override results path for per-window isolation (parallel WFV safety)
+    if args.output:
+        RESULTS_PATH = Path(args.output)
+        RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        RESULTS_PATH = PROJECT_DIR / "calibration_results_tv.json"
     
     end_row = args.end_row
     trial_rows = 1000 if args.smoke else CALIB_PARAMS["calibration_rows_per_trial"]
@@ -384,7 +396,7 @@ def main():
     db_dir = PROJECT_DIR / "optuna_db"
     db_dir.mkdir(exist_ok=True)
     
-    db_name = f"optuna_tv_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    db_name = f"optuna_tv_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
     storage_path = f"sqlite:///{db_dir / db_name}"
     
     current_best = None

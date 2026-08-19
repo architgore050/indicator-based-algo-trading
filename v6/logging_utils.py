@@ -86,14 +86,18 @@ def get_logger(name, log_dir=None, worker_id=None):
         logger.setLevel(logging.INFO)
 
     # --- Console handler (INFO level) ---
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
+    # Only add console handler when no file handler is being added.
+    # When log_dir is provided, file handler handles output; messages
+    # propagate to root logger's console handler, avoiding duplicates.
+    if log_dir is None:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
 
     # --- File handler (optional, per-worker) ---
     if log_dir is not None:

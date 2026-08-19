@@ -27,15 +27,35 @@ The active codebase lives in `v6/`. It consists of:
 
 | Component | Files | Purpose |
 |---|---|---|
-| **Indicator Engine** | `definitions.py`, `gpu_io.py` | Vectorized indicator math with GPU dispatch paths; CSV↔GPU I/O helpers |
-| **Calibration Pipeline** | `orchestrate_calibration.py`, `optuna_calibrate_*.py` | WFV orchestrator + Bayesian optimization per strategy |
-| **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py` | Produce window-specific signal CSVs from calibrated parameters |
-| **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals with realistic risk management |
+| **Indicator Engine** | `definitions.py` | Fully GPU-native indicator computation (cudf/cupy). 17 functions, zero pandas fallback. |
+| **CSV I/O** | `gpu_io.py` | Minimal CSV I/O helpers. Pandas used only at data boundaries. |
+| **Calibration Pipeline** | `orchestrate_calibration.py`, `optuna_calibrate_*.py` | WFV orchestrator + Bayesian optimization per strategy. All GPU-native. |
+| **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py` | Produce window-specific signal CSVs from calibrated parameters. All GPU-native. |
+| **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals. 305-820% speedup over pandas baseline. All GPU-native. |
 | **Collation** | `collate_wfv_results.py` | Aggregate WFV results across windows |
 | **Utilities** | `logging_utils.py`, `data_download.py` | Structured logging, 1-minute XAUUSD data ingestion |
-| **Validation** | `parity_test_optuna_calibrate.py` | Parity test for Optuna calibration pipeline. `parity_test_signal_generators.py` does not yet exist — needs to be created for signal generator parity testing. |
+| **Validation** | `parity_maintenance/` | All parity tests and `.bak` backups. Contains: `parity_test_definitions.py`, `parity_test_gpu_io.py`, `parity_test_backtesting.py`, `parity_test_optuna_calibrate.py`, and 8 `.bak` files. |
 | **Configuration** | `config.json`, `best_manual_params_vm.json`, `calibration_results_vm.json` | Baseline parameters (DO NOT MODIFY), manual tuning reference, calibration overrides |
 | **Data** | `data.csv` | Raw 1-minute XAUUSD OHLCV data |
+
+Two strategies are implemented:
+1. **VM Strategy** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD.
+2. **TV Strategy** — Inspired by TradingView community indicators (TDI, Loxx, Donchian Bands).
+
+## GPU Migration Status (COMPLETE)
+The pandas→cudf migration is complete. All dual-path code (~560 lines) has been removed from 7 files. The codebase is now fully GPU-native with pandas used only at CSV I/O boundaries.
+
+**Migration docs:** `docs/gpu_migration/M14_cudf_migration_final_audit.md` (comprehensive audit)
+
+**Key changes:**
+- `definitions.py` — 17 indicator functions, cudf-only, zero pandas fallback
+- `gpu_io.py` — simplified to CSV I/O helpers only
+- `optuna_calibrate_*.py` — single cudf path, no `--gpu` flag
+- `generate_*_signals.py` — single cudf path, no `--gpu` flag
+- `backtest_xauusd_signal_csv.py` — cupy arrays for numeric data, 305-820% speedup
+- `orchestrate_calibration.py` — unchanged (pure coordination, pandas only at CSV boundary)
+
+**15 bugs fixed during migration, all parity tests pass with zero skips.**
 
 Two strategies are implemented:
 1. **VM Strategy** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD.
@@ -45,14 +65,75 @@ Two strategies are implemented:
 All legacy version directories (v2–v5) have been removed. Only `v6/` remains as the active codebase. No migration awareness or cross-version comparison is needed.
 - `calibrate_vm_strategy.py` and `calibrate_tv_strategy.py` were deleted — they imported nonexistent `scorer.py` and were legacy fallback references. Git history can recover them if needed.
 
-## Environment Setup (WSL + RAPIDS)
-GPU-related code runs through WSL Ubuntu with the `rapids` conda environment:
+## MANDATORY: Read AGENTS.md
+
+All subagents MUST read AGENTS.md before starting work. It contains essential project context including:
+- Project vision and design philosophy
+- Hardware context (RTX 5080, CUDA 12.9, WSL)
+- Architecture overview (v6/ structure)
+- Critical operational rules (headless execution, cudf inspection, vectorization)
+- Developer commands (smoke test commands)
+- Known issues and deferred items
+- Experience learning from past debugging sessions
+
+## MANDATORY: Thorough Testing Required
+
+No subagent may return work as "done" unless ALL of the following are true:
+1. All syntax checks pass
+2. All smoke tests run successfully (exit code 0)
+3. All error patterns searched and found zero matches
+4. All parity tests pass (if applicable to the task)
+5. Output files verified to exist and contain data
+6. Script reached expected completion point
+
+**Syntax OK is NOT sufficient.** Every subagent must run smoke tests and verify results. See `orchestration_skill.md` for the complete testing procedure.
+
+## MANDATORY: Output Capture and Error Search
+
+When running any script:
+1. Save output to `docs/test.txt` or `/tmp/test_output.txt`
+2. Search output for error patterns: `ERROR`, `Traceback`, `Exception`, `Warning`, `Failed`, `Crash`, `Timeout`, `AttributeError`, `TypeError`, `ValueError`, `KeyError`, `IndexError`, `PermissionError`, `FileNotFoundError`, `ModuleNotFoundError`, `ImportError`, `RuntimeError`, `SyntaxError`, `NameError`, `NoneType`, `Incompatible`, `Mismatch`
+3. Also check for: `^` (traceback markers), `---` (separators), `>>>` (hung subprocess), `exit status 1/2`, `[E]`/`[ERROR]` log lines, `[W]`/`[WARNING]` log lines
+4. Verify output file has content (`wc -l > 0`)
+5. Check tail of output for completion messages
+6. Clean up temp files after testing
+
+## MANDATORY: WSL + RAPIDS Execution
+
+**Every Python script that uses GPU/cudf/cupy MUST be run through WSL with the rapids conda environment activated. None of the scripts will work without this.** This is NOT optional. This is NOT a suggestion. This is a hard requirement for ALL GPU-related scripts.
+
+### Correct Execution Format
+
+**Use SINGLE quotes `'...'` around the entire WSL command. Double quotes `"` cause PowerShell quoting issues.**
 
 ```powershell
-wsl bash -c "source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py"
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
 ```
 
-The `rapids` conda environment contains cudf, cupy, and all CUDA dependencies. Every GPU-invoking command must go through this WSL activation path.
+### Component Breakdown
+
+| Component | Purpose |
+|---|---|
+| `wsl bash -c "..."` | Runs the entire command inside WSL Ubuntu, not Windows PowerShell |
+| `cd /mnt/c/...` | Mounts the Windows filesystem path into WSL's `/mnt/c/` namespace |
+| `source ...conda.sh && conda activate rapids` | Activates the RAPIDS conda environment containing cudf, cupy, and all CUDA dependencies |
+| `python your_script.py` | Runs the target script with GPU support enabled |
+
+### Consequences of NOT Using This Format
+
+- **Scripts silently fall back to pandas/numpy** — GPU code paths become dead code. The script "works" but produces no GPU acceleration, defeating the entire architecture.
+- **Scripts crash with CUDA context errors** — `cupy` and `cudf` cannot initialize without the rapids environment's CUDA libraries, causing hard failures.
+- **Scripts produce incorrect results** — CPU and GPU implementations may differ slightly in floating-point behavior. Running on CPU when GPU is expected produces subtly wrong numbers.
+- **Parity tests give false passes** — If both baseline and refactored code run on CPU due to wrong execution format, they match each other but neither matches the intended GPU output. The test passes while the actual GPU migration is broken.
+
+### Test Output Convention
+
+When orchestrator smoke tests are run, capture and save their output to `docs/test.txt` for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal.
+
+Example:
+```powershell
+wsl bash -c "cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python orchestrate_calibration.py --strategy vm --smoke" > docs/test.txt 2>&1
+```
 
 ## Critical Operational Rules
 - **Headless execution:** Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless WSL.
@@ -67,6 +148,12 @@ When given a multi-part task, delegate subtasks to parallel subagents rather tha
 - Each subagent should have a clear, self-contained scope (e.g., "GPU dispatch in definitions.py", "Remove skip-stable regime logic from orchestrate_calibration.py").
 - Subagents must follow all WSL/cudf/protected-files rules documented here — include them in each subagent's prompt.
 - Review subagent results after completion; only then proceed with integration or verification.
+
+## MANDATORY: Single Subagent Execution
+
+**Absolutely NO parallel subagents. Every task must be executed sequentially, one subagent at a time.** This is NOT optional. This is NOT a suggestion. This is a hard rule that MUST be obeyed by ALL subagents and by the orchestrator (the main agent that delegates).
+
+**Why:** The inference backend is optimized for a single subagent at a time. Parallelism destroys performance on local inference — speed drops from ~35 tokens/sec to ~7 tokens/sec per subagent when running in parallel. The performance gain from parallelism is only meaningful for cloud-hosted models, not local inference. Sequential execution is faster overall because each subagent runs at full speed without the degradation caused by concurrent execution.
 
 ## User Preferences & Constraints
 1. **Smoke mode default** — Default to `--smoke` mode for all tasks unless explicitly told otherwise (small data slices, fast feedback).
@@ -110,12 +197,9 @@ python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --outp
     - `.../backtest_results/`: Contains plots, CSVs, and `summary_stats.json`.
 
 ### GPU Dispatch Architecture (definitions.py)
-All indicator functions follow a three-tier dispatch pattern:
-1. **GPU path** (`cupy`) — when `_use_gpu()` returns True, computation runs on the GPU via cupy arrays.
-2. **cudf Python-path** — when input is already a cudf DataFrame, operations stay in Python without numpy conversion overhead.
-3. **CPU fallback** (pandas/numpy) — default path when no GPU is available or for edge cases.
+All indicator functions are cudf-only. The three-tier dispatch pattern has been removed — there is no CPU fallback path. Functions accept cudf DataFrames and compute entirely on GPU via cupy. Pandas is used only at CSV I/O boundaries (loading data.csv, writing output CSVs).
 
-Function signatures are preserved across all tiers to ensure zero breaking changes for consumer scripts.
+Function signatures are preserved for consumer scripts.
 
 ### Algorithmic Soundness by Component
 - **Indicator Engine (`definitions.py`):** Fully vectorized. All 9 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
@@ -135,7 +219,7 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 - **Phase 1 (GPU Shift):** COMPLETE — cudf/cupy dispatch paths in all helper functions + indicator functions in `definitions.py`. GPU I/O helpers in `gpu_io.py`.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
 - **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
-- **Phase 4 (Algorithmic Optimization):** IN PROGRESS — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. GPU data loading via `--gpu` flag. Backtester numeric arrays converted to cupy (M09). Backtesting loop-breaking and Optuna search space reduction remain.
+- **Phase 4 (Algorithmic Optimization):** COMPLETE — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. Backtester numeric arrays converted to cupy (M09), 305-820% speedup. All dual-path code removed (~560 lines). GPU migration complete (M14). Backtesting loop-breaking and Optuna search space reduction remain as next targets.
 
 ## Active Issues from External Review
 
@@ -194,6 +278,42 @@ This section exists to ensure AGENTS.md stays accurate and useful over time. It 
 
 ---
 
+## Self-Organization Protocol
+
+AGENTS.md and skills are living documents. They must stay current — stale documentation is worse than no documentation because it misleads.
+
+### When to update:
+- **After every significant code change** — new file added/removed, architecture shift, bug fix pattern discovered.
+- **After every bug** — the root cause and fix pattern should be recorded in Experience Learning.
+- **After every skill creation or modification** — AGENTS.md must reference all skills and their purposes.
+- **After every session where meaningful changes were made** — review and refresh at minimum.
+
+### What to update:
+1. **Roadmap & Current Status** — Reflect actual completion state.
+2. **System Knowledge Base** — Add new architectural patterns; remove outdated descriptions.
+3. **Experience Learning** — Record new lessons from debugging, tool usage, design decisions.
+4. **Project Architecture table** — Add/remove files, update purposes.
+5. **Skills index** — Track all skills in the `skills/` directory.
+6. **Developer Commands** — Update if CLI interfaces change.
+
+### Skill management:
+- Skills live in the root directory (e.g., `orchestration_skill.md`).
+- AGENTS.md must list all skills and their purposes.
+- When a new pattern is discovered that warrants a skill, create it proactively.
+- When a skill becomes obsolete, remove it and update AGENTS.md.
+
+### File structure tracking:
+- The Project Architecture table must always reflect the actual file layout.
+- If a directory is renamed, moved, or deleted, update AGENTS.md.
+- If a new directory is created (e.g., `parity_maintenance/`, `docs/gpu_migration/`), add it to the architecture table.
+
+### Anti-patterns:
+- **DO NOT** let AGENTS.md drift. Stale docs mislead subagents.
+- **DO NOT** hardcode transient details (temporary file paths, one-time config values).
+- **DO NOT** delete skills without replacing them — they may be imported by other agents.
+
+---
+
 ## Experience Learning
 
 This section captures lessons learned from actual implementation experience. It simulates agentic learning — like how humans learn from mistakes and successes — so future decisions are informed by past reality rather than theoretical assumptions.
@@ -223,5 +343,26 @@ This section captures lessons learned from actual implementation experience. It 
 - **Cupy does not support datetime64 dtype.** Never try to put datetime arrays into cupy. Keep timestamps as numpy and only convert numeric columns to cupy.
 - **Converting cudf→pandas requires an active CUDA context.** If the CUDA context is unavailable (e.g., in certain test environments), `cudf.DataFrame.to_pandas()` will fail. Prefer extracting data directly from pandas when the input is already a pandas DataFrame.
 
+### Subagent Execution & Testing
+- **Subagents cannot run long pipelines (orchestrator) reliably.** The orchestrator spawns subprocesses that inherit the parent environment. When running inside WSL with rapids already activated, subprocesses do NOT need `wsl bash -c` wrapping — they inherit the environment. Wrapping in `bash -c` creates nested WSL calls that fail with exit code 2. Fix: `get_env_activation()` returns `""` when inside WSL, full `wsl bash -c "..."` wrapper only when on Windows.
+- **Shell quoting bugs in subprocess commands cause silent failures.** An unclosed `bash -c "..."` string or trailing space in `env_activation` causes subprocesses to drop into a REPL (`>>>`) or exit with status 2. Always verify the constructed command string before declaring tests pass.
+- **`/bin/sh` (dash) does not support `source`.** When wrapping conda activation in `bash -c`, always use `bash -c "source ..."` not just `source ...` — the default shell on many systems is dash, not bash.
+- **Subagents must NOT return work as "done" based on syntax checks alone.** Syntax OK is not sufficient. Every subagent must run smoke tests, save output to `docs/test.txt`, search it for errors, read the top AND bottom of the output file, and verify the file has content. A subagent that only runs `py_compile` has not done its job.
+- **Smoke tests must use ≥1 year of data.** Tiny smoke windows (e.g., 50K rows) can produce 0 trades, which means parity tests pass trivially without verifying any trading logic. Use at least 1 year of data (525,600+ bars for 1-minute data) to ensure meaningful test coverage.
+- **WSL output capture must use `2>&1`.** When redirecting output to a file, use `> docs/test.txt 2>&1` to capture both stdout and stderr. Without `2>&1`, errors go to stderr and the captured file appears clean while the script actually failed.
+- **cudf.to_pandas() segfaults in some WSL environments.** Use `cudf.to_arrow().to_pandas()` as a bridge when `to_pandas()` fails. This is a known workaround for cudf/numba CUDA context incompatibility in certain WSL setups.
+- **`.view("int64")` does not work on cudf Series.** Use `.astype("int64")` instead. This is a cudf API difference from pandas.
+- **Subagents cannot access the bash tool correctly on Windows.** The `bash` tool runs PowerShell, not bash. For WSL commands, always use `wsl bash -c '...'` format with single quotes around the entire command. Double quotes cause PowerShell quoting issues.
+- **Test files from parity testing must be organized.** All parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`. Stray `*test*.py` and `*_bak.py` files in the v6 root are stale and should be cleaned up.
+- **The orchestrator runs inside WSL but spawns subprocesses.** These subprocesses inherit the parent's environment (including cudf/cupy availability). Do NOT wrap them in `wsl bash -c` when the orchestrator is already running inside WSL — the nested WSL call fails.
+- **Every subagent must read AGENTS.md.** It contains essential project context including file structure, WSL execution format, parity testing requirements, and design philosophy. Not reading it leads to broken assumptions and wasted effort.
+
+### Proactive Self-Organization
+- **Both the orchestrator and every subagent MUST proactively keep AGENTS.md and skills updated.** After every significant code change, bug fix, or architectural shift, update the relevant sections.
+- **Skills are living documents.** When a subagent uses a skill and finds something that can be improved, it MUST report that feedback to the orchestrator. The orchestrator evaluates the feedback and decides whether to apply it.
+- **User permission required for AGENTS.md/skills changes.** One hallucination can derail all future processes. Any changes to AGENTS.md or skills MUST be proposed first and require explicit user approval before being applied. Subagents should NEVER modify AGENTS.md or skills directly — they should report proposed changes to the orchestrator.
+- **Track file structure changes.** The Project Architecture table must always reflect the actual file layout. If a directory is renamed, moved, or deleted, AGENTS.md must be updated.
+- **Record new lessons in Experience Learning.** Every bug fix, design decision, or tool usage lesson should be recorded for future reference.
+
 ---
-*Last updated: 2026-08-16 — M09 backtester cudf migration complete. Parity test passes with 300-800% speedup. All .bak files refreshed.*
+*Last updated: 2026-08-18 — GPU migration complete (M14). ~560 lines dual-path code removed across 7 files. 15 bugs fixed. All parity tests pass with zero skips. Backtester 305-820% speedup. Self-organization protocol added. Experiences Learning expanded with subagent execution lessons.*

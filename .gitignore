@@ -20,4 +20,6 @@ optuna_db/
 .idea/
 .DS_Store
 Thumbs.db
-AGENTS.md
+
+# AI orchestration docs (internal, not for sharing)
+orchestration_skill.md

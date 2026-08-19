@@ -30,7 +30,7 @@ def load_csv(path: str, skiprows: int = 0, nrows: int = None) -> cudf.DataFrame:
     pdf = pd.read_csv(path, **read_kwargs)
     pdf.columns = [col.strip().lower() for col in pdf.columns]
     if "timestamp" in pdf.columns:
-        pdf["timestamp"] = pd.to_datetime(pdf["timestamp"], utc=True)
+        pdf["timestamp"] = pd.to_datetime(pdf["timestamp"], utc=True).dt.tz_localize(None)
     return cudf.from_pandas(pdf)
 
 
