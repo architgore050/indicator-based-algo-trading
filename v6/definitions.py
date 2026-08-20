@@ -59,8 +59,23 @@ def sma(
 def ema(
     src: Union[pd.Series, "cudf.Series"], length: int
 ) -> Union[pd.Series, "cudf.Series"]:
-    """Exponential Moving Average."""
-    return src.ewm(span=length, adjust=False).mean()
+    """Exponential Moving Average — cudf-safe NaN handling.
+
+    cudf ewm() propagates NaN through the entire series when input contains
+    NaN (e.g. from stoch warmup). Pandas skips NaN and continues EMA from
+    the last valid value. This fix forward-fills NaN before ewm(), then
+    restores NaN at original positions for parity.
+    """
+    if isinstance(src, cudf.Series):
+        nan_mask = src.isnull()
+        if nan_mask.any():
+            filled = src.bfill().ffill()
+            result = filled.ewm(span=length, adjust=False).mean()
+            return result.where(~nan_mask, float("nan"))
+        else:
+            return src.ewm(span=length, adjust=False).mean()
+    else:
+        return src.ewm(span=length, adjust=False).mean()
 
 
 def wma(src: Union[pd.Series, "cudf.Series"], length: int) -> Union[pd.Series, "cudf.Series"]:
