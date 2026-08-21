@@ -219,6 +219,8 @@ def open_position(
     signal: str,
     rng: np.random.Generator,
 ) -> None:
+    # Convert cupy scalars to Python float to prevent dtype object in trade DataFrame
+    mid_price = float(mid_price)
     units_oz = BP["trade_size_lots"] * BP["standard_lot_oz"]
     needed_margin = margin_required(mid_price, units_oz)
     if state.cash < needed_margin:
@@ -270,14 +272,16 @@ def close_position(
     if position is None:
         return
 
+    # Convert cupy scalars to Python float to prevent dtype object in DataFrame columns
+    mid_price = float(mid_price)
     exit_fill, exit_cost_per_oz = fill_price(mid_price, side=position.side, is_entry=False, rng=rng)
     exit_commission = commission(position.lots)
     exit_friction = exit_cost_per_oz * position.units_oz
-    gross_pnl = (exit_fill - position.entry_fill) * position.units_oz * position.side
+    gross_pnl = float((exit_fill - position.entry_fill) * position.units_oz * position.side)
     total_commission = position.entry_commission + exit_commission
     total_friction = position.entry_friction + exit_friction
     swap_cashflow = position.accrued_swap_usd
-    net_pnl = gross_pnl + swap_cashflow - total_commission
+    net_pnl = float(gross_pnl + swap_cashflow - total_commission)
 
     state.cash += gross_pnl - exit_commission
     state.total_commission += exit_commission
@@ -423,8 +427,8 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                     stop = l + tsl_usd
                     pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
 
-            pos.mfe_usd = max(pos.mfe_usd, fav)
-            pos.mae_usd = min(pos.mae_usd, adv)
+            pos.mfe_usd = float(max(pos.mfe_usd, fav))
+            pos.mae_usd = float(min(pos.mae_usd, adv))
             pos.best_price = max(pos.best_price, h) if pos.best_price else h
             pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
 
@@ -505,8 +509,8 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                             if tsl_usd > 0:
                                 stop = l + tsl_usd
                                 pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
-                        pos.mfe_usd = max(pos.mfe_usd, fav)
-                        pos.mae_usd = min(pos.mae_usd, adv)
+                        pos.mfe_usd = float(max(pos.mfe_usd, fav))
+                        pos.mae_usd = float(min(pos.mae_usd, adv))
                         pos.best_price = max(pos.best_price, h) if pos.best_price else h
                         pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
                 elif state.position.side != new_side and allow_reversals:
@@ -561,8 +565,8 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
                             if tsl_usd > 0:
                                 stop = l + tsl_usd
                                 pos.trailing_stop_mid = stop if pos.trailing_stop_mid is None else min(pos.trailing_stop_mid, stop)
-                        pos.mfe_usd = max(pos.mfe_usd, fav)
-                        pos.mae_usd = min(pos.mae_usd, adv)
+                        pos.mfe_usd = float(max(pos.mfe_usd, fav))
+                        pos.mae_usd = float(min(pos.mae_usd, adv))
                         pos.best_price = max(pos.best_price, h) if pos.best_price else h
                         pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
 
@@ -754,8 +758,13 @@ def compute_summary(
 ) -> dict[str, float | int | str]:
     final_equity = float(equity["equity_usd"].iloc[-1]) if len(equity) else BP["initial_capital_usd"]
     total_return_pct = (final_equity / BP["initial_capital_usd"] - 1.0) * 100
-    returns = equity["equity_usd"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    # Convert to float64 to prevent cupy/pandas dtype incompatibility in nanops
+    eq_series = equity["equity_usd"].astype("float64")
+    returns = eq_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     ret_std = returns.std()
+    # Handle degenerate case: all returns identical (pandas nanops can't convert near-zero arrays)
+    if not np.isfinite(ret_std):
+        ret_std = 0.0
     sharpe = float((returns.mean() / ret_std) * np.sqrt(BP["bars_per_year"])) if len(returns) and ret_std > 0 else 0.0
     max_dd, max_dd_pct, max_dd_bars = max_drawdown(equity["equity_usd"]) if len(equity) else (0.0, 0.0, 0)
 

@@ -372,30 +372,45 @@ Some situations require stepping back and reconsidering the entire approach:
 
 ## 12. Lessons from M31 (cudf ewm NaN Propagation)
 
-This diagnosis (2026-08-08) is the canonical example of this methodology in action:
+This diagnosis (2026-08-20) is the canonical example of this methodology in action:
 
 ### The Symptom
-Backtest produced zero trades across all windows. No errors, no warnings. Silent failure.
+Backtest produced zero trades across all windows. No errors, no warnings. Silent failure. Pipeline completed successfully with "WFV Pipeline Complete" message — but every window had 0% CAGR and flat equity curves.
 
 ### The Cascade Trace
 ```
-0 trades → 0 signal rows → buy_setup_raw = 0 → stoch_bull = False → Slow_Signal = NaN → ewm() propagation
+0 trades → 0 signal rows → buy_setup_raw = 0 → stoch_bull/stoch_bear = False → Slow_Signal = ALL NaN → cudf ewm() propagates warmup NaN through entire series
 ```
 
 ### The Hypothesis
-"cudf's `ewm()` propagates warmup NaN through the entire series, unlike pandas which fills with the first valid value."
+"cudf's `ewm(adjust=False)` propagates NaN through the entire series when input contains NaN (from stoch warmup). Pandas correctly handles this by filling from the first valid value."
 
 ### The Minimal Test
-500 rows. Run indicator engine. Check NaN count in `Slow_Signal`. Compare cudf output vs pandas output from `.bak` backup.
+500 rows. Run indicator engine. Check NaN count in `Slow_Signal`. cudf: 500 NaN (entire series). pandas: ~49 NaN (warmup only). Comparison against `.bak` backup confirmed the discrepancy.
 
 ### The Root Cause
-`cudf.ewm()` requires `min_periods` data points before producing any output. If warmup NaN exceeds `min_periods`, the entire series becomes NaN. Pandas handles this differently (fills from first valid value).
+`cudf.ewm(span=N, adjust=False).mean()` propagates NaN through the entire series when input contains any NaN values. This is a cudf library behavior difference from pandas. When `stoch()` produces NaN for its lookback warmup period, calling `ema(stoch, signal_len)` with cudf floods every subsequent value with NaN — not just the warmup period.
+
+### The Fix
+Override `ema()` to use `bfill().ffill()` before `ewm()`, then restore NaN at original warmup positions:
+```python
+if isinstance(src, cudf.Series):
+    nan_mask = src.isnull()
+    if nan_mask.any():
+        filled = src.bfill().ffill()
+        result = filled.ewm(span=length, adjust=False).mean()
+        return result.where(~nan_mask, float("nan"))
+```
 
 ### The Classification
 **Implementation bug** — cudf behavior differs from pandas. Not a design bug (the ewm computation was correct), not a parameter bug (parameters worked with pandas).
 
-### The Lesson
-**Silent failures are the hardest to diagnose.** When a pipeline produces no output and no errors, trace backward through every stage. The bug is never in the last stage — it's upstream somewhere.
+### The Lesson: Silent Failures Are the Hardest to Diagnose
+
+When a pipeline produces no output and no errors, trace backward through every stage. The bug is never in the last stage — it's upstream somewhere. Additionally:
+
+- **Tracebacks can be hidden inside structured log lines.** Optuna embeds error details inside `[W ...] Trial N failed` entries, not as standalone "Traceback" at line start. Always search inside log content, not just line headers.
+- **UTF-16 encoding breaks grep.** PowerShell captures WSL output as UTF-16 LE. Standard grep patterns won't match — always convert to UTF-8 first before searching for errors.
 
 ---
 

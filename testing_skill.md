@@ -46,22 +46,48 @@ exit status 1 | exit status 2
 ```
 
 ### How to Search
+
 ```powershell
 # After running a script, save output to docs/test.txt:
 wsl bash -c 'cd /mnt/c/... && python script.py' > docs/test.txt 2>&1
+```
 
-# Search for errors:
-findstr /I "ERROR Traceback Exception Warning Failed Crash" docs\test.txt
-findstr /I "AttributeError TypeError ValueError KeyError" docs\test.txt
+⚠️ **CRITICAL: UTF-16 Encoding Trap**
+
+PowerShell captures WSL output as UTF-16 LE. `grep`/`findstr` will fail to match patterns in the captured file even when errors are present. This has caused tracebacks to slip through multiple audit cycles.
+
+**Always convert test.txt to UTF-8 before searching:**
+```powershell
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/docs/test.txt > /tmp/test_utf8.txt'
+```
+
+Then search `/tmp/test_utf8.txt` instead of `docs/test.txt`.
+
+⚠️ **Tracebacks Embedded in Log Lines**
+
+Optuna's `[W ...] Trial N failed with parameters: ... because of the following error:` log lines embed tracebacks inside structured log entries. These do NOT appear as standalone "Traceback" at line start, so simple grep may miss them.
+
+**Search strategy:**
+```bash
+# Search for embedded tracebacks (check inside any line containing "failed")
+grep -n "failed\|TypeError\|ValueError" /tmp/test_utf8.txt | head -20
+
+# Also search for the full pattern: trial failed → error message
+grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 ```
 
 ### Verification Steps
 1. Save output to `docs/test.txt` or `/tmp/test_output.txt`
-2. Search for all error patterns listed above
-3. Verify output file has content (`wc -l > 0` or check file size)
-4. Check tail of output for completion messages
-5. Read **both top AND bottom** of the output file
-6. Clean up temp files after testing
+2. **Convert to UTF-8** before searching (see warning above)
+3. Search for all error patterns listed above — including embedded tracebacks in log lines
+4. Verify output file has content (`wc -l > 0` or check file size)
+5. Check tail of output for completion messages
+6. Read **both top AND bottom** of the output file
+7. Clean up temp files after testing
+
+### Path Note
+
+The project folder on disk is named **"ago"** (not "algo"): `indicator based ago trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `./docs/test.txt` work fine.
 
 ---
 
@@ -115,7 +141,7 @@ All parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`
 **Use SINGLE quotes `'...'` around the entire WSL command. Double quotes `"` cause PowerShell quoting issues.**
 
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
 ```
 
 ### Component Breakdown
@@ -260,43 +286,55 @@ If a script exceeds its expected timeout, interrupt it and investigate — this 
 
 ### Running Scripts (WSL + Rapids)
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python script.py'
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python script.py'
 ```
 
 ### Capturing Output
 ```powershell
-wsl bash -c 'cd /mnt/c/... && python script.py' > docs/test.txt 2>&1
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && python script.py' > docs/test.txt 2>&1
+```
+
+### Converting to UTF-8 (CRITICAL — Never Skip)
+PowerShell captures WSL output as UTF-16 LE. grep/findstr will fail to match patterns even when errors are present. **Always convert before searching:**
+```powershell
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/docs/test.txt > /tmp/test_utf8.txt'
 ```
 
 ### Reading Output Files
 ```powershell
-# Read top of file
-read docs\test.txt
+# Read top of file (use relative path from workspace root)
+read ./docs/test.txt
 
 # Read bottom of file (for completion messages)
-read docs\test.txt -Offset <last_lines> -Limit 50
+read ./docs/test.txt -Offset <last_lines> -Limit 50
 ```
 
 ### Error Searching
+⚠️ **Search `/tmp/test_utf8.txt`, NOT `docs/test.txt`** — the UTF-16 encoded file will not match patterns.
+
 ```powershell
-# Search for error keywords
-findstr /I "ERROR Traceback Exception Warning Failed Crash" docs\test.txt
+# Search for error keywords (in UTF-8 converted file)
+findstr /I "ERROR Traceback Exception Warning Failed Crash" /tmp/test_utf8.txt
 
 # Search for specific error types
-findstr /I "AttributeError TypeError ValueError KeyError IndexError" docs\test.txt
+findstr /I "AttributeError TypeError ValueError KeyError IndexError" /tmp/test_utf8.txt
 
 # Search for structural patterns
-findstr /C:">>>" docs\test.txt
-findstr /C:"exit status" docs\test.txt
+findstr /C:">>>" /tmp/test_utf8.txt
+findstr /C:"exit status" /tmp/test_utf8.txt
+
+# Search for embedded tracebacks in Optuna log lines
+grep -n "failed\|TypeError\|ValueError" /tmp/test_utf8.txt | head -20
+grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 ```
 
 ### File Verification
 ```powershell
 # Check file has content
-powershell -Command "(Get-Item docs\test.txt).Length -gt 0"
+powershell -Command "(Get-Item ./docs/test.txt).Length -gt 0"
 
 # Count lines
-powershell -Command "(Get-Content docs\test.txt).Count"
+powershell -Command "(Get-Content ./docs/test.txt).Count"
 ```
 
 ### Code Changes
