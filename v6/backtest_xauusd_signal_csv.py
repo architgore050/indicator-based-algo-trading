@@ -12,7 +12,6 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend for ALL imports
 import matplotlib.pyplot as plt
-import cupy as cp
 import numpy as np
 import pandas as pd
 import cudf
@@ -340,24 +339,27 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFram
     rng = np.random.default_rng(BP["random_seed"])
     state = BacktestState()
 
-    # Pre-extract data to cupy arrays for GPU-native computation
-    # Timestamps stay as numpy (cupy doesn't support datetime64)
-    # Convert via pandas bridge to avoid cudf.to_numpy() CUDA context issues
+    # Pre-extract data to numpy arrays for fast CPU loop access.
+    # Timestamps stay as numpy (cupy doesn't support datetime64).
+    # Convert via pandas bridge to avoid cudf.to_numpy() CUDA context issues.
+    # IMPORTANT: Cupy arrays must NOT be used here — the backtest loop is a
+    # fundamentally sequential state machine that accesses one element at a time.
+    # Each cupy index operation (highs[i]) triggers a synchronous GPU→CPU PCIe
+    # transfer, turning 7K bar iterations into 28K tiny device-to-host transfers
+    # that take ~10-100 us each. Converting to numpy upfront eliminates all that
+    # overhead. The GPU has no useful work to do in this loop anyway.
     if hasattr(data, "to_arrow"):
         timestamps_np = data["timestamp"].to_arrow().to_pandas().to_numpy()
+        opens = data["open"].to_arrow().to_pandas().to_numpy().astype(np.float64)
+        highs = data["high"].to_arrow().to_pandas().to_numpy().astype(np.float64)
+        lows = data["low"].to_arrow().to_pandas().to_numpy().astype(np.float64)
+        closes = data["close"].to_arrow().to_pandas().to_numpy().astype(np.float64)
     else:
         timestamps_np = data["timestamp"].to_numpy()
-    # Convert via pandas bridge to avoid cudf.to_numpy() CUDA context issues
-    if hasattr(data, "to_arrow"):
-        opens = cp.asarray(data["open"].to_arrow().to_pandas().to_numpy().astype(np.float64))
-        highs = cp.asarray(data["high"].to_arrow().to_pandas().to_numpy().astype(np.float64))
-        lows = cp.asarray(data["low"].to_arrow().to_pandas().to_numpy().astype(np.float64))
-        closes = cp.asarray(data["close"].to_arrow().to_pandas().to_numpy().astype(np.float64))
-    else:
-        opens = cp.asarray(data["open"].to_numpy().astype(np.float64))
-        highs = cp.asarray(data["high"].to_numpy().astype(np.float64))
-        lows = cp.asarray(data["low"].to_numpy().astype(np.float64))
-        closes = cp.asarray(data["close"].to_numpy().astype(np.float64))
+        opens = data["open"].to_numpy().astype(np.float64)
+        highs = data["high"].to_numpy().astype(np.float64)
+        lows = data["low"].to_numpy().astype(np.float64)
+        closes = data["close"].to_numpy().astype(np.float64)
 
     # Pre-compute dates array for swap accrual (avoids repeated pd.Timestamp() in loop)
     dates = np.array([pd.Timestamp(ts).date() for ts in timestamps_np], dtype=object)

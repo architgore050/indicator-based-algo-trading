@@ -344,11 +344,11 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
     
     # 1. Equity Curve
     fig, ax1 = plt.subplots(figsize=(14, 7))
-    ax1.plot(combined_equity_df['timestamp'], combined_equity_df['equity_usd'], label='Equity', linewidth=1.5)
+    ax1.plot(combined_equity_df['timestamp'], combined_equity_df['equity_usd'], label='Equity', linewidth=0.15)
     for pt in recalibration_points['annual']: ax1.axvline(x=pt, color='grey', linestyle='-', linewidth=2, alpha=0.6)
     for pt in recalibration_points['monthly']: ax1.axvline(x=pt, color='grey', linestyle='--', linewidth=1, alpha=0.4)
     ax1.set_title('Collated WFV Equity Curve')
-    plt.savefig(os.path.join(output_dir, 'collated_equity_curve.png'), dpi=300)
+    plt.savefig(os.path.join(output_dir, 'collated_equity_curve.png'), dpi=600)
     plt.close()
 
     # 2. Drawdown

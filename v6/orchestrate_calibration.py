@@ -74,9 +74,9 @@ def detect_available_vram_gb():
 def estimate_vram_per_worker(total_rows: int, n_cols: int = 7) -> float:
     """Estimate VRAM needed per worker in GB based on actual data size.
 
-    Memory model: rows x cols x 8 bytes (float64) x ~3 copies (cudf overhead +
-    intermediate arrays + pandas transfer buffer). Plus a small fixed overhead
-    for cudf metadata and indicator state (~50 MB).
+    Memory model: rows x cols x 8 bytes (float64) x ~4 copies (cudf overhead +
+    intermediate arrays + pandas transfer buffer + indicator state). Plus a
+    small fixed overhead for cudf metadata (~50 MB).
 
     Parameters
     ----------
@@ -90,8 +90,8 @@ def estimate_vram_per_worker(total_rows: int, n_cols: int = 7) -> float:
     float
         Estimated VRAM per worker in GB.
     """
-    # Base memory: rows * cols * 8 bytes * 3 copies (cudf overhead factor)
-    base_bytes = total_rows * n_cols * 8 * 3.0
+    # Base memory: rows * cols * 8 bytes * 4 copies (cudf overhead factor)
+    base_bytes = total_rows * n_cols * 8 * 4.0
     # Fixed overhead for cudf metadata, indicator state, temp arrays
     fixed_overhead_bytes = 50 * 1024 * 1024  # 50 MB
     total_gb = (base_bytes + fixed_overhead_bytes) / (1024 ** 3)
@@ -264,12 +264,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             if yearly_best_path and yearly_best_path.exists():
                 cal_cmd.extend(["--annual-baseline", str(yearly_best_path)])
 
-        env_activation = get_env_activation()
-        cal_cmd_str = (
-            f'{env_activation}{shlex.join(cal_cmd)}"'
-            if env_activation
-            else shlex.join(cal_cmd)
-        )
+        cal_cmd_str = shlex.join(cal_cmd)
         worker_logger.info(f"Calibration Command: {cal_cmd_str}")
         try:
             subprocess.run(cal_cmd_str, shell=True, check=True)
@@ -370,7 +365,7 @@ def main():
 
     mode_label = "SMOKE" if args.smoke else "FULL"
     logger.info(f"[{mode_label}] Max rows per worker: IS={max_is_rows:,} + OOS={oos_rows:,} = {max_total_rows:,}")
-    logger.info(f"[{mode_label}] VRAM estimate: {vram_per_worker:.2f} GB/worker (rows x cols x 8B x 3 copies + 50MB overhead)")
+    logger.info(f"[{mode_label}] VRAM estimate: {vram_per_worker:.2f} GB/worker (rows x cols x 8B x 4 copies + 50MB overhead)")
 
     if total_vram is not None:
         logger.info(f"[{mode_label}] VRAM-aware worker limit: {safe_count} workers (total VRAM: {total_vram:.1f}GB, est per worker: {vram_per_worker:.2f}GB)")
