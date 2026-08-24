@@ -233,9 +233,9 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     oos_end = oos_start_base + i * rows_per_window
     is_end = oos_start
     if is_annual:
-        is_start = is_end - (1000 if args.smoke else full_cal_rows)
+        is_start = max(0, is_end - (1000 if args.smoke else full_cal_rows))
     else:
-        is_start = is_end - (1000 if args.smoke else rows_per_window * recal_windows_count)
+        is_start = max(0, is_end - (1000 if args.smoke else rows_per_window * recal_windows_count))
 
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
@@ -318,7 +318,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         "--end-row", str(oos_window_size),
         "--headless",
         "--output-dir", str(backtest_dir),
-        "--signals", str(signal_file_path)
+        "--signals", str(signal_file_path),
+        "--random-seed", str(CONFIG["backtesting_params"]["random_seed"] + i)
     ])
 
     # 7. Record Performance
@@ -347,9 +348,9 @@ def main():
     args = parser.parse_args()
 
     # Logic Parameters (needed before VRAM estimation)
-    oos_start_base = DATA_CONF["calibration_rows"]
+    oos_start_base = DATA_CONF["wfv_start_row"]
     rows_per_window = WFV_CONF["rows_per_window"]
-    total_wfv_rows = WFV_CONF["total_wfv_rows"]
+    total_wfv_rows = DATA_CONF["wfv_total_rows"]
     recal_windows_count = WFV_CONF["recalibration_windows"]
     full_recal_interval = WFV_CONF["windows_per_full_recalibration"]
     full_cal_rows = CALIB_PARAMS["calibration_rows_per_trial"]

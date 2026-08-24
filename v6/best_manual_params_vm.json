@@ -7,7 +7,7 @@
     "initial_capital_usd": 100000.0,
     "standard_lot_oz": 100.0,
     "trade_size_lots": 0.1,
-    "leverage": 1.0,
+    "leverage": 10.0,
     "maintenance_margin_ratio": 0.5,
     "spread_usd_per_oz": 0.2,
     "slippage_mean_usd_per_oz": 0.04,
@@ -136,7 +136,7 @@
       "multi_rsi_p1": [8, 21],
       "multi_rsi_p2": [20, 50],
       "multi_rsi_p3": [40, 100],
-      "multi_rsi_smal": [1, 5],
+      "multi_rsi_smal": [1, 10],
       "crsi_dom_cycle": [6, 30],
       "crsi_vibration": [5, 20],
       "crsi_leveling": [5.0, 25.0],
@@ -154,8 +154,6 @@
     }
   },
   "data_config": {
-    "total_rows": 4000000,
-    "calibration_rows": 3999300,
-    "testing_rows": 700
+    "total_rows": 4000000
   }
 }

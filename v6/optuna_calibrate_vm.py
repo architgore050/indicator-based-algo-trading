@@ -145,7 +145,7 @@ def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str 
         stoch_bull = recent(stoch_bull_raw, int(p["confirmation_lookback_bars"]))
         
         # Multi RSI Bullish: RSI1 in the Buy Area (lower zone)
-        multi_bull = multi_rsi["RSI1"] < 40
+        multi_bull = multi_rsi["R1MAVW"] < 40
         
         # Cyclic RSI Bullish: CRSI reclaiming Lower_Band or just > 50
         cyclic_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | (cyclic_rsi["CRSI"] > 50)
@@ -156,7 +156,7 @@ def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str 
         # Sell Setup
         stoch_bear_raw = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
         stoch_bear = recent(stoch_bear_raw, int(p["confirmation_lookback_bars"]))
-        multi_bear = multi_rsi["RSI1"] > 60
+        multi_bear = multi_rsi["R1MAVW"] > 60
         cyclic_bear = (cyclic_rsi["CRSI"] >= cyclic_rsi["Upper_Band"]) | (cyclic_rsi["CRSI"] < 50)
 
         sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
@@ -373,7 +373,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--start-row", type=int, default=0)
-    parser.add_argument("--end-row", type=int, default=3000000)
+    parser.add_argument("--end-row", type=int, default=4000000)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")

@@ -369,7 +369,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--start-row", type=int, default=0)
-    parser.add_argument("--end-row", type=int, default=3000000)
+    parser.add_argument("--end-row", type=int, default=4000000)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")

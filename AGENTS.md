@@ -119,12 +119,16 @@ wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indic
 | `source ...conda.sh && conda activate rapids` | Activates the RAPIDS conda environment containing cudf, cupy, and all CUDA dependencies |
 | `python your_script.py` | Runs the target script with GPU support enabled |
 
+### What Does NOT Need WSL Wrapping
+
+**All other tool calls run natively in PowerShell. Do NOT wrap them in `wsl bash -c`.**
+
+File operations (`read`, `edit`, `write`, `glob`, `grep`), syntax checks (`py_compile`), git operations, and any non-GPU Python script should execute directly without WSL. WSL/conda/rapids is ONLY needed when running Python scripts that import `cudf`, `cupy`, or other GPU libraries. Wrapping file operations in WSL adds unnecessary overhead and is a common mistake.
+
 ### Consequences of NOT Using This Format
 
-- **Scripts silently fall back to pandas/numpy** — GPU code paths become dead code. The script "works" but produces no GPU acceleration, defeating the entire architecture.
-- **Scripts crash with CUDA context errors** — `cupy` and `cudf` cannot initialize without the rapids environment's CUDA libraries, causing hard failures.
-- **Scripts produce incorrect results** — CPU and GPU implementations may differ slightly in floating-point behavior. Running on CPU when GPU is expected produces subtly wrong numbers.
-- **Parity tests give false passes** — If both baseline and refactored code run on CPU due to wrong execution format, they match each other but neither matches the intended GPU output. The test passes while the actual GPU migration is broken.
+- **Scripts crash with CUDA/context errors** — `cupy` and `cudf` cannot initialize without the rapids environment's CUDA libraries. The script will fail with a hard error.
+- **No silent fallback** — the dual-path pandas/cudf dispatch was removed during migration. There is no CPU fallback. If the rapids env isn't activated, the script simply won't run.
 
 ### Test Output Convention
 
@@ -297,10 +301,16 @@ AGENTS.md and skills are living documents. They must stay current — stale docu
 6. **Developer Commands** — Update if CLI interfaces change.
 
 ### Skill management:
-- Skills live in the root directory (e.g., `orchestration_skill.md`).
+- Skills live in the root directory (e.g., `diagnose_code_context.md`).
 - AGENTS.md must list all skills and their purposes.
 - When a new pattern is discovered that warrants a skill, create it proactively.
 - When a skill becomes obsolete, remove it and update AGENTS.md.
+
+### Skills Index
+
+| Skill | File | Purpose |
+|---|---|---|
+| Code Context Diagnosis | `diagnose_code_context.md` | Structured approach for understanding code changes before implementing — trace references, map dependencies, identify hidden patterns, report findings, wait for approval. |
 
 ### File structure tracking:
 - The Project Architecture table must always reflect the actual file layout.
@@ -311,6 +321,7 @@ AGENTS.md and skills are living documents. They must stay current — stale docu
 - **DO NOT** let AGENTS.md drift. Stale docs mislead subagents.
 - **DO NOT** hardcode transient details (temporary file paths, one-time config values).
 - **DO NOT** delete skills without replacing them — they may be imported by other agents.
+- **DO NOT rewrite files entirely.** Prefer targeted edits. Full-file rewrites are unreliable — they hallucinate content, introduce formatting drift, and make it impossible to verify what actually changed. Changing a car's leather seats does not require rebuilding the car from scratch. Use targeted edits with the `edit` tool.
 
 ---
 
@@ -329,6 +340,9 @@ This section captures lessons learned from actual implementation experience. It 
 - **GPU dispatch should be transparent to consumers.** All indicator function signatures must remain identical across CPU and GPU paths. Consumer scripts (calibrators, signal generators, backtester) should never know or care whether computation runs on CPU or GPU. This isolation means `definitions.py` can evolve its internal dispatch without breaking anything downstream.
 - **CSV-only persistence is a constraint worth enforcing.** Introducing Parquet or pickle for "performance" creates format fragmentation — some scripts read CSV, others read Parquet, parity testing becomes format-dependent. The CSV boundary is slow but simple and universal. GPU acceleration happens *in memory*, not in file format changes.
 - **Parity tests before speedups.** Every refactoring (especially GPU migration) must be validated against the pandas baseline with tolerance checks (`atol=1e-8`). Speed without correctness is just a faster way to produce wrong results.
+- **CAGR annualization exponent is constant across all trials in a WFV run.** It is determined by the forward test window (OOS) duration, not calibration data. Since the same exponent applies to every trial, ranking is preserved. The annualization acts as a signal amplifier that widens the gap between good and mediocre trials — beneficial for TPE learning. Leave as-is.
+- **Linear penalties with moderate weights (3.5) provide better gradient for TPE than hard rejection.** A trial slightly below threshold gets a small penalty; a trial far below gets a large penalty. TPE can learn from the gradient. Hard rejection (-100 flat) crushes all below-threshold trials to the same value, destroying the gradient.
+- **Always verify parameter→signal→backtest chain is complete.** A parameter is dead if Optuna samples it but no downstream code consumes its output. Dead parameters waste ~5.5% of tuning budget per parameter and can cause boundary hits that are noise, not signal. Check that every tunable parameter actually affects the signal generation.
 
 ### Debugging Patterns
 - **Empty signal files crash backtests.** Signal CSVs with headers but no data rows cause `pd.read_csv()` to raise `EmptyDataError`. Always check file size and wrap reads in try/except, returning an empty DataFrame gracefully.
@@ -365,4 +379,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Record new lessons in Experience Learning.** Every bug fix, design decision, or tool usage lesson should be recorded for future reference.
 
 ---
-*Last updated: 2026-08-18 — GPU migration complete (M14). ~560 lines dual-path code removed across 7 files. 15 bugs fixed. All parity tests pass with zero skips. Backtester 305-820% speedup. Self-organization protocol added. Experiences Learning expanded with subagent execution lessons.*
+*Last updated: 2026-08-23 — CAGR annualization confirmed as signal amplifier (not distortion). Dead parameter detection added to Experience Learning. Linear penalty gradient confirmed as correct for TPE. Anti-pattern: do not rewrite files entirely. allow_reversals set to true. multi_rsi_smal dead parameter identified — signal generation should use R1MAVW not RSI1.*

@@ -81,12 +81,13 @@ class BacktestState:
 # IO
 # ---------------------------------------------------------------------------
 
-def load_market_data(mode: str, start_row: int = 0, end_row: int = 4000000, data_csv_path: str = None) -> pd.DataFrame:
+def load_market_data(mode: str, start_row: int = 0, end_row: int = None, data_csv_path: str = None) -> pd.DataFrame:
     source = data_csv_path if data_csv_path else DATA_CSV
+    end_row = end_row if end_row is not None else DATA_CONF["total_rows"]
     read_kwargs = {"parse_dates": ["timestamp"]}
     
     # Manual window override
-    if start_row != 0 or end_row != 4000000:
+    if start_row != 0 or end_row != DATA_CONF["total_rows"]:
         read_kwargs["skiprows"] = range(1, start_row + 1)
         read_kwargs["nrows"] = end_row - start_row
         logger.info(f"Loading window: rows [{start_row}, {end_row}]")
@@ -94,10 +95,10 @@ def load_market_data(mode: str, start_row: int = 0, end_row: int = 4000000, data
         read_kwargs["nrows"] = 50000
         logger.info("Loading 50,000 rows (SMOKE mode)")
     elif mode == "test":
-        # Held-out set (last 1M rows)
-        read_kwargs["skiprows"] = range(1, DATA_CONF["calibration_rows"] + 1)
-        read_kwargs["nrows"] = DATA_CONF["testing_rows"]
-        logger.info(f"Loading held-out test set ({DATA_CONF['testing_rows']:,} rows starting from {DATA_CONF['calibration_rows']:,})")
+        # Held-out set (WFV range)
+        read_kwargs["skiprows"] = range(1, DATA_CONF["wfv_start_row"] + 1)
+        read_kwargs["nrows"] = DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"]
+        logger.info(f"Loading held-out test set ({DATA_CONF['wfv_total_rows'] - DATA_CONF['wfv_start_row']:,} rows starting from {DATA_CONF['wfv_start_row']:,})")
     else:
         logger.info("Loading full market dataset (4M rows)")
 
@@ -335,8 +336,8 @@ def action_to_side(action: str, signal: str) -> int | None:
 # Backtest (OPTIMIZED)
 # ---------------------------------------------------------------------------
 
-def run_backtest(data: pd.DataFrame, signals: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    rng = np.random.default_rng(BP["random_seed"])
+def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(seed if seed is not None else BP["random_seed"])
     state = BacktestState()
 
     # Pre-extract data to numpy arrays for fast CPU loop access.
@@ -916,6 +917,7 @@ def compute_summary(
             "commission_usd": 0.0,
             "spread_slippage_cost_usd": 0.0,
             "swap_usd": 0.0,
+            "total_costs_usd": 0.0,
         }
     else:
         pnl = trades["net_pnl_usd"]
@@ -944,6 +946,9 @@ def compute_summary(
             "commission_usd": float(trades["commission_usd"].sum()),
             "spread_slippage_cost_usd": float(trades["spread_slippage_cost_usd"].sum()),
             "swap_usd": float(trades["swap_usd"].sum()),
+            "total_costs_usd": float(trades["commission_usd"].sum())
+                + abs(float(trades["spread_slippage_cost_usd"].sum()))
+                + abs(float(trades["swap_usd"].sum())),
         }
 
     exposure_pct = float((equity["position"] != 0).mean() * 100) if len(equity) else 0.0
@@ -1212,11 +1217,12 @@ def main() -> None:
     parser.add_argument("--strategy", type=str, choices=["tv", "vm"], default="tv")
     parser.add_argument("--mode", type=str, choices=["smoke", "test", "full"], default="smoke")
     parser.add_argument("--start-row", type=int, default=0)
-    parser.add_argument("--end-row", type=int, default=4000000)
+    parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--headless", action="store_true", help="Don't show plots, only save them.")
     parser.add_argument("--output-dir", type=str, default=None, help="Explicit output directory.")
     parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
+    parser.add_argument("--random-seed", type=int, default=None, help="Override random seed (for per-window seed variation in WFV).")
     args = parser.parse_args()
 
     if args.headless:
@@ -1254,7 +1260,7 @@ def main() -> None:
     start, end = data["timestamp"].min(), data["timestamp"].max()
     signals = signals[(signals["timestamp"] >= start) & (signals["timestamp"] <= end)].reset_index(drop=True)
 
-    trades, equity, executions, skipped = run_backtest(data, signals)
+    trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed)
     summary = compute_summary(trades, equity, signals, signal_path, data)
     
     # Save all outputs

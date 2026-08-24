@@ -1,6 +1,9 @@
 import os
 import json
+import subprocess
+import shutil
 import warnings
+import sys
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
@@ -45,6 +48,102 @@ def _flatten_dict(d, parent_key='', sep='_'):
     return dict(items)
 
 
+def _get_env_activation():
+    """Return environment activation prefix for subprocesses.
+
+    When running inside WSL (already in rapids env): return "" — subprocesses inherit the environment.
+    When running on Windows: return the wsl bash -c wrapper.
+    """
+    if os.path.exists("/proc/version"):
+        try:
+            with open("/proc/version", "r") as f:
+                if "microsoft" in f.read().lower():
+                    return ""
+        except Exception:
+            pass
+    return 'wsl bash -c "cd /mnt/c/Users/gorea/Desktop/indicator\\\\ based\\\\ algo\\\\ trading/indicator\\\\ based\\\\ algo\\\\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && '
+
+
+def _run_subprocess(cmd):
+    """Run a subprocess with WSL-aware environment activation."""
+    env_activation = _get_env_activation()
+    import shlex
+    inner_cmd = shlex.join(cmd) if isinstance(cmd, list) else cmd
+    if env_activation:
+        cmd_str = f'{env_activation}{inner_cmd}"'
+    else:
+        cmd_str = inner_cmd
+    print(f"[baseline] Running: {cmd_str}")
+    result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[baseline] Subprocess failed (exit {result.returncode}):")
+        print(f"  stdout: {result.stdout[:500]}")
+        print(f"  stderr: {result.stderr[:500]}")
+    return result
+
+
+def _run_baseline(output_dir):
+    """Run baseline signal generation + backtest using default config params.
+
+    Creates handshake folder with artifacts for diagnosis.
+    Returns dict with baseline equity curve data and summary stats, or None on failure.
+    """
+    PROJECT_DIR = Path(__file__).resolve().parent
+    handshake_dir = Path(output_dir) / "baseline_handshake"
+
+    # Replace existing folder (fixed path, no accumulation)
+    if handshake_dir.exists():
+        shutil.rmtree(handshake_dir)
+    handshake_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Generate signals with default params (no --calibration flag)
+    signal_script = PROJECT_DIR / "generate_vm_automation_logic_signals.py"
+    signal_cmd = [
+        sys.executable, str(signal_script),
+        "--mode", "test",
+        "--output-dir", str(handshake_dir),
+    ]
+    result = _run_subprocess(signal_cmd)
+    if result.returncode != 0:
+        print(f"[baseline] Signal generation failed. Skipping baseline.")
+        return None
+    print("[baseline] Signal generation complete.")
+
+    # Step 2: Run backtest on generated signals (test mode → _test.csv suffix)
+    backtest_script = PROJECT_DIR / "backtest_xauusd_signal_csv.py"
+    signal_file = handshake_dir / "vm_automation_logic_signals_test.csv"
+    backtest_cmd = [
+        sys.executable, str(backtest_script),
+        "--strategy", "vm",
+        "--mode", "test",
+        "--headless",
+        "--signals", str(signal_file),
+        "--output-dir", str(handshake_dir),
+    ]
+    result = _run_subprocess(backtest_cmd)
+    if result.returncode != 0:
+        print(f"[baseline] Backtest failed. Skipping baseline.")
+        return None
+    print("[baseline] Backtest complete.")
+
+    # Step 3: Load baseline results
+    summary_path = handshake_dir / "summary_stats.json"
+    equity_path = handshake_dir / "equity_curve.csv"
+
+    if not summary_path.exists() or not equity_path.exists():
+        print("[baseline] Baseline output files not found.")
+        return None
+
+    with open(summary_path, 'r') as f:
+        summary = json.load(f)
+
+    equity_df = pd.read_csv(equity_path)
+    equity_df['timestamp'] = pd.to_datetime(equity_df['timestamp'])
+
+    print(f"[baseline] Baseline CAGR: {summary.get('cagr_pct', 'N/A')}%, Trades: {summary.get('total_trades', 'N/A')}")
+    return {'summary': summary, 'equity': equity_df}
+
+
 def _extract_window_info(window_dir):
     """Extract window index and regime type from directory name."""
     name = window_dir.name
@@ -64,6 +163,20 @@ def _extract_window_info(window_dir):
 
 def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # --- Run baseline (native behavior, always) ---
+    print("[baseline] Starting baseline signal generation + backtest...")
+    baseline_data = _run_baseline(output_dir)
+    baseline_equity = None
+    baseline_summary = None
+    if baseline_data is not None:
+        baseline_equity = baseline_data['equity']
+        baseline_summary = baseline_data['summary']
+        # Save baseline diagnostics JSON
+        diag_json_path = os.path.join(output_dir, 'baseline_diagnostics.json')
+        with open(diag_json_path, 'w') as f:
+            json.dump(baseline_summary, f, indent=2, default=_safe_json_default)
+        print(f"[baseline] Baseline diagnostics saved: {diag_json_path}")
     
     all_summary_stats = []
     equity_curves = []
@@ -144,7 +257,7 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
                           'avg_loss_usd', 'payoff_ratio', 'best_trade_usd',
                           'worst_trade_usd', 'avg_bars_held', 'median_bars_held',
                           'max_consecutive_wins', 'max_consecutive_losses',
-                          'commission_usd', 'spread_slippage_cost_usd', 'swap_usd']
+                          'commission_usd', 'spread_slippage_cost_usd', 'swap_usd', 'total_costs_usd']
             for key in trade_keys:
                 if key in stats:
                     diag[f'trade_{key}'] = stats[key]
@@ -217,6 +330,31 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
     combined_equity_df['close'] = price_df.values
     combined_equity_df['position'] = pd.concat([df.set_index('timestamp')['position'] for df in equity_curves]).values
 
+    # --- Baseline equity curve alignment ---
+    if baseline_equity is not None:
+        baseline_map = pd.Series(baseline_equity.set_index('timestamp')['equity_usd'].values,
+                                 index=baseline_equity['timestamp']).to_dict()
+        combined_equity_df['baseline_equity_usd'] = combined_equity_df['timestamp'].map(baseline_map).values
+    else:
+        combined_equity_df['baseline_equity_usd'] = np.nan
+
+    # --- Buy-and-hold asset benchmark (vectorized, zero loops) ---
+    PROJECT_DIR = Path(__file__).resolve().parent
+    data_csv = PROJECT_DIR / "data.csv"
+    if data_csv.exists():
+        data_df = pd.read_csv(data_csv, parse_dates=['timestamp'])
+        # Normalize timestamps: strip timezone suffix to match collated format
+        data_df['timestamp'] = pd.to_datetime(data_df['timestamp'], utc=True).dt.tz_localize(None)
+        close_series = data_df['close']
+        # Normalize to $100K start for direct comparison on same axis
+        first_close = close_series.iloc[0]
+        asset_equity = BP["initial_capital_usd"] * (close_series / first_close)
+        # Build a timestamp→value map for alignment
+        asset_map = pd.Series(asset_equity.values, index=data_df['timestamp']).to_dict()
+        combined_equity_df['raw_asset_close'] = combined_equity_df['timestamp'].map(asset_map).values
+    else:
+        combined_equity_df['raw_asset_close'] = np.nan
+
     # --- Save Consolidated Data ---
     combined_equity_df.to_csv(os.path.join(output_dir, 'collated_equity_curve.csv'), index=False)
     
@@ -273,7 +411,7 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
         # Trade metric totals (for counts/profit)
         for col in ['trade_total_trades', 'trade_winning_trades', 'trade_losing_trades',
                      'trade_gross_profit_usd', 'trade_gross_loss_usd', 'trade_commission_usd',
-                     'trade_spread_slippage_cost_usd']:
+                     'trade_spread_slippage_cost_usd', 'trade_swap_usd']:
             if col in diag_df.columns:
                 values = pd.to_numeric(diag_df[col], errors='coerce').dropna()
                 if len(values) > 0:
@@ -313,6 +451,10 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
                 'max_drawdown_pct': wd.get('top_max_drawdown_pct', 0),
                 'profit_factor': wd.get('trade_profit_factor', 0),
                 'expectancy_usd': wd.get('trade_expectancy_usd', 0),
+                'commission_usd': wd.get('trade_commission_usd', 0),
+                'spread_slippage_cost_usd': wd.get('trade_spread_slippage_cost_usd', 0),
+                'swap_usd': wd.get('trade_swap_usd', 0),
+                'total_costs_usd': wd.get('trade_total_costs_usd', 0),
                 'sl_hits': wd.get('sl_total_sl_hits', 0),
                 'tsl_hits': wd.get('tsl_total_tsl_hits', 0),
                 'whipsaw_count': wd.get('tsl_whipsaw_count', 0),
@@ -325,8 +467,23 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
                 'regimes': list(set(d['regime'] for d in window_diagnostics))
             },
             'aggregates': aggregates,
-            'per_window_diagnostics': window_diagnostics
+            'per_window_diagnostics': window_diagnostics,
         }
+        
+        # Add baseline to diagnostic report if available
+        if baseline_summary is not None:
+            diagnostic_report['baseline'] = {
+                'cagr_pct': baseline_summary.get('cagr_pct'),
+                'sharpe_ratio': baseline_summary.get('sharpe_ratio'),
+                'calmar_ratio': baseline_summary.get('calmar_ratio'),
+                'max_drawdown_pct': baseline_summary.get('max_drawdown_pct'),
+                'total_trades': baseline_summary.get('total_trades'),
+                'win_rate_pct': baseline_summary.get('win_rate_pct'),
+                'net_profit_usd': baseline_summary.get('net_profit_usd'),
+                'profit_factor': baseline_summary.get('profit_factor'),
+                'expectancy_usd': baseline_summary.get('expectancy_usd'),
+                'total_costs_usd': baseline_summary.get('total_costs_usd'),
+            }
         
         diag_json_path = os.path.join(output_dir, 'collated_diagnostics.json')
         with open(diag_json_path, 'w') as f:
@@ -342,13 +499,38 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
 
     # --- Diagnostic Plotting ---
     
-    # 1. Equity Curve
+    # 1. Equity Curve (optimized + baseline + asset on same axis)
     fig, ax1 = plt.subplots(figsize=(14, 7))
-    ax1.plot(combined_equity_df['timestamp'], combined_equity_df['equity_usd'], label='Equity', linewidth=0.15)
-    for pt in recalibration_points['annual']: ax1.axvline(x=pt, color='grey', linestyle='-', linewidth=2, alpha=0.6)
-    for pt in recalibration_points['monthly']: ax1.axvline(x=pt, color='grey', linestyle='--', linewidth=1, alpha=0.4)
-    ax1.set_title('Collated WFV Equity Curve')
-    plt.savefig(os.path.join(output_dir, 'collated_equity_curve.png'), dpi=600)
+    
+    # Optimized equity
+    color_optimized = "#1f77b4"
+    ax1.set_ylabel("Equity USD", color=color_optimized)
+    ax1.plot(combined_equity_df['timestamp'], combined_equity_df['equity_usd'],
+             color=color_optimized, label='Optimized (WFV)', linewidth=0.15)
+    ax1.tick_params(axis="y", labelcolor=color_optimized)
+    
+    # Baseline equity
+    color_baseline = "#2ca02c"
+    has_baseline = combined_equity_df['baseline_equity_usd'].notna().any()
+    if has_baseline:
+        ax1.plot(combined_equity_df['timestamp'], combined_equity_df['baseline_equity_usd'],
+                 color=color_baseline, label='Baseline (Default Params)', linewidth=0.15)
+    
+    # Asset (buy-and-hold, normalized to $100K start)
+    color_asset = "#808080"
+    has_asset = combined_equity_df['raw_asset_close'].notna().any()
+    if has_asset:
+        ax1.plot(combined_equity_df['timestamp'], combined_equity_df['raw_asset_close'],
+                 color=color_asset, label='Asset (Buy-and-Hold)', linewidth=0.5, alpha=0.6, linestyle='-')
+    
+    # Calibration vertical lines
+    for pt in recalibration_points['annual']: ax1.axvline(x=pt, color='grey', linestyle='-', linewidth=1, alpha=0.6)
+    for pt in recalibration_points['monthly']: ax1.axvline(x=pt, color='grey', linestyle='--', linewidth=0.3, alpha=0.4)
+    
+    ax1.set_title('Collated WFV Equity Curve — Optimized vs Baseline vs Asset')
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=0.25)
+    plt.savefig(os.path.join(output_dir, 'collated_equity_curve.png'), dpi=900)
     plt.close()
 
     # 2. Drawdown

@@ -104,21 +104,22 @@ def with_mode_suffix(path: Path, mode: str) -> Path:
 def load_data(
     mode: str,
     start_row: int = 0,
-    end_row: int = 4000000,
+    end_row: int = None,
     data_csv_path: str = None,
 ):
     """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps."""
     source = data_csv_path if data_csv_path else DATA_CSV
+    end_row = end_row if end_row is not None else DATA_CONF["total_rows"]
     read_kwargs = {"parse_dates": ["timestamp"]}
 
-    if start_row != 0 or end_row != 4000000:
+    if start_row != 0 or end_row != DATA_CONF["total_rows"]:
         read_kwargs["skiprows"] = range(1, start_row + 1)
         read_kwargs["nrows"] = end_row - start_row
     elif mode == "smoke":
         read_kwargs["nrows"] = 50_000
     elif mode == "test":
-        read_kwargs["skiprows"] = range(1, DATA_CONF["calibration_rows"] + 1)
-        read_kwargs["nrows"] = DATA_CONF["testing_rows"]
+        read_kwargs["skiprows"] = range(1, DATA_CONF["wfv_start_row"] + 1)
+        read_kwargs["nrows"] = DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"]
 
     gpu_df = load_csv(str(source))
 
@@ -276,7 +277,7 @@ def generate_signals(
     params: dict,
     mode: str,
     start_row: int = 0,
-    end_row: int = 4000000,
+    end_row: int = None,
     data_csv_path: str = None,
     output_dir: str = None,
 ) -> Path:
@@ -325,7 +326,7 @@ def generate_signals(
         stoch_bull = recent(stoch_bull_raw, params["confirmation_lookback_bars"])
         
         # Multi RSI Bullish: RSI1 in the Buy Area (lower zone)
-        multi_bull = multi_rsi["RSI1"] < 40
+        multi_bull = multi_rsi["R1MAVW"] < 40
         
         # Cyclic RSI Bullish: CRSI reclaiming Lower_Band or just > 50
         cyclic_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | (cyclic_rsi["CRSI"] > 50)
@@ -339,7 +340,7 @@ def generate_signals(
         # Sell Setup
         stoch_bear_raw = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
         stoch_bear = recent(stoch_bear_raw, params["confirmation_lookback_bars"])
-        multi_bear = multi_rsi["RSI1"] > 60
+        multi_bear = multi_rsi["R1MAVW"] > 60
         cyclic_bear = (cyclic_rsi["CRSI"] >= cyclic_rsi["Upper_Band"]) | (cyclic_rsi["CRSI"] < 50)
 
         sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
@@ -397,7 +398,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate VM Automation Logic signal CSV.")
     parser.add_argument("--mode", type=str, choices=["smoke", "test", "full"], default="full", help="Execution mode.")
     parser.add_argument("--start-row", type=int, default=0)
-    parser.add_argument("--end-row", type=int, default=4000000)
+    parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")

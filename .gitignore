@@ -23,3 +23,6 @@ Thumbs.db
 
 # AI orchestration docs (internal, not for sharing)
 orchestration_skill.md
+testing_skill.md
+diagnosis_skill.md
+diagnose_code_context.md

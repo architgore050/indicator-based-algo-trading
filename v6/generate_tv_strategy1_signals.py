@@ -108,21 +108,22 @@ def with_mode_suffix(path: Path, mode: str) -> Path:
 def load_data(
     mode: str,
     start_row: int = 0,
-    end_row: int = 4000000,
+    end_row: int = None,
     data_csv_path: str = None,
 ):
     """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps."""
     source = data_csv_path if data_csv_path else DATA_CSV
+    end_row = end_row if end_row is not None else DATA_CONF["total_rows"]
     read_kwargs = {"parse_dates": ["timestamp"]}
 
-    if start_row != 0 or end_row != 4000000:
+    if start_row != 0 or end_row != DATA_CONF["total_rows"]:
         read_kwargs["skiprows"] = range(1, start_row + 1)
         read_kwargs["nrows"] = end_row - start_row
     elif mode == "smoke":
         read_kwargs["nrows"] = 50_000
     elif mode == "test":
-        read_kwargs["skiprows"] = range(1, DATA_CONF["calibration_rows"] + 1)
-        read_kwargs["nrows"] = DATA_CONF["testing_rows"]
+        read_kwargs["skiprows"] = range(1, DATA_CONF["wfv_start_row"] + 1)
+        read_kwargs["nrows"] = DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"]
 
     gpu_df = load_csv(str(source))
 
@@ -283,7 +284,7 @@ def build_signal_rows(
 def generate_signals(
     mode: str,
     start_row: int = 0,
-    end_row: int = 4000000,
+    end_row: int = None,
     data_csv_path: str = None,
     output_dir: str = None,
 ) -> Path:
