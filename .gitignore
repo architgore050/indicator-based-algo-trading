@@ -14,6 +14,7 @@ optuna_db/
 *_log.txt
 *.log
 *_smoke.csv
+output.txt
 
 # IDE
 .vscode/
@@ -26,3 +27,4 @@ orchestration_skill.md
 testing_skill.md
 diagnosis_skill.md
 diagnose_code_context.md
+todo.txt

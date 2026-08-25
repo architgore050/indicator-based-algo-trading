@@ -1220,6 +1220,7 @@ def main() -> None:
     parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--headless", action="store_true", help="Don't show plots, only save them.")
+    parser.add_argument("--plots", action="store_true", help="Generate diagnostic PNG plots (off by default; WFV collation reads CSVs only).")
     parser.add_argument("--output-dir", type=str, default=None, help="Explicit output directory.")
     parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
     parser.add_argument("--random-seed", type=int, default=None, help="Override random seed (for per-window seed variation in WFV).")
@@ -1278,7 +1279,8 @@ def main() -> None:
         pbar.update()
         save_summary(summary, out_dir)
         pbar.update()
-        save_plots(data, trades, equity, out_dir)
+        if args.plots:
+            save_plots(data, trades, equity, out_dir)
         pbar.update()
     
     print(f"Backtest complete. Results in {out_dir}")

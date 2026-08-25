@@ -15,11 +15,11 @@
   "calmar_ratio": 0.0,
   "exposure_pct": 0.0,
   "signals_read": 0,
-  "spread_usd_per_oz": 0.2,
-  "slippage_mean_usd_per_oz": 0.04,
+  "spread_usd_per_oz": 0.12,
+  "slippage_mean_usd_per_oz": 0.03,
   "commission_per_lot_side_usd": 3.5,
   "trade_size_lots": 0.1,
-  "leverage": 1.0,
+  "leverage": 10.0,
   "usdinr_rate": 92,
   "sl_diagnostics": {
     "total_sl_hits": 0,
@@ -58,5 +58,6 @@
   "max_consecutive_losses": 0,
   "commission_usd": 0.0,
   "spread_slippage_cost_usd": 0.0,
-  "swap_usd": 0.0
+  "swap_usd": 0.0,
+  "total_costs_usd": 0.0
 }

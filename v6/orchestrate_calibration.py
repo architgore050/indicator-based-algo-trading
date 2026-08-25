@@ -41,75 +41,44 @@ def get_env_activation():
 
 
 # ---------------------------------------------------------------------------
-# VRAM-Aware Worker Limiting (dynamic, data-size-aware)
+# RAM-Aware Worker Limiting
 # ---------------------------------------------------------------------------
 
-def detect_available_vram_gb():
-    """Detect total GPU VRAM in GB. Returns None if no NVIDIA GPU detected."""
-    # Try Linux /proc path first
-    proc_path = "/proc/driver/nvidia/gpus/0/memory/total"
-    if os.path.exists(proc_path):
-        try:
-            with open(proc_path, "r") as f:
-                bytes_val = int(f.read().strip())
-            return bytes_val / (1024 ** 3)
-        except (ValueError, IOError, IndexError):
-            pass
+# Resource budget constants — tune these if OOM ever reappears.
+# Measured: full run with 20 workers peaked at ~30.5GB / 32GB (~1.5GB per worker).
+RAM_PER_WORKER_GB = 2.0    # lightly padded per-worker RSS budget
+SYSTEM_HEADROOM_GB = 4.0   # OS + orchestrator + transient parent/child overlap
 
-    # Fallback: nvidia-smi (works on both WSL and native Windows)
+
+def detect_total_ram_gb() -> float:
+    """Read total system RAM in GB from /proc/meminfo (Linux/WSL).
+
+    Returns 0.0 if unavailable — caller must treat 0.0 as "detection failed"
+    and fall back to a conservative cap.
+    """
     try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            total_mb = float(result.stdout.strip())
-            return total_mb / 1024.0
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_kb = float(line.split()[1])
+                    return total_kb / (1024 ** 2)
+    except (OSError, ValueError, IndexError):
         pass
+    return 0.0
 
-    return None
 
+def compute_safe_worker_count(max_workers: int) -> int:
+    """Cap worker count so total expected RSS fits in system RAM minus headroom.
 
-def estimate_vram_per_worker(total_rows: int, n_cols: int = 7) -> float:
-    """Estimate VRAM needed per worker in GB based on actual data size.
-
-    Memory model: rows x cols x 8 bytes (float64) x ~4 copies (cudf overhead +
-    intermediate arrays + pandas transfer buffer + indicator state). Plus a
-    small fixed overhead for cudf metadata (~50 MB).
-
-    Parameters
-    ----------
-    total_rows : int
-        Total rows this worker will process (IS calibration + OOS combined).
-    n_cols : int
-        Number of columns in the DataFrame. Defaults to 7 (OHLCV + derived).
-
-    Returns
-    -------
-    float
-        Estimated VRAM per worker in GB.
+    Falls back to min(max_workers, 4) when RAM detection fails.
     """
-    # Base memory: rows * cols * 8 bytes * 4 copies (cudf overhead factor)
-    base_bytes = total_rows * n_cols * 8 * 4.0
-    # Fixed overhead for cudf metadata, indicator state, temp arrays
-    fixed_overhead_bytes = 50 * 1024 * 1024  # 50 MB
-    total_gb = (base_bytes + fixed_overhead_bytes) / (1024 ** 3)
-    return max(total_gb, 0.05)  # minimum 50 MB per worker
-
-
-def compute_safe_worker_count(max_workers: int, vram_per_worker_gb: float, safety_factor: float = 0.75) -> int:
-    """Compute a safe worker count based on available VRAM and actual data size.
-
-    Returns min(max_workers, floor(total_vram * safety_factor / vram_per_worker)).
-    If VRAM detection fails, conservatively caps at min(max_workers, 4).
-    """
-    total_vram_gb = detect_available_vram_gb()
-    if total_vram_gb is not None:
-        safe_count = math.floor(total_vram_gb * safety_factor / vram_per_worker_gb)
-        return min(max_workers, max(1, safe_count))
+    total_ram_gb = detect_total_ram_gb()
+    if total_ram_gb > 0:
+        ram_budget_gb = max(0.0, total_ram_gb - SYSTEM_HEADROOM_GB)
+        ram_limit = math.floor(ram_budget_gb / RAM_PER_WORKER_GB)
+        return min(max_workers, max(1, ram_limit))
     else:
-        # No NVIDIA GPU detected — fall back to conservative default
+        # RAM detection failed — conservative default
         return min(max_workers, 4)
 
 
@@ -360,18 +329,21 @@ def main():
     # VRAM-aware worker limiting — compute from actual data sizes, not hardcoded defaults
     max_is_rows, oos_rows = compute_max_rows_per_window(args, full_cal_rows, rows_per_window, recal_windows_count)
     max_total_rows = max_is_rows + oos_rows
-    vram_per_worker = estimate_vram_per_worker(max_total_rows)
-    total_vram = detect_available_vram_gb()
-    safe_count = compute_safe_worker_count(args.workers, vram_per_worker)
+    total_ram_gb = detect_total_ram_gb()
+    safe_count = compute_safe_worker_count(args.workers)
 
     mode_label = "SMOKE" if args.smoke else "FULL"
     logger.info(f"[{mode_label}] Max rows per worker: IS={max_is_rows:,} + OOS={oos_rows:,} = {max_total_rows:,}")
-    logger.info(f"[{mode_label}] VRAM estimate: {vram_per_worker:.2f} GB/worker (rows x cols x 8B x 4 copies + 50MB overhead)")
 
-    if total_vram is not None:
-        logger.info(f"[{mode_label}] VRAM-aware worker limit: {safe_count} workers (total VRAM: {total_vram:.1f}GB, est per worker: {vram_per_worker:.2f}GB)")
+    if total_ram_gb > 0:
+        ram_budget_gb = max(0.0, total_ram_gb - SYSTEM_HEADROOM_GB)
+        logger.info(
+            f"[{mode_label}] RAM-aware worker limit: {safe_count} workers "
+            f"(total RAM: {total_ram_gb:.1f}GB, budget: {ram_budget_gb:.1f}GB, "
+            f"{RAM_PER_WORKER_GB:.1f}GB/worker)"
+        )
     else:
-        logger.info(f"[{mode_label}] VRAM detection unavailable — using conservative limit: {safe_count} workers")
+        logger.info(f"[{mode_label}] RAM detection unavailable — using conservative limit: {safe_count} workers")
 
     # In smoke mode, cap workers aggressively to avoid GPU memory contention
     if args.smoke:

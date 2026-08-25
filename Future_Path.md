@@ -141,6 +141,41 @@ However, widening ranges is not free. Each parameter added to the search space i
 ### Why deferred
 The verdict is to wait until after a clean baseline WFV run. The boundary hits may be artifacts of the dead parameter bug (Issue 9) or the current signal quality. Once the baseline is established, boundary analysis will be meaningful.
 
+**Empirical addendum (2026-08-24 audit of historical Optuna DBs):** blind Phase-1 search produced **0 profitable trials out of 2,093** across 21 annual studies (best ever: -3.2). Anchored monthly refinements found ≥1 profitable config in ~20% of windows (231/1,183). This reframes the problem: range widening alone cannot rescue cold-start discovery when its hit rate is exactly zero — knowledge inheritance (see §6) may matter more than wider bounds. Revisit both together after the clean full run.
+
+---
+
+## 6. Semi-Pre-Informed Phase 3 (Distribution Inheritance)
+
+### Problem
+Monthly (phase-3-only) windows currently receive a single best-point handoff (`--annual-baseline`) plus hard-narrowed bounds (±5% of range width via `phase3_refinement_pct`). With month-long windows, regimes can completely flip, so tight geometric bounds around last year's winner are brittle. The intended behavior is for each phase-3 window to inherit the annual run's *learned distribution* and fine-tune it for the current regime — but that channel does not exist yet.
+
+Empirical evidence from the DB audit (2026-08-24):
+- Blind search never works: 0/2,093 profitable Phase-1 trials
+- Anchored refinement works: ~20% of monthly windows find ≥1 profitable config
+- Tight bounds are pathological: annual P3 zero-signal rate doubles to 52% when sampling narrows around the incumbent (edge collapse into degenerate parameter combos)
+
+### Design options considered
+| Variant | Prior character | Regime-flip robustness |
+|---|---|---|
+| Full history import (P1+P2+P3) | Precise, heavily concentrated near last year's winner | Poor — over-anchors |
+| P1 only | Broad landscape map, unbiased | Good, coarse |
+| **P1+P2 (leaning)** | Broad map + intermediate sharpening, minus winner-hugging | Best balance |
+
+### What would change
+- Annual calibrations export their trial ledger to a CSV sidecar (`trial_history_vm.csv`: phase, trial_number, value, params) next to `calibration_results_vm.json` — CSV per data-persistence convention
+- Orchestrator passes the most recent annual sidecar path to monthly children (same pattern as `--annual-baseline`)
+- Monthly windows replay imported trials into the fresh study via `study.add_trial(create_trial(...))`, then enqueue the annual best as today
+- Phase-3 bounds stay at full `vm_ranges` — let the seeded TPE density model concentrate sampling instead of geometric narrowing (avoids the 52% empty-signal pathology)
+- Open question resolved during implementation: exact import variant (P1 / P1+P2 / full)
+
+### Prerequisites
+- Orchestrator dependency ordering (open Bug 2): monthly windows must wait for their parent annual window to complete — importing from an artifact that doesn't exist yet is what produces the config-defaults fallback storm
+- ~~In-memory Optuna storage~~ **DONE (2026-08-24):** SQLite RDBStorage disabled in both calibrators; one shared in-memory study per process preserves cross-phase TPE history and warm-starts. Remaining prerequisite: Bug 2 ordering only.
+
+### Why deferred
+Blocked pending a successful clean full run. Deciding the import variant requires current-pipeline scores under the corrected reward function; implementing against historical scores from older cost/scoring regimes would tune toward stale objectives. Re-evaluate jointly with §1 (search space) after the baseline run.
+
 ---
 
 ## Execution Order
@@ -148,10 +183,11 @@ The verdict is to wait until after a clean baseline WFV run. The boundary hits m
 These upgrades should be tackled in this order:
 
 1. **Search Space Optimization** (lowest risk, highest leverage) — Analyze boundary hits after baseline WFV run, adjust ranges. Quick win.
-2. **Risk Management Additions** — Add SL/TP/TSL/circuit breaker to established strategy. Measure the delta vs baseline.
-3. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
-4. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.
-5. **Session-Aware Spread** — Lowest priority. Marginal accuracy gain for significant complexity.
+2. **Semi-Pre-Informed Phase 3** — Decide import variant and implement distribution inheritance; depends on Bug 2 ordering fix + in-memory storage. Decide jointly with #1 after the baseline run.
+3. **Risk Management Additions** — Add SL/TP/TSL/circuit breaker to established strategy. Measure the delta vs baseline.
+4. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
+5. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.
+6. **Session-Aware Spread** — Lowest priority. Marginal accuracy gain for significant complexity.
 
 ---
 
@@ -165,4 +201,4 @@ These upgrades should be tackled in this order:
 
 ---
 
-*Created 2026-08-24. Review and update after each baseline WFV run.*
+*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Review and update after each baseline WFV run.*

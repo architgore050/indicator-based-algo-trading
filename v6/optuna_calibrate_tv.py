@@ -304,16 +304,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
         logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study_name: str, storage: str, current_best: dict = None):
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        sampler=sampler,
-        direction="maximize",
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner()
-    )
-    
+def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None):
     ranges = CALIB_PARAMS["tv_ranges"]
 
     # Port over the distribution/warm start by enqueuing the current best
@@ -392,12 +383,25 @@ def main():
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
     
-    # Ensure storage directory exists
-    db_dir = PROJECT_DIR / "optuna_db"
-    db_dir.mkdir(exist_ok=True)
-    
-    db_name = f"optuna_tv_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
-    storage_path = f"sqlite:///{db_dir / db_name}"
+    # SQLite storage disabled (2026-08-24): 'database is locked' crashes killed
+    # annual windows under parallel WFV (9p-mounted NTFS + multi-thread commits).
+    # Audit showed nothing ever read these per-process DB files back.
+    # See Future_Path.md §6.
+    # db_dir = PROJECT_DIR / "optuna_db"
+    # db_dir.mkdir(exist_ok=True)
+    #
+    # db_name = f"optuna_tv_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
+    # storage_path = f"sqlite:///{db_dir / db_name}"
+
+    # One in-memory study shared across all phases — preserves cross-phase TPE
+    # history and enqueued warm-starts exactly as the shared SQLite file did.
+    storage_path = None
+    shared_study = optuna.create_study(
+        study_name="tv_discovery",
+        storage=storage_path,
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner()
+    )
     
     current_best = None
     baseline_annual_params = None
@@ -426,7 +430,7 @@ def main():
         # PHASE 1
         logger.info("PHASE 1: Sobol Quasi-random Exploration...")
         p1_trials = 5 if args.smoke else OPTUNA_CONF["phase1_trials"]
-        study = run_study(1, p1_trials, QMCSampler(), data, "tv_discovery", storage_path)
+        study = run_study(1, p1_trials, QMCSampler(), data, shared_study)
         
         if args.smoke:
             logger.info("Smoke test complete.")
@@ -447,7 +451,7 @@ def main():
             # PHASE 2
             logger.info("PHASE 2: Bayesian (TPE) Refinement...")
             p2_trials = OPTUNA_CONF["phase2_trials"]
-            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
+            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best)
             
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
@@ -458,7 +462,7 @@ def main():
     # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, "tv_discovery", storage_path, current_best=current_best)
+    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best)
     
     # Survival of the Fittest Check
     try:
