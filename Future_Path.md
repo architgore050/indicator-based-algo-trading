@@ -143,6 +143,10 @@ The verdict is to wait until after a clean baseline WFV run. The boundary hits m
 
 **Empirical addendum (2026-08-24 audit of historical Optuna DBs):** blind Phase-1 search produced **0 profitable trials out of 2,093** across 21 annual studies (best ever: -3.2). Anchored monthly refinements found ≥1 profitable config in ~20% of windows (231/1,183). This reframes the problem: range widening alone cannot rescue cold-start discovery when its hit rate is exactly zero — knowledge inheritance (see §6) may matter more than wider bounds. Revisit both together after the clean full run.
 
+**Full-run verdict (2026-08-24, post first clean run):** boundary-hit analysis confirmed clipping — 10/18 params HOT, 2 exit booleans pinned False in 178/185 windows (remove, don't widen), `confirmation_lookback_bars` pins below its floor. Full methodology and evidence: `docs/full_run_analysis_2026-08-24.md`.
+
+**IMPLEMENTED (2026-08-26):** Search space corrections applied per spec. Exit flags permanently ON (removed from search space). 13 edge-pinned parameter ranges widened. `confirmation_lookback_bars` floor lowered from 2→1. Trial counts adjusted (P1: 100→150, P3: 30→50). See `docs/wfv_restructuring_implementation.md`.
+
 ---
 
 ## 6. Semi-Pre-Informed Phase 3 (Distribution Inheritance)
@@ -176,14 +180,18 @@ Empirical evidence from the DB audit (2026-08-24):
 ### Why deferred
 Blocked pending a successful clean full run. Deciding the import variant requires current-pipeline scores under the corrected reward function; implementing against historical scores from older cost/scoring regimes would tune toward stale objectives. Re-evaluate jointly with §1 (search space) after the baseline run.
 
+**Full-run verdict (2026-08-24):** the clean run proved inheritance never occurs — **0/174 monthly windows were informed** (all calibrated before their parent annual finished; Bug 2 is structural, not intermittent). Dependency ordering is now a *blocking* prerequisite, and the next run should be designed as an informed-vs-fallback A/B experiment. Full methodology and evidence: `docs/full_run_analysis_2026-08-24.md`.
+
+**IMPLEMENTED (2026-08-26):** Two-phase scheduling + distribution-based prior inheritance implemented per spec. Annual windows run first (Phase 1), monthly windows run after (Phase 2) with inherited priors from parent annual's Phase 1+2 trial statistics. Phase 3 hard narrowing removed (was collapsing search space to single point). SQLite trial logging on WSL-native filesystem. See `docs/wfv_restructuring_implementation.md`.
+
 ---
 
 ## Execution Order
 
 These upgrades should be tackled in this order:
 
-1. **Search Space Optimization** (lowest risk, highest leverage) — Analyze boundary hits after baseline WFV run, adjust ranges. Quick win.
-2. **Semi-Pre-Informed Phase 3** — Decide import variant and implement distribution inheritance; depends on Bug 2 ordering fix + in-memory storage. Decide jointly with #1 after the baseline run.
+1. ~~**Search Space Optimization**~~ **DONE (2026-08-26)** — Exit flags ON, ranges widened, trial counts adjusted. See `docs/wfv_restructuring_implementation.md`.
+2. ~~**Semi-Pre-Informed Phase 3**~~ **DONE (2026-08-26)** — Two-phase scheduling + distribution-based prior inheritance implemented. See `docs/wfv_restructuring_implementation.md`.
 3. **Risk Management Additions** — Add SL/TP/TSL/circuit breaker to established strategy. Measure the delta vs baseline.
 4. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
 5. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.

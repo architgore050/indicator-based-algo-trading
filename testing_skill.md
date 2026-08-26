@@ -58,7 +58,7 @@ PowerShell captures WSL output as UTF-16 LE. `grep`/`findstr` will fail to match
 
 **Always convert test.txt to UTF-8 before searching:**
 ```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/docs/test.txt > /tmp/test_utf8.txt'
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/docs/test.txt > /tmp/test_utf8.txt'
 ```
 
 Then search `/tmp/test_utf8.txt` instead of `docs/test.txt`.
@@ -87,7 +87,7 @@ grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 
 ### Path Note
 
-The project folder on disk is named **"ago"** (not "algo"): `indicator based ago trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `./docs/test.txt` work fine.
+The project folder on disk is named **"algo"** (not "ago"): `indicator based algo trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `./docs/test.txt` work fine.
 
 ---
 
@@ -141,7 +141,7 @@ All parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`
 **Use SINGLE quotes `'...'` around the entire WSL command. Double quotes `"` cause PowerShell quoting issues.**
 
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
 ```
 
 ### Component Breakdown
@@ -286,18 +286,18 @@ If a script exceeds its expected timeout, interrupt it and investigate — this 
 
 ### Running Scripts (WSL + Rapids)
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python script.py'
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python script.py'
 ```
 
 ### Capturing Output
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/v6 && python script.py' > docs/test.txt 2>&1
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && python script.py' > docs/test.txt 2>&1
 ```
 
 ### Converting to UTF-8 (CRITICAL — Never Skip)
 PowerShell captures WSL output as UTF-16 LE. grep/findstr will fail to match patterns even when errors are present. **Always convert before searching:**
 ```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ ago\ trading/indicator\ based\ ago\ trading/docs/test.txt > /tmp/test_utf8.txt'
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/docs/test.txt > /tmp/test_utf8.txt'
 ```
 
 ### Reading Output Files

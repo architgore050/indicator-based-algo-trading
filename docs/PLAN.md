@@ -54,6 +54,7 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 
 - [x] **Task 4.1: Signal Generation — Sparse Event Loop**: Replaced `for i in tqdm(range(len(data)))` bar-by-bar loop with `for i in np.where(has_event)[0]` sparse event iteration. Uses fast numpy OR across all boolean arrays to find signal bars, then only iterates those (typically 0.1-1% of total bars). Applied to both VM and TV signal generators. Function signature preserved for parity.
 - [x] **Task 4.2: Signal Generation — GPU Data Loading**: Added `--gpu` flag to both signal generators. When enabled, loads CSV via `gpu_io.load_csv_to_gpu()` → cudf → converts to pandas for processing. Indicator computation in `definitions.py` auto-dispatches to GPU via `_use_gpu()`. Backward compatible — defaults to pandas path.
+- [x] **Task 4.6: WFV Pipeline Restructuring** (2026-08-26): Implemented two-phase scheduling (annual windows before monthly), removed Phase 3 hard narrowing (was collapsing search space to single point), re-introduced SQLite trial logging on WSL-native filesystem, implemented distribution-based prior inheritance from parent annual's Phase 1+2 trials, widened search space for edge-pinned parameters, permanently enabled exit flags, adjusted trial counts (P1: 100→150, P3: 30→50). See `docs/wfv_restructuring_implementation.md` for full details.
 - [ ] **Task 4.3: Backtesting — Loop Breaking Strategy**: The backtester has sequential dependencies (equity compounds bar-to-bar). Explore algorithmic approaches: (a) vectorize trade-by-trade PnL instead of bar-by-bar, (b) batch equity curve computation using cumulative operations on trade-level data, (c) identify which metrics truly need per-bar granularity vs. which can be computed from trade summaries. GPU porting is secondary to finding a non-sequential formulation.
 - [ ] **Task 4.4: Optuna Search Space Reduction**: Profile calibration trials to identify which parameters actually move the needle. Fix low-sensitivity parameters at their calibrated values and reduce search space dimensionality. Fewer dimensions = fewer trials needed for Bayesian convergence. Target: reduce trial count by 30-50% without sacrificing reward quality.
 - [ ] **Task 4.5: Parity Validation**: Run smoke tests comparing optimized signal generation + backtesting vs existing implementations (atol=1e-8 for equity curves, metric values within 0.1%).
@@ -98,7 +99,7 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 - **Fixed `EmptyDataError` in backtest** (`backtest_xauusd_signal_csv.py:108`): Signal files with headers but no data rows caused pandas crash. Added zero-byte check + try/except around `pd.read_csv()` to return empty DataFrame gracefully.
 
 ### 📍 Current Action
-**Status:** Phase 1 (1.1, 1.2, 1.3) + Phase 2 (2.1, 2.2) + Phase 3 (3.1, 3.2, 3.3) COMPLETE. All VRAM limits, structured logging, GPU I/O helpers, documentation, and dead state cleanup done. Phase 4 in progress: signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons + GPU data loading via `--gpu` flag. Remaining: backtesting loop-breaking (Task 4.3) and Optuna search space reduction (Task 4.4).
+**Status:** Phase 1-3 COMPLETE. Phase 4 Tasks 4.1, 4.2, 4.6 COMPLETE. WFV pipeline restructuring implemented and smoke-tested for both VM and TV strategies. Two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections, trial count adjustments, and SQLite trial logging all working. Remaining: backtesting loop-breaking (4.3), Optuna search space reduction (4.4), full WFV run on all windows.
 
 ### 📊 Algorithmic Soundness by Component
 | Component | Vectorized? | Loop Status | GPU Path |
@@ -162,10 +163,10 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 15. [ ] Run GPU parity tests: feed cudf DataFrames into indicator functions, convert results to pandas, compare against pure-pandas outputs for all 11 helpers + 9 indicators (atol=1e-8)
 16. [x] **Phase 4 Task 4.1**: Sparse event loop optimization — `np.where(has_event)[0]` reduces loop iterations from O(n) to O(events) where events are typically 0.1-1% of bars (both VM + TV)
 17. [x] **Phase 4 Task 4.2**: GPU data loading via `--gpu` flag — uses `gpu_io.load_csv_to_gpu()` when available, falls back to pandas. Indicator computation auto-dispatches via definitions.py
-18. [ ] **Phase 4 Task 4.3**: Backtesting loop-breaking strategy — explore trade-level vectorization, batch equity computation, identify which metrics need per-bar granularity
-19. [ ] **Phase 4 Task 4.4**: Optuna search space reduction — profile parameter sensitivity, fix low-sensitivity params, reduce trial count by 30-50%
-20. [ ] **Phase 4 Task 4.5 / Phase 5**: Parity validation — run `parity_test_signal_generators.py` to verify signal output matches backup
-21. [ ] **New**: Run smoke tests on both signal generators to verify functionality (`--mode smoke`)
+19. [ ] **Phase 4 Task 4.3**: Backtesting loop-breaking strategy — explore trade-level vectorization, batch equity computation, identify which metrics need per-bar granularity
+20. [ ] **Phase 4 Task 4.4**: Optuna search space reduction — profile parameter sensitivity, fix low-sensitivity params, reduce trial count by 30-50%
+21. [ ] **Phase 4 Task 4.5 / Phase 5**: Parity validation — run `parity_test_signal_generators.py` to verify signal output matches backup
+22. [ ] **New**: Full WFV run on all windows (VM + TV) with new restructuring — see `docs/wfv_restructuring_implementation.md`
 
 ### 🚀 Commands (Unchanged — No Breaking Changes)
 ```powershell
@@ -181,6 +182,17 @@ python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 -
 # Backtesting
 python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results
 ```
+
+---
+### 🧹 Cleanup Log (2026-08-26)
+- **WFV Pipeline Restructuring (Phase 4 Task 4.6):**
+  - Modified: `orchestrate_calibration.py` — two-phase scheduling (annuals before months), `_resolve_parent_path` with retry/abort, `_compute_distribution_prior` for knowledge inheritance
+  - Modified: `optuna_calibrate_vm.py` — SQLite on WSL-native fs (PID+UUID), distribution-based prior inheritance, Phase 3 narrowing removed (full config range), `--distribution-prior` arg, trial saving (phase1/phase2 JSON)
+  - Modified: `optuna_calibrate_tv.py` — same pattern as VM + fixed `--phase3-only` fallback bug (was erroring instead of falling back to config defaults)
+  - Modified: `config.json` — exit flags permanently ON (removed from search space), widened ranges for 13 edge-pinned parameters, trial counts: P1=150, P3=50
+  - Created: `docs/wfv_restructuring_implementation.md` — full implementation documentation
+  - Smoke tests: both VM and TV pass (5 windows each, two-phase scheduling verified)
+  - Parity tests: signal parity PASS (pre-existing objective_wrapper datetime64 issue unrelated to changes)
 
 ---
 ### 🧹 Cleanup Log (2026-07-11)

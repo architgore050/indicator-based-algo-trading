@@ -278,6 +278,101 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     return float(objective_score)
 
 # ---------------------------------------------------------------------------
+# Distribution-Based Prior Inheritance
+# ---------------------------------------------------------------------------
+
+def save_phase_trials(study, output_dir, phase, n_trials_phase):
+    """Save Phase 1 or Phase 2 trial data to JSON for child windows to inherit."""
+    trials = study.trials
+    phase_trials = []
+    for t in trials:
+        if t.number < n_trials_phase:
+            phase_trials.append({
+                "number": t.number,
+                "value": t.value,
+                "params": t.params,
+                "state": t.state.name
+            })
+    path = Path(output_dir) / f"phase{phase}_trials.json"
+    with open(path, "w") as f:
+        json.dump(phase_trials, f)
+    logger.info(f"Saved {len(phase_trials)} Phase {phase} trials to {path}")
+
+
+def compute_distribution_stats(trials_data, top_pct):
+    """Compute per-parameter mean and std from top-N% trials."""
+    values = [t for t in trials_data if t["state"] != "PRUNED" and t["value"] is not None]
+    if not values:
+        return None
+    n_top = max(1, int(len(values) * top_pct))
+    top_trials = sorted(values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:n_top]
+    
+    all_params = set()
+    for t in top_trials:
+        all_params.update(t["params"].keys())
+    
+    stats = {}
+    for param in all_params:
+        vals = [t["params"][param] for t in top_trials if param in t["params"]]
+        if not vals:
+            continue
+        mean = float(np.mean(vals))
+        std = float(np.std(vals))
+        stats[param] = {"mean": mean, "std": std}
+    return stats
+
+
+def combine_prior(phase1_stats, phase2_stats, ranges):
+    """Combine Phase 1 and Phase 2 stats into child search space bounds.
+    
+    Returns dict of {param: (low, high)} clamped to original bounds,
+    with 40% guardrail.
+    """
+    combined = {}
+    all_params = set()
+    if phase1_stats:
+        all_params.update(phase1_stats.keys())
+    if phase2_stats:
+        all_params.update(phase2_stats.keys())
+    
+    for param in all_params:
+        if param not in ranges:
+            continue
+        
+        p1 = phase1_stats.get(param, {})
+        p2 = phase2_stats.get(param, {})
+        
+        # Equal weight combination
+        if p1 and p2:
+            mean = (p1["mean"] + p2["mean"]) / 2.0
+            std = (p1["std"] + p2["std"]) / 2.0
+        elif p1:
+            mean = p1["mean"]
+            std = p1["std"]
+        elif p2:
+            mean = p2["mean"]
+            std = p2["std"]
+        else:
+            continue
+        
+        low = mean - 1.5 * std
+        high = mean + 1.5 * std
+        
+        orig_low = ranges[param][0]
+        orig_high = ranges[param][1]
+        
+        # Guardrail: if combined range < 40% of original, use original
+        combined_width = high - low
+        original_width = orig_high - orig_low
+        if combined_width < 0.4 * original_width:
+            combined[param] = (orig_low, orig_high)
+        else:
+            combined[param] = (max(orig_low, low), min(orig_high, high))
+    
+    return combined
+
+
+# ---------------------------------------------------------------------------
 # Parallel Optimization
 # ---------------------------------------------------------------------------
 
@@ -304,7 +399,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
         logger.info(f"Enqueued {enqueued} top trials as warm-start candidates.")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None):
+def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None, distribution_prior: dict = None):
     ranges = CALIB_PARAMS["tv_ranges"]
 
     # Port over the distribution/warm start by enqueuing the current best
@@ -318,10 +413,14 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
             # Auto-detect float vs int
             if isinstance(v[0], int) and isinstance(v[1], int):
                 # Integer param
-                if current_best and phase >= 2:
-                    # Narrow refinement around best
+                if distribution_prior and phase == 3 and k in distribution_prior:
+                    # Use inherited distribution bounds (no narrowing)
+                    low, high = distribution_prior[k]
+                    trial_params[k] = trial.suggest_int(k, int(low), int(high))
+                elif current_best and phase == 2:
+                    # Phase 2 only: narrow refinement around best
                     width = v[1] - v[0]
-                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"]
                     r_width = max(1, int(width * refine_pct))
                     low = max(v[0], current_best[k] - r_width // 2)
                     high = min(v[1], current_best[k] + r_width // 2)
@@ -330,9 +429,14 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
                     trial_params[k] = trial.suggest_int(k, v[0], v[1])
             else:
                 # Float param
-                if current_best and phase >= 2:
+                if distribution_prior and phase == 3 and k in distribution_prior:
+                    # Use inherited distribution bounds (no narrowing)
+                    low, high = distribution_prior[k]
+                    trial_params[k] = trial.suggest_float(k, low, high)
+                elif current_best and phase == 2:
+                    # Phase 2 only: narrow refinement around best
                     width = v[1] - v[0]
-                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"] if phase == 2 else OPTUNA_CONF["phase3_refinement_pct"]
+                    refine_pct = OPTUNA_CONF["phase2_refinement_pct"]
                     r_width = width * refine_pct
                     low = max(v[0], current_best[k] - r_width / 2.0)
                     high = min(v[1], current_best[k] + r_width / 2.0)
@@ -364,6 +468,7 @@ def main():
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
+    parser.add_argument("--distribution-prior", type=str, help="Path to JSON file with distribution prior (mean, std) from parent annual's Phase 1+2 trials.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_tv.json).")
     args = parser.parse_args()
     
@@ -383,29 +488,33 @@ def main():
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
     
-    # SQLite storage disabled (2026-08-24): 'database is locked' crashes killed
-    # annual windows under parallel WFV (9p-mounted NTFS + multi-thread commits).
-    # Audit showed nothing ever read these per-process DB files back.
-    # See Future_Path.md §6.
-    # db_dir = PROJECT_DIR / "optuna_db"
-    # db_dir.mkdir(exist_ok=True)
-    #
-    # db_name = f"optuna_tv_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
-    # storage_path = f"sqlite:///{db_dir / db_name}"
+    # SQLite storage on WSL-native filesystem ($HOME/optuna_logs/) for persistent trial logging.
+    # Previous failure was on 9p-mounted NTFS (/mnt/c/) causing 'database is locked' crashes.
+    # WSL-native ext4 filesystem avoids 9p latency/locking issues entirely.
+    is_monthly = args.phase3_only
+    if is_monthly:
+        storage_path = None
+    else:
+        home = os.environ.get("HOME", "/home/gorea")
+        db_dir = Path(home) / "optuna_logs"
+        db_dir.mkdir(exist_ok=True)
+        db_name = f"optuna_tv_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
+        storage_path = f"sqlite:///{db_dir / db_name}"
 
-    # One in-memory study shared across all phases — preserves cross-phase TPE
-    # history and enqueued warm-starts exactly as the shared SQLite file did.
-    storage_path = None
+    # Unique study name per process to avoid DuplicatedStudyError across WFV runs
+    run_id = uuid.uuid4().hex[:8]
     shared_study = optuna.create_study(
-        study_name="tv_discovery",
+        study_name=f"tv_discovery_{run_id}",
         storage=storage_path,
         direction="maximize",
-        pruner=optuna.pruners.MedianPruner()
+        pruner=optuna.pruners.MedianPruner(),
+        load_if_exists=True
     )
     
     current_best = None
     baseline_annual_params = None
     baseline_annual_score = -np.inf
+    distribution_prior = None
     
     # Load Baseline from Annual results if provided
     if args.annual_baseline:
@@ -418,14 +527,35 @@ def main():
                 baseline_annual_score = objective_wrapper(baseline_annual_params, data)
                 logger.info(f"Annual Baseline IS Score: {baseline_annual_score:.4f}")
 
+    # Load distribution prior from parent annual (monthly windows only)
+    if args.distribution_prior:
+        prior_path = Path(args.distribution_prior)
+        if prior_path.exists():
+            with open(prior_path, "r") as f:
+                prior_data = json.load(f)
+            phase1_stats = prior_data.get("phase1_stats")
+            phase2_stats = prior_data.get("phase2_stats")
+            if phase1_stats and phase2_stats:
+                distribution_prior = combine_prior(phase1_stats, phase2_stats, CALIB_PARAMS["tv_ranges"])
+                logger.info(f"PHASE 3 ONLY (informed): Using distribution prior from parent annual.")
+                logger.info(f"Distribution prior bounds: {len(distribution_prior)} parameters inherited.")
+            else:
+                logger.warning("Distribution prior file missing phase stats — falling back to config defaults.")
+        else:
+            logger.warning(f"Distribution prior file not found: {prior_path}. Falling back to config defaults.")
+    
     if args.phase3_only:
         if not RESULTS_PATH.exists():
-            logger.error(f"Cannot run --phase3-only: {RESULTS_PATH} not found.")
-            return
-        with open(RESULTS_PATH, "r") as f:
-            prev_results = json.load(f)
-            current_best = {k: v for k, v in prev_results["best_parameters"].items() if k in CALIB_PARAMS["tv_ranges"]}
-        logger.info("PHASE 3 ONLY: Skipping Phases 1 & 2. Using existing results as baseline.")
+            # Parallel WFV race: shared file not written yet, fall back to config defaults
+            logger.warning(f"Phase3-only requested but {RESULTS_PATH} not found. Using config defaults.")
+            current_best = None
+            logger.info("PHASE 3 ONLY (fallback): Using default parameters from config.json.")
+        else:
+            with open(RESULTS_PATH, "r") as f:
+                prev_results = json.load(f)
+                current_best = {k: v for k, v in prev_results["best_parameters"].items() if k in CALIB_PARAMS["tv_ranges"]}
+        if not distribution_prior:
+            logger.info("PHASE 3 ONLY: Skipping Phases 1 & 2. Using existing results as baseline.")
     else:
         # PHASE 1
         logger.info("PHASE 1: Sobol Quasi-random Exploration...")
@@ -445,6 +575,10 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
             
+            # Save Phase 1 trials for distribution-based inheritance by child monthly windows
+            output_dir = str(RESULTS_PATH.parent)
+            save_phase_trials(study, output_dir, 1, p1_trials)
+            
             # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
             enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
             
@@ -456,13 +590,16 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
             
+            # Save Phase 2 trials for distribution-based inheritance by child monthly windows
+            save_phase_trials(study, output_dir, 2, p2_trials)
+            
             # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
             enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
     
     # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best)
+    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best, distribution_prior=distribution_prior)
     
     # Survival of the Fittest Check
     try:

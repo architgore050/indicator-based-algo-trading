@@ -14,7 +14,7 @@ optuna_db/
 *_log.txt
 *.log
 *_smoke.csv
-output.txt
+v6/output.txt
 
 # IDE
 .vscode/

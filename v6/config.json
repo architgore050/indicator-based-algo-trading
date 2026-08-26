@@ -100,9 +100,9 @@
       "penalty_weight_risk": 3.5
     },
     "optuna_config": {
-      "phase1_trials": 100,
+      "phase1_trials": 150,
       "phase2_trials": 50,
-      "phase3_trials": 30,
+      "phase3_trials": 50,
       "n_startup_trials": 30,
       "top_n_to_enqueue": 5,
       "phase2_refinement_pct": 0.3,
@@ -146,24 +146,22 @@
       "min_sell_confirmations": [1, 10]
     },
     "vm_ranges": {
-      "multi_rsi_p1": [8, 21],
+      "multi_rsi_p1": [8, 30],
       "multi_rsi_p2": [20, 50],
       "multi_rsi_p3": [30, 100],
-      "multi_rsi_smal": [1, 10],
-      "crsi_dom_cycle": [6, 30],
-      "crsi_vibration": [5, 20],
+      "multi_rsi_smal": [1, 30],
+      "crsi_dom_cycle": [4, 40],
+      "crsi_vibration": [3, 30],
       "crsi_leveling": [5.0, 25.0],
-      "stoch_macd_fast_len": [8, 21],
-      "stoch_macd_slow_len": [20, 50],
-      "stoch_macd_signal_len": [5, 15],
-      "stoch_macd_lookback": [20, 60],
-      "stoch_macd_fast_len_xd": [3, 10],
-      "stoch_macd_slow_len_xd": [10, 20],
-      "stoch_macd_signal_len_xd": [2, 8],
-      "stoch_macd_lookback_xd": [15, 30],
-      "confirmation_lookback_bars": [2, 12],
-      "use_fast_stoch_exit": [0, 1],
-      "use_slow_stoch_exit": [0, 1]
+      "stoch_macd_fast_len": [5, 30],
+      "stoch_macd_slow_len": [15, 60],
+      "stoch_macd_signal_len": [3, 20],
+      "stoch_macd_lookback": [15, 80],
+      "stoch_macd_fast_len_xd": [1, 20],
+      "stoch_macd_slow_len_xd": [5, 50],
+      "stoch_macd_signal_len_xd": [1, 15],
+      "stoch_macd_lookback_xd": [10, 60],
+      "confirmation_lookback_bars": [1, 12]
     }
   },
   "data_config": {

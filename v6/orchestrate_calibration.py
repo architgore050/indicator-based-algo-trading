@@ -46,8 +46,9 @@ def get_env_activation():
 
 # Resource budget constants — tune these if OOM ever reappears.
 # Measured: full run with 20 workers peaked at ~30.5GB / 32GB (~1.5GB per worker).
-RAM_PER_WORKER_GB = 2.0    # lightly padded per-worker RSS budget
-SYSTEM_HEADROOM_GB = 4.0   # OS + orchestrator + transient parent/child overlap
+RAM_PER_WORKER_GB = 2.0        # lightly padded per-worker RSS budget
+SYSTEM_HEADROOM_GB = 4.0       # OS + orchestrator + transient parent/child overlap
+MAX_WINDOW_RETRIES = 3         # max attempts before aborting the entire WFV run
 
 
 def detect_total_ram_gb() -> float:
@@ -178,23 +179,137 @@ def run_step(cmd):
     logger.info(f"Running: {cmd_str}")
     subprocess.run(cmd_str, shell=True, check=True)
 
+
+# ---------------------------------------------------------------------------
+# Parent Resolution (file-based, with retry)
+# ---------------------------------------------------------------------------
+
+def _resolve_parent_path(wfv_dir, window_index, full_recal_interval, strategy):
+    """Find parent annual's calibration results on disk.
+
+    For monthly windows: returns the path to the parent annual's
+    calibration_results_{strategy}.json, or None if this is an annual window.
+
+    Retries immediately (no sleep) up to MAX_WINDOW_RETRIES times.
+    If all attempts fail, raises RuntimeError with ABORT marker.
+    """
+    if ((window_index - 1) % full_recal_interval) == 0:
+        return None  # Annual windows have no parent
+
+    parent_idx = 1 + ((window_index - 2) // full_recal_interval) * full_recal_interval
+    parent_dir = wfv_dir / f"window_{parent_idx}_annual_recal_{parent_idx}"
+    cal_file = parent_dir / f"calibration_results_{strategy}.json"
+
+    for attempt in range(1, MAX_WINDOW_RETRIES + 1):
+        if cal_file.exists():
+            return str(cal_file)
+        if attempt < MAX_WINDOW_RETRIES:
+            logger.warning(
+                f"Window {window_index}: parent ({parent_idx}) results not found. "
+                f"Retry {attempt}/{MAX_WINDOW_RETRIES}..."
+            )
+        else:
+            raise RuntimeError(
+                f"ABORT: Parent annual window {parent_idx} results not found at {cal_file} "
+                f"after {MAX_WINDOW_RETRIES} retries. The parent annual likely crashed. "
+                f"Aborting entire WFV run."
+            )
+
+
+def _compute_distribution_prior(wfv_dir, window_index, full_recal_interval):
+    """Compute distribution prior from parent annual's Phase 1+2 trials.
+    
+    Returns path to the combined distribution prior JSON, or None if unavailable.
+    """
+    import numpy as np
+    
+    parent_idx = 1 + ((window_index - 2) // full_recal_interval) * full_recal_interval
+    parent_dir = wfv_dir / f"window_{parent_idx}_annual_recal_{parent_idx}"
+    
+    phase1_path = parent_dir / "phase1_trials.json"
+    phase2_path = parent_dir / "phase2_trials.json"
+    
+    if not phase1_path.exists() or not phase2_path.exists():
+        return None
+    
+    with open(phase1_path, "r") as f:
+        phase1_data = json.load(f)
+    with open(phase2_path, "r") as f:
+        phase2_data = json.load(f)
+    
+    # Compute stats from top 30% of Phase 1
+    p1_values = [t for t in phase1_data if t["state"] != "PRUNED" and t["value"] is not None]
+    if not p1_values:
+        return None
+    p1_top_n = max(1, int(len(p1_values) * 0.3))
+    p1_top = sorted(p1_values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:p1_top_n]
+    
+    # Compute stats from top 20% of Phase 2
+    p2_values = [t for t in phase2_data if t["state"] != "PRUNED" and t["value"] is not None]
+    p2_top_n = max(1, int(len(p2_values) * 0.2))
+    p2_top = sorted(p2_values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:p2_top_n]
+    
+    # Per-parameter mean+std
+    def compute_stats(trials):
+        all_params = set()
+        for t in trials:
+            all_params.update(t["params"].keys())
+        stats = {}
+        for param in all_params:
+            vals = [t["params"][param] for t in trials if param in t["params"]]
+            if vals:
+                stats[param] = {"mean": float(np.mean(vals)), "std": float(np.std(vals))}
+        return stats
+    
+    p1_stats = compute_stats(p1_top)
+    p2_stats = compute_stats(p2_top)
+    
+    # Combine with equal weight
+    combined = {}
+    all_params = set(p1_stats.keys()) | set(p2_stats.keys())
+    for param in all_params:
+        p1 = p1_stats.get(param, {})
+        p2 = p2_stats.get(param, {})
+        if p1 and p2:
+            mean = (p1["mean"] + p2["mean"]) / 2.0
+            std = (p1["std"] + p2["std"]) / 2.0
+        elif p1:
+            mean = p1["mean"]
+            std = p1["std"]
+        elif p2:
+            mean = p2["mean"]
+            std = p2["std"]
+        else:
+            continue
+        combined[param] = {"mean": mean, "std": std}
+    
+    if not combined:
+        return None
+    
+    # Save to temp file
+    fd, tmp_path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"phase1_stats": p1_stats, "phase2_stats": p2_stats, "combined": combined}, f)
+    return tmp_path
+
+
 # ---------------------------------------------------------------------------
 # Window Processing Logic (The Worker)
 # ---------------------------------------------------------------------------
 
 def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv_rows, 
                    recal_windows_count, full_recal_interval, full_cal_rows, 
-                   shared_yearly_best, row_to_chunk):
+                   wfv_dir, row_to_chunk):
     """
     Processes a single WFV window. This function is designed to run in a separate process.
     """
     # Per-worker logger with dedicated log file
-    worker_logger = get_logger(__name__, log_dir=WFV_DIR, worker_id=i)
+    worker_logger = get_logger(__name__, log_dir=wfv_dir, worker_id=i)
 
     # 1. Determine Window Type
     is_annual = ((i - 1) % full_recal_interval == 0)
     window_label = f"annual_recal_{i}" if is_annual else f"monthly_refine_{i}"
-    current_dir = WFV_DIR / f"window_{i}_{window_label}"
+    current_dir = wfv_dir / f"window_{i}_{window_label}"
     current_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. Temporal Partitioning
@@ -208,16 +323,14 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
 
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
-    # 3. Decision Logic: Every window always recalibrates
-    trigger_refinement = True
-    yearly_best_path = None
-    if shared_yearly_best.value != "":
-        yearly_best_path = Path(shared_yearly_best.value)
+    # 3. Resolve parent annual path (file-based, with retry)
+    yearly_best_path = _resolve_parent_path(wfv_dir, i, full_recal_interval, strategy)
 
     worker_logger.info(f"Decision: {window_label} - always recalibrate.")
 
-    # 4. Calibration
-    if trigger_refinement:
+    # 4. Calibration (with retry)
+    cal_success = False
+    for attempt in range(1, MAX_WINDOW_RETRIES + 1):
         window_cal_output = str(current_dir / f"calibration_results_{strategy}.json")
         cal_cmd = [
             PYTHON, str(PROJECT_DIR / get_calibration_script(strategy)),
@@ -230,24 +343,32 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             cal_cmd.append("--smoke")
         if not is_annual:
             cal_cmd.append("--phase3-only")
-            if yearly_best_path and yearly_best_path.exists():
-                cal_cmd.extend(["--annual-baseline", str(yearly_best_path)])
+            if yearly_best_path:
+                cal_cmd.extend(["--annual-baseline", yearly_best_path])
+            # Compute and pass distribution prior from parent annual
+            dist_prior_path = _compute_distribution_prior(wfv_dir, i, full_recal_interval)
+            if dist_prior_path:
+                cal_cmd.extend(["--distribution-prior", dist_prior_path])
 
         cal_cmd_str = shlex.join(cal_cmd)
         worker_logger.info(f"Calibration Command: {cal_cmd_str}")
         try:
             subprocess.run(cal_cmd_str, shell=True, check=True)
+            cal_success = True
+            break
         except Exception as e:
-            worker_logger.error(f"Calibration failed for window {i}: {e}")
-            return False
+            worker_logger.warning(f"Calibration attempt {attempt}/{MAX_WINDOW_RETRIES} failed for window {i}: {e}")
+            if attempt < MAX_WINDOW_RETRIES:
+                worker_logger.info(f"Retrying calibration for window {i}...")
 
-        # Update shared results file (atomic copy from per-window output after write completes)
-        res_file = current_dir / f"calibration_results_{strategy}.json"
-        if res_file.exists():
-            atomic_write(res_file, PROJECT_DIR / f"calibration_results_{strategy}.json")
-            if is_annual:
-                # Update the shared yearly best path
-                shared_yearly_best.value = str(current_dir / f"calibration_results_{strategy}.json")
+    if not cal_success:
+        worker_logger.error(f"Calibration failed after {MAX_WINDOW_RETRIES} attempts for window {i}")
+        raise RuntimeError(f"ABORT: Window {i} calibration failed after {MAX_WINDOW_RETRIES} retries")
+
+    # Update shared results file (atomic copy from per-window output after write completes)
+    res_file = current_dir / f"calibration_results_{strategy}.json"
+    if res_file.exists():
+        atomic_write(res_file, PROJECT_DIR / f"calibration_results_{strategy}.json")
 
     # 5. Signal Generation (OOS) — use per-window calibration results to avoid race conditions
     window_cal = current_dir / f"calibration_results_{strategy}.json"
@@ -394,26 +515,58 @@ def main():
     # Map (start_row, end_row) → sliced path for workers
     row_to_chunk = {r: str(SLICED_DIR / f"rows_{r[0]}_{r[1]}.csv") for r in unique_ranges}
 
-    # Shared state via Manager (only yearly_best path - shared_history removed as dead state)
-    manager = multiprocessing.Manager()
-    shared_yearly_best = manager.Value('s', "") # String for path
+    # Identify annual and monthly window indices
+    annual_indices = [i for i in range(1, total_windows + 1) if (i - 1) % full_recal_interval == 0]
+    monthly_indices = [i for i in range(1, total_windows + 1) if (i - 1) % full_recal_interval != 0]
+
+    logger.info(f"Two-phase scheduling: {len(annual_indices)} annual windows, {len(monthly_indices)} monthly windows")
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = []
-        for i in range(1, total_windows + 1):
-            futures.append(executor.submit(
+        # Phase 1: All annual windows
+        logger.info("--- Phase 1: Annual Windows ---")
+        annual_futures = []
+        for i in annual_indices:
+            annual_futures.append(executor.submit(
                 process_window, 
                 i, args.strategy, args, oos_start_base, rows_per_window, 
                 total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, shared_yearly_best, row_to_chunk
+                full_cal_rows, WFV_DIR, row_to_chunk
             ))
 
-        # Use tqdm to track completion of futures
-        for f in tqdm(futures, desc="WFV Progress", unit="window"):
+        for f in tqdm(annual_futures, desc="Phase 1 — Annual Windows", unit="window"):
             try:
                 f.result()
+            except RuntimeError as e:
+                if "ABORT" in str(e):
+                    logger.error(f"WFV run aborted: {e}")
+                    raise
+                raise
             except Exception as e:
-                logger.error(f"A window task failed with error: {e}")
+                logger.error(f"Annual window failed: {e}")
+                raise
+
+        # Phase 2: All monthly windows
+        logger.info("--- Phase 2: Monthly Windows ---")
+        monthly_futures = []
+        for i in monthly_indices:
+            monthly_futures.append(executor.submit(
+                process_window, 
+                i, args.strategy, args, oos_start_base, rows_per_window, 
+                total_wfv_rows, recal_windows_count, full_recal_interval, 
+                full_cal_rows, WFV_DIR, row_to_chunk
+            ))
+
+        for f in tqdm(monthly_futures, desc="Phase 2 — Monthly Windows", unit="window"):
+            try:
+                f.result()
+            except RuntimeError as e:
+                if "ABORT" in str(e):
+                    logger.error(f"WFV run aborted: {e}")
+                    raise
+                raise
+            except Exception as e:
+                logger.error(f"Monthly window failed: {e}")
+                raise
 
     logger.info("WFV Pipeline Complete.")
 

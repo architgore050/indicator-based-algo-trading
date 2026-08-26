@@ -372,6 +372,15 @@ This section captures lessons learned from actual implementation experience. It 
 - **The orchestrator runs inside WSL but spawns subprocesses.** These subprocesses inherit the parent's environment (including cudf/cupy availability). Do NOT wrap them in `wsl bash -c` when the orchestrator is already running inside WSL — the nested WSL call fails.
 - **Every subagent must read AGENTS.md.** It contains essential project context including file structure, WSL execution format, parity testing requirements, and design philosophy. Not reading it leads to broken assumptions and wasted effort.
 
+### WFV Restructuring (2026-08-26)
+- **Optuna SQLite `DuplicatedStudyError` on repeated runs.** When reusing the same study name with `storage=sqlite://...`, Optuna raises `DuplicatedStudyError`. Fix: use PID+UUID for unique study names + `load_if_exists=True`. This was the first SQLite re-introduction attempt after the 2026-08-24 removal.
+- **SQLite on WSL-native ext4 works reliably.** Previous failures were on 9p-mounted NTFS (`/mnt/c/`). Storing DBs in `$HOME/optuna_logs/` (WSL-native) avoids 9p latency/locking entirely. PID+UUID filenames prevent inter-process collisions.
+- **Two-phase scheduling is structural, not optional.** Monthly windows that calibrate before their parent annual finish produce config-default fallbacks (0% knowledge transfer). Phase 1 (annuals) must complete before Phase 2 (months) starts. This is enforced in `orchestrate_calibration.py` via separate `annual_indices`/`monthly_indices` lists and sequential executor phases.
+- **Phase 3 hard narrowing collapses search space to single point.** 10% geometric narrowing on integer parameters with small ranges → `max(1, 0) = 0` → `0 // 2 = 0` → one value. Removal restores full config range for Phase 3. TPE naturally concentrates without hard bounds.
+- **Distribution-based prior inheritance requires parent trial data.** Annual calibrations now save `phase1_trials.json` and `phase2_trials.json` to their window directory. Orchestrator computes combined stats (top 30% P1 + top 20% P2, equal weight) and passes via `--distribution-prior` arg. 40% guardrail restores original range if combined stats over-narrow.
+- **TV calibrator `--phase3-only` fallback must match VM.** TV's original code errored out when `calibration_results_tv.json` didn't exist (parallel WFV race). Fixed to fall back to config defaults, matching VM's behavior.
+- **Exit flags permanently ON removes 2 dimensions from search space.** `use_fast_stoch_exit` and `use_slow_stoch_exit` were pinned False in 178/185 windows. Removing them from `vm_ranges` gives Optuna 2 fewer dimensions to optimize.
+
 ### Proactive Self-Organization
 - **Both the orchestrator and every subagent MUST proactively keep AGENTS.md and skills updated.** After every significant code change, bug fix, or architectural shift, update the relevant sections.
 - **Skills are living documents.** When a subagent uses a skill and finds something that can be improved, it MUST report that feedback to the orchestrator. The orchestrator evaluates the feedback and decides whether to apply it.
@@ -380,4 +389,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Record new lessons in Experience Learning.** Every bug fix, design decision, or tool usage lesson should be recorded for future reference.
 
 ---
-*Last updated: 2026-08-24 — Optuna moved to in-memory storage (SQLite lock crashes eliminated; one shared study per calibration process). RAM-aware worker limiting replaced VRAM estimation (tunable constants in orchestrate_calibration.py). Backtester plotting disabled by default (--plots flag restores). CAGR annualization confirmed as signal amplifier. Dead parameter detection added to Experience Learning. Linear penalty gradient confirmed as correct for TPE. allow_reversals set to true. multi_rsi_smal dead parameter identified — signal generation should use R1MAVW not RSI1.*
+*Last updated: 2026-08-26 — WFV pipeline restructuring complete: two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections (exit flags ON, 13 ranges widened, confirmation_lookback_bars floor 2→1), trial counts (P1: 100→150, P3: 30→50), SQLite trial logging on WSL-native fs. TV calibrator --phase3-only fallback fixed. See docs/wfv_restructuring_implementation.md.*
