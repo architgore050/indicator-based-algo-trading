@@ -337,7 +337,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             "--data-csv", row_to_chunk[(is_start, is_end)],
             "--start-row", "0",
             "--end-row", str(is_end - is_start + 1),
-            "--output", window_cal_output
+            "--output", window_cal_output,
+            "--window-index", str(i)
         ]
         if args.smoke:
             cal_cmd.append("--smoke")

@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import optuna
-from optuna.samplers import QMCSampler, TPESampler
+from optuna.samplers import TPESampler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
@@ -475,6 +475,7 @@ def main():
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
     parser.add_argument("--distribution-prior", type=str, help="Path to JSON file with distribution prior (mean, std) from parent annual's Phase 1+2 trials.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_vm.json).")
+    parser.add_argument("--window-index", type=int, default=0, help="Window index for per-window SQLite DB naming.")
     args = parser.parse_args()
     
     # Override results path for per-window isolation (parallel WFV safety)
@@ -505,9 +506,8 @@ def main():
         home = os.environ.get("HOME", "/home/gorea")
         db_dir = Path(home) / "optuna_logs"
         db_dir.mkdir(exist_ok=True)
-        # Unique per-process: PID + UUID prevents SQLite/Alembic race conditions
-        # when multiple WFV workers launch within the same second.
-        db_name = f"optuna_vm_{os.getpid()}_{uuid.uuid4().hex[:8]}.db"
+        # Per-window DB: each annual window gets its own file, no concurrent access.
+        db_name = f"optuna_vm_window_{args.window_index}.db"
         storage_path = f"sqlite:///{db_dir / db_name}"
     
     # Unique study name per process to avoid DuplicatedStudyError across WFV runs
@@ -570,11 +570,7 @@ def main():
         # PHASE 1
         logger.info("PHASE 1: Sobol Quasi-random Exploration...")
         p1_trials = 5 if args.smoke else OPTUNA_CONF["phase1_trials"]
-        try:
-            sampler = QMCSampler()
-        except Exception:
-            logger.warning("QMCSampler unavailable (scipy missing). Falling back to TPESampler.")
-            sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"])
+        sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"])
         study = run_study(1, p1_trials, sampler, data, shared_study)
         
         if args.smoke:
