@@ -373,13 +373,93 @@ def combine_prior(phase1_stats, phase2_stats, ranges):
 
 
 # ---------------------------------------------------------------------------
+# PostgreSQL Configuration & Retry Helpers
+# ---------------------------------------------------------------------------
+
+def get_postgres_url() -> str:
+    """Get PostgreSQL connection URL.
+
+    Uses trust authentication (no password) since this is a local dev DB.
+    Database: optuna_db, User: gorea, Host: localhost (via Unix socket).
+    """
+    return "postgresql://gorea@localhost/optuna_db"
+
+
+def _get_storage_url(study) -> str:
+    """Extract the storage URL from a study's storage backend.
+
+    Optuna wraps the storage in CachedStorage, so we need to unwrap it.
+    For PostgreSQL, the URL is stored in the backend's url attribute.
+    """
+    storage = study._storage
+    # Unwrap CachedStorage if present
+    if hasattr(storage, "_backend"):
+        storage = storage._backend
+    if hasattr(storage, "url"):
+        return storage.url
+    return None
+
+
+def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20):
+    """Run study.optimize() with randomized backoff on PostgreSQL lock errors.
+
+    Catches StorageInternalError (wraps psycopg2.errors.DeadlockDetected /
+    serialization failures) and retries with randomized backoff (2-10s) to
+    avoid thundering herd. PostgreSQL handles concurrent writes natively —
+    this retry is a safety net for rare serialization conflicts.
+    On retry, creates a fresh study from the persisted DB so Optuna's internal
+    state is clean. Other exceptions are raised immediately.
+
+    Note: Optuna's internal state machine converts StorageInternalError to
+    AssertionError("Should not reach.") when the trial state becomes
+    inconsistent. Both are caught.
+    """
+    from optuna.exceptions import StorageInternalError
+    import optuna
+    import random
+
+    for attempt in range(max_retries):
+        try:
+            study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
+            return study
+        except (StorageInternalError, AssertionError) as e:
+            msg = str(e).lower()
+            is_locked = "locked" in msg or "should not reach" in msg or "deadlock" in msg or "serialization" in msg
+            if not is_locked:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            delay = random.uniform(2.0, 10.0)
+            logger.warning(
+                f"PostgreSQL contention (attempt {attempt + 1}/{max_retries}): {e}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            run_id = uuid.uuid4().hex[:8]
+            storage_url = get_postgres_url()
+            study = optuna.create_study(
+                study_name=f"tv_discovery_{run_id}",
+                storage=storage_url,
+                direction="maximize",
+                pruner=optuna.pruners.MedianPruner(),
+                load_if_exists=True,
+            )
+            import time
+            time.sleep(delay)
+    return study
+
+
+# ---------------------------------------------------------------------------
 # Parallel Optimization
 # ---------------------------------------------------------------------------
 
 def get_optimal_n_jobs():
-    """Return optimal parallel workers for Optuna."""
+    """Return optimal parallel workers for Optuna.
+
+    Uses all available CPU cores (capped at 20) for maximum throughput.
+    PostgreSQL handles concurrent writes natively — no SQLite contention.
+    """
     cpu_count = multiprocessing.cpu_count()
-    return min(cpu_count, 12)
+    return min(cpu_count, 20)
 
 
 def enqueue_top_trials(study, ranges: dict, n: int = None):
@@ -447,13 +527,7 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
         return objective_wrapper(trial_params, data)
 
     n_jobs = get_optimal_n_jobs()
-    for attempt in range(3):
-        try:
-            study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
-            break
-        except Exception as e:
-            if attempt == 2: raise e
-            logger.warning(f"Optuna collision (attempt {attempt+1}): {e}. Retrying...")
+    study = sqlite_retry_optimize(study, objective, n_trials, n_jobs)
     return study
 
 # ---------------------------------------------------------------------------
@@ -489,25 +563,14 @@ def main():
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
     
-    # SQLite storage on WSL-native filesystem ($HOME/optuna_logs/) for persistent trial logging.
-    # Previous failure was on 9p-mounted NTFS (/mnt/c/) causing 'database is locked' crashes.
-    # WSL-native ext4 filesystem avoids 9p latency/locking issues entirely.
-    is_monthly = args.phase3_only
-    if is_monthly:
-        storage_path = None
-    else:
-        home = os.environ.get("HOME", "/home/gorea")
-        db_dir = Path(home) / "optuna_logs"
-        db_dir.mkdir(exist_ok=True)
-        # Per-window DB: each annual window gets its own file, no concurrent access.
-        db_name = f"optuna_tv_window_{args.window_index}.db"
-        storage_path = f"sqlite:///{db_dir / db_name}"
+    # PostgreSQL for persistent trial logging with native concurrent write support.
+    storage_url = get_postgres_url()
 
     # Unique study name per process to avoid DuplicatedStudyError across WFV runs
     run_id = uuid.uuid4().hex[:8]
     shared_study = optuna.create_study(
         study_name=f"tv_discovery_{run_id}",
-        storage=storage_path,
+        storage=storage_url,
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(),
         load_if_exists=True

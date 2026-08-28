@@ -46,7 +46,9 @@ def get_env_activation():
 
 # Resource budget constants — tune these if OOM ever reappears.
 # Measured: full run with 20 workers peaked at ~30.5GB / 32GB (~1.5GB per worker).
-RAM_PER_WORKER_GB = 2.0        # lightly padded per-worker RSS budget
+# NOTE: 2GB/worker caused PCIe saturation with 11 concurrent cudf.from_pandas() calls.
+# 4GB/worker limits to ~5 workers, keeping the GPU busy without saturating the bus.
+RAM_PER_WORKER_GB = 4.0        # per-worker RSS budget (CPU RAM + GPU VRAM overhead)
 SYSTEM_HEADROOM_GB = 4.0       # OS + orchestrator + transient parent/child overlap
 MAX_WINDOW_RETRIES = 3         # max attempts before aborting the entire WFV run
 
