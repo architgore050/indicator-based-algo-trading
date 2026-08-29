@@ -307,6 +307,11 @@ def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str 
 # ---------------------------------------------------------------------------
 
 def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
+    # Apply SL/TP overrides from sampled params to BP (backtest reads from BP)
+    for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz"):
+        if key in params:
+            BP[key] = params[key]
+    
     # 1. Generate Signals
     signals = generate_vm_signals_local(data, params, trial_id=trial_id)
     if signals.empty:
@@ -449,10 +454,10 @@ def combine_prior(phase1_stats, phase2_stats, ranges):
         orig_low = ranges[param][0]
         orig_high = ranges[param][1]
         
-        # Guardrail: if combined range < 40% of original, use original
+        # Guardrail: if combined range < 60% of original, use original
         combined_width = high - low
         original_width = orig_high - orig_low
-        if combined_width < 0.4 * original_width:
+        if combined_width < 0.6 * original_width:
             combined[param] = (orig_low, orig_high)
         else:
             combined[param] = (max(orig_low, low), min(orig_high, high))

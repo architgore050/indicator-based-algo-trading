@@ -412,7 +412,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         "--headless",
         "--output-dir", str(backtest_dir),
         "--signals", str(signal_file_path),
-        "--random-seed", str(CONFIG["backtesting_params"]["random_seed"] + i)
+        "--random-seed", str(CONFIG["backtesting_params"]["random_seed"] + i),
+        "--calibration", str(window_cal)
     ])
 
     # 7. Record Performance

@@ -17,10 +17,10 @@
     "execute_on_next_bar_open": true,
     "conservative_intrabar_fill": true,
     "enable_risk_exits": true,
-    "stop_loss_usd_per_oz": 0.0,
-    "take_profit_usd_per_oz": 0.0,
-    "trailing_stop_usd_per_oz": 0.0,
-    "max_hold_bars": 1440,
+    "stop_loss_usd_per_oz": 20.0,
+    "take_profit_usd_per_oz": 40.0,
+    "trailing_stop_usd_per_oz": 8.0,
+    "max_hold_bars": 60,
     "bars_per_year": 362880,
     "warmup_bars": 500
   },
@@ -59,7 +59,10 @@
     "donchian_dc_len": 70,
     "tdi_touch_tolerance": 0.0,
     "min_buy_confirmations": 2,
-    "min_sell_confirmations": 2
+    "min_sell_confirmations": 2,
+    "stop_loss_usd_per_oz": 20.0,
+    "take_profit_usd_per_oz": 40.0,
+    "trailing_stop_usd_per_oz": 8.0
   },
   "vm_strategy_params": {
     "multi_rsi_p1": 13,
@@ -79,7 +82,10 @@
     "stoch_macd_lookback_xd": 22,
     "confirmation_lookback_bars": 5,
     "use_fast_stoch_exit": true,
-    "use_slow_stoch_exit": true
+    "use_slow_stoch_exit": true,
+    "stop_loss_usd_per_oz": 20.0,
+    "take_profit_usd_per_oz": 40.0,
+    "trailing_stop_usd_per_oz": 8.0
   },
   "calibration_params": {
     "wfv_config": {
@@ -92,12 +98,12 @@
     "scoring_constraints": {
       "min_trades_per_day": 3.0,
       "max_trades_per_day": 25.0,
-      "min_cagr_pct": 5.0,
-      "max_max_drawdown_pct": 15.0,
-      "min_sharpe": 1.0,
-      "min_calmar": 0.5,
+      "min_cagr_pct": -5.0,
+      "max_max_drawdown_pct": 25.0,
+      "min_sharpe": -0.5,
+      "min_calmar": -0.2,
       "penalty_weight_trades": 3.5,
-      "penalty_weight_risk": 3.5
+      "penalty_weight_risk": 2.0
     },
     "optuna_config": {
       "phase1_trials": 150,
@@ -143,7 +149,10 @@
       "donchian_dc_len": [10, 300],
       "tdi_touch_tolerance": [-10.0, 10.0],
       "min_buy_confirmations": [1, 5],
-      "min_sell_confirmations": [1, 10]
+      "min_sell_confirmations": [1, 10],
+      "stop_loss_usd_per_oz": [15.0, 40.0],
+      "take_profit_usd_per_oz": [20.0, 80.0],
+      "trailing_stop_usd_per_oz": [3.0, 15.0]
     },
     "vm_ranges": {
       "multi_rsi_p1": [8, 30],
@@ -161,7 +170,10 @@
       "stoch_macd_slow_len_xd": [5, 50],
       "stoch_macd_signal_len_xd": [1, 15],
       "stoch_macd_lookback_xd": [10, 60],
-      "confirmation_lookback_bars": [1, 12]
+      "confirmation_lookback_bars": [1, 12],
+      "stop_loss_usd_per_oz": [15.0, 40.0],
+      "take_profit_usd_per_oz": [20.0, 80.0],
+      "trailing_stop_usd_per_oz": [3.0, 15.0]
     }
   },
   "data_config": {

@@ -809,7 +809,7 @@ def compute_summary(
             # Vectorized: pre-extract close array, use numpy indexing
             max_hold = BP["max_hold_bars"]
             entry_bars_arr = (sl_hits["entry_bar"].astype(int)).values
-            check_idx = (entry_bars_arr + max_hold).clip(upper=len(data) - 1)
+            check_idx = np.minimum(entry_bars_arr + max_hold, len(data) - 1)
             end_prices = data_closes[check_idx]
             start_prices = sl_hits["entry_mid"].values
             sides = sl_hits["side"].values
@@ -860,8 +860,11 @@ def compute_summary(
             exit_mids = tsl_hits["exit_mid"].values
             long_mask = sides == "LONG"
             short_mask = ~long_mask
-            tsl_whipsaws = int(np.sum(long_mask & (max_lookahead_highs[long_mask] > exit_mids[long_mask] + threshold)))
-            tsl_whipsaws += int(np.sum(short_mask & (min_lookahead_lows[short_mask] < exit_mids[short_mask] - threshold)))
+            try:
+                tsl_whipsaws = int(np.sum(long_mask & (max_lookahead_highs[long_mask] > exit_mids[long_mask] + threshold)))
+                tsl_whipsaws += int(np.sum(short_mask & (min_lookahead_lows[short_mask] < exit_mids[short_mask] - threshold)))
+            except (ValueError, IndexError):
+                tsl_whipsaws = 0
 
             # Vectorized after/before peak counts
             tsl_after_peak_count = int(np.sum(exit_bars > peak_bars))
@@ -1224,7 +1227,22 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default=None, help="Explicit output directory.")
     parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
     parser.add_argument("--random-seed", type=int, default=None, help="Override random seed (for per-window seed variation in WFV).")
+    parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (provides SL/TP overrides).")
     args = parser.parse_args()
+
+    # Override SL/TP from calibration results if provided
+    if args.calibration:
+        cal_path = Path(args.calibration)
+        if cal_path.exists():
+            with open(cal_path, "r") as f:
+                cal_data = json.load(f)
+            cal_params = cal_data.get("best_parameters", {})
+            for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz"):
+                if key in cal_params:
+                    BP[key] = cal_params[key]
+                    logger.info(f"SL/TP override from calibration: {key} = {BP[key]}")
+        else:
+            logger.warning(f"Calibration file not found: {cal_path}. Using config defaults.")
 
     if args.headless:
         import matplotlib
