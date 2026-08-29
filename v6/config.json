@@ -152,7 +152,8 @@
       "min_sell_confirmations": [1, 10],
       "stop_loss_usd_per_oz": [15.0, 40.0],
       "take_profit_usd_per_oz": [20.0, 80.0],
-      "trailing_stop_usd_per_oz": [3.0, 15.0]
+      "trailing_stop_usd_per_oz": [3.0, 15.0],
+      "max_hold_bars": [10, 1440]
     },
     "vm_ranges": {
       "multi_rsi_p1": [8, 30],
@@ -173,7 +174,8 @@
       "confirmation_lookback_bars": [1, 12],
       "stop_loss_usd_per_oz": [15.0, 40.0],
       "take_profit_usd_per_oz": [20.0, 80.0],
-      "trailing_stop_usd_per_oz": [3.0, 15.0]
+      "trailing_stop_usd_per_oz": [3.0, 15.0],
+      "max_hold_bars": [10, 1440]
     }
   },
   "data_config": {

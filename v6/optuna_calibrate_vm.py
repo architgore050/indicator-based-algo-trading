@@ -308,7 +308,7 @@ def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str 
 
 def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
     # Apply SL/TP overrides from sampled params to BP (backtest reads from BP)
-    for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz"):
+    for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars"):
         if key in params:
             BP[key] = params[key]
     

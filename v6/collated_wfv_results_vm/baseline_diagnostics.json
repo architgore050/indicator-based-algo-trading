@@ -1,0 +1,72 @@
+{
+  "signal_file": "vm_automation_logic_signals_test.csv",
+  "initial_capital_usd": 100000.0,
+  "final_equity_usd": 70444.58107379092,
+  "final_equity_inr": 6480901.458788765,
+  "net_profit_usd": -29555.41892620908,
+  "net_profit_inr": -2719098.5412112353,
+  "total_return_pct": -29.555418926209075,
+  "cagr_pct": -3.0524246460275517,
+  "max_drawdown_usd": -29684.271953533316,
+  "max_drawdown_pct": -29.678588247472685,
+  "max_drawdown_bars": 3994953,
+  "sharpe_ratio": -4.767342192689504,
+  "sortino_ratio": -1.1013519025614382,
+  "calmar_ratio": -0.10284938827194667,
+  "exposure_pct": 2.952425,
+  "signals_read": 23920,
+  "spread_usd_per_oz": 0.12,
+  "slippage_mean_usd_per_oz": 0.03,
+  "commission_per_lot_side_usd": 3.5,
+  "trade_size_lots": 0.1,
+  "leverage": 10.0,
+  "usdinr_rate": 92,
+  "sl_diagnostics": {
+    "total_sl_hits": 0,
+    "good_idea_hits": 0,
+    "bad_idea_hits": 0,
+    "efficiency_ratio_pct": 100.0
+  },
+  "tsl_diagnostics": {
+    "total_tsl_hits": 84,
+    "avg_retention_pct": 10.136910702516396,
+    "whipsaw_count": 0,
+    "whipsaw_ratio_pct": 0.0,
+    "closed_after_peak_count": 37,
+    "closed_after_peak_avg_bars": 5.162162162162162,
+    "closed_before_peak_count": 44,
+    "closed_before_peak_avg_bars": 27.772727272727273,
+    "after_before_peak_ratio": 0.8409090909090909
+  },
+  "exit_trigger_diagnostics": {
+    "exit_indicator": {
+      "count": 11876,
+      "pct": 99.29765886287626
+    },
+    "trailing_stop": {
+      "count": 84,
+      "pct": 0.7023411371237459
+    }
+  },
+  "total_trades": 11960,
+  "winning_trades": 3653,
+  "losing_trades": 8307,
+  "win_rate_pct": 30.543478260869566,
+  "gross_profit_usd": 42823.66684996486,
+  "gross_loss_usd": -72379.08577610366,
+  "profit_factor": 0.5916580237340234,
+  "expectancy_usd": -2.4711888734229777,
+  "avg_win_usd": 11.72287622501091,
+  "avg_loss_usd": -8.713023447225673,
+  "payoff_ratio": 1.3454429792385798,
+  "best_trade_usd": 323.9557846920541,
+  "worst_trade_usd": -82.36549450598268,
+  "avg_bars_held": 9.87433110367893,
+  "median_bars_held": 9.0,
+  "max_consecutive_wins": 8,
+  "max_consecutive_losses": 36,
+  "commission_usd": 8372.000000000002,
+  "spread_slippage_cost_usd": 21701.938926145755,
+  "swap_usd": -103.60000000000001,
+  "total_costs_usd": 30177.538926145753
+}

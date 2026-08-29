@@ -1237,7 +1237,7 @@ def main() -> None:
             with open(cal_path, "r") as f:
                 cal_data = json.load(f)
             cal_params = cal_data.get("best_parameters", {})
-            for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz"):
+            for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars"):
                 if key in cal_params:
                     BP[key] = cal_params[key]
                     logger.info(f"SL/TP override from calibration: {key} = {BP[key]}")

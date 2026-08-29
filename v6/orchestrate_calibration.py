@@ -48,9 +48,17 @@ def get_env_activation():
 # Measured: full run with 20 workers peaked at ~30.5GB / 32GB (~1.5GB per worker).
 # NOTE: 2GB/worker caused PCIe saturation with 11 concurrent cudf.from_pandas() calls.
 # 4GB/worker limits to ~5 workers, keeping the GPU busy without saturating the bus.
-RAM_PER_WORKER_GB = 4.0        # per-worker RSS budget (CPU RAM + GPU VRAM overhead)
-SYSTEM_HEADROOM_GB = 4.0       # OS + orchestrator + transient parent/child overlap
-MAX_WINDOW_RETRIES = 3         # max attempts before aborting the entire WFV run
+RAM_PER_WORKER_GB = 3.0        # per-worker RSS budget (CPU RAM + GPU VRAM overhead)
+SYSTEM_HEADROOM_GB = 0.0       # OS + orchestrator + transient parent/child overlap
+MAX_WINDOW_RETRIES = 5         # max attempts before aborting the entire WFV run
+
+# Strategy-aware memory multipliers.
+# TV has 38 tunable params vs VM's 19 — roughly 2x the indicator computations
+# and intermediate tensors. Each TV worker needs ~2x the RAM of a VM worker.
+STRATEGY_MEMORY_MULTIPLIER = {
+    "vm": 1.0,
+    "tv": 2.0,
+}
 
 
 def detect_total_ram_gb() -> float:
@@ -70,15 +78,18 @@ def detect_total_ram_gb() -> float:
     return 0.0
 
 
-def compute_safe_worker_count(max_workers: int) -> int:
+def compute_safe_worker_count(max_workers: int, strategy: str = "vm") -> int:
     """Cap worker count so total expected RSS fits in system RAM minus headroom.
 
+    Applies a strategy-specific memory multiplier (TV uses ~2x VM memory).
     Falls back to min(max_workers, 4) when RAM detection fails.
     """
+    multiplier = STRATEGY_MEMORY_MULTIPLIER.get(strategy, 1.0)
+    effective_ram = RAM_PER_WORKER_GB * multiplier
     total_ram_gb = detect_total_ram_gb()
     if total_ram_gb > 0:
         ram_budget_gb = max(0.0, total_ram_gb - SYSTEM_HEADROOM_GB)
-        ram_limit = math.floor(ram_budget_gb / RAM_PER_WORKER_GB)
+        ram_limit = math.floor(ram_budget_gb / effective_ram)
         return min(max_workers, max(1, ram_limit))
     else:
         # RAM detection failed — conservative default
@@ -455,17 +466,19 @@ def main():
     max_is_rows, oos_rows = compute_max_rows_per_window(args, full_cal_rows, rows_per_window, recal_windows_count)
     max_total_rows = max_is_rows + oos_rows
     total_ram_gb = detect_total_ram_gb()
-    safe_count = compute_safe_worker_count(args.workers)
+    safe_count = compute_safe_worker_count(args.workers, args.strategy)
 
     mode_label = "SMOKE" if args.smoke else "FULL"
     logger.info(f"[{mode_label}] Max rows per worker: IS={max_is_rows:,} + OOS={oos_rows:,} = {max_total_rows:,}")
 
+    multiplier = STRATEGY_MEMORY_MULTIPLIER.get(args.strategy, 1.0)
+    effective_ram = RAM_PER_WORKER_GB * multiplier
     if total_ram_gb > 0:
         ram_budget_gb = max(0.0, total_ram_gb - SYSTEM_HEADROOM_GB)
         logger.info(
             f"[{mode_label}] RAM-aware worker limit: {safe_count} workers "
             f"(total RAM: {total_ram_gb:.1f}GB, budget: {ram_budget_gb:.1f}GB, "
-            f"{RAM_PER_WORKER_GB:.1f}GB/worker)"
+            f"{effective_ram:.1f}GB/worker [base {RAM_PER_WORKER_GB:.1f}GB x {multiplier:.1f} {args.strategy}])"
         )
     else:
         logger.info(f"[{mode_label}] RAM detection unavailable — using conservative limit: {safe_count} workers")
