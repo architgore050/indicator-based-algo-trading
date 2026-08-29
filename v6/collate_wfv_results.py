@@ -82,7 +82,7 @@ def _run_subprocess(cmd):
     return result
 
 
-def _run_baseline(output_dir):
+def _run_baseline(output_dir, strategy="vm"):
     """Run baseline signal generation + backtest using default config params.
 
     Creates handshake folder with artifacts for diagnosis.
@@ -97,7 +97,7 @@ def _run_baseline(output_dir):
     handshake_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Generate signals with default params (no --calibration flag)
-    signal_script = PROJECT_DIR / "generate_vm_automation_logic_signals.py"
+    signal_script = _get_signal_script(strategy)
     signal_cmd = [
         sys.executable, str(signal_script),
         "--mode", "test",
@@ -111,10 +111,11 @@ def _run_baseline(output_dir):
 
     # Step 2: Run backtest on generated signals (test mode → _test.csv suffix)
     backtest_script = PROJECT_DIR / "backtest_xauusd_signal_csv.py"
-    signal_file = handshake_dir / "vm_automation_logic_signals_test.csv"
+    signal_filename = _get_signal_filename(strategy, "test")
+    signal_file = handshake_dir / signal_filename
     backtest_cmd = [
         sys.executable, str(backtest_script),
-        "--strategy", "vm",
+        "--strategy", strategy,
         "--mode", "test",
         "--headless",
         "--signals", str(signal_file),
@@ -161,12 +162,12 @@ def _extract_window_info(window_dir):
     return window_idx, regime, recal_idx
 
 
-def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
+def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results', strategy='vm'):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # --- Run baseline (native behavior, always) ---
-    print("[baseline] Starting baseline signal generation + backtest...")
-    baseline_data = _run_baseline(output_dir)
+    print(f"[baseline] Starting baseline signal generation + backtest (strategy={strategy})...")
+    baseline_data = _run_baseline(output_dir, strategy)
     baseline_equity = None
     baseline_summary = None
     if baseline_data is not None:
@@ -543,5 +544,33 @@ def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results'):
 
     print(f"Collation complete. Files saved in {output_dir}")
 
+def _get_signal_script(strategy):
+    """Return the signal generation script path for the given strategy."""
+    PROJECT_DIR = Path(__file__).resolve().parent
+    if strategy == "vm":
+        return PROJECT_DIR / "generate_vm_automation_logic_signals.py"
+    elif strategy == "tv":
+        return PROJECT_DIR / "generate_tv_strategy1_signals.py"
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
+def _get_signal_filename(strategy, mode):
+    """Return the expected signal CSV filename for the given strategy and mode."""
+    if strategy == "vm":
+        return f"vm_automation_logic_signals_{mode}.csv"
+    elif strategy == "tv":
+        return f"tv_strategy1_signals_{mode}.csv"
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
 if __name__ == "__main__":
-    collate_results()
+    import argparse
+    parser = argparse.ArgumentParser(description="Collate WFV results across windows")
+    parser.add_argument("--strategy", choices=["vm", "tv"], default="vm",
+                        help="Strategy to use for baseline comparison (default: vm)")
+    parser.add_argument("--wfv-dir", default="wfv", help="WFV output directory")
+    parser.add_argument("--output-dir", default="collated_wfv_results", help="Output directory for collated results")
+    args = parser.parse_args()
+    collate_results(wfv_dir=args.wfv_dir, output_dir=args.output_dir, strategy=args.strategy)

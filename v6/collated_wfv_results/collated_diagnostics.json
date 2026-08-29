@@ -15714,15 +15714,15 @@
     }
   ],
   "baseline": {
-    "cagr_pct": -3.0524246460275517,
-    "sharpe_ratio": -4.767342192689504,
-    "calmar_ratio": -0.10284938827194667,
-    "max_drawdown_pct": -29.678588247472685,
-    "total_trades": 11960,
-    "win_rate_pct": 30.543478260869566,
-    "net_profit_usd": -29555.41892620908,
-    "profit_factor": 0.5916580237340234,
-    "expectancy_usd": -2.4711888734229777,
-    "total_costs_usd": 30177.538926145753
+    "cagr_pct": -2.272855218676506,
+    "sharpe_ratio": -3.3628141523842174,
+    "calmar_ratio": -0.09590536443841999,
+    "max_drawdown_pct": -23.698937301217253,
+    "total_trades": 8558,
+    "win_rate_pct": 51.71769104931059,
+    "net_profit_usd": -22881.766786629174,
+    "profit_factor": 0.6287310728331319,
+    "expectancy_usd": -2.6737282994366534,
+    "total_costs_usd": 21697.206786584193
   }
 }
