@@ -551,6 +551,8 @@ def _get_signal_script(strategy):
         return PROJECT_DIR / "generate_vm_automation_logic_signals.py"
     elif strategy == "tv":
         return PROJECT_DIR / "generate_tv_strategy1_signals.py"
+    elif strategy == "trend":
+        return PROJECT_DIR / "generate_trend_following_signals.py"
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -561,6 +563,8 @@ def _get_signal_filename(strategy, mode):
         return f"vm_automation_logic_signals_{mode}.csv"
     elif strategy == "tv":
         return f"tv_strategy1_signals_{mode}.csv"
+    elif strategy == "trend":
+        return f"trend_strategy_signals_{mode}.csv"
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -568,7 +572,7 @@ def _get_signal_filename(strategy, mode):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Collate WFV results across windows")
-    parser.add_argument("--strategy", choices=["vm", "tv"], default="vm",
+    parser.add_argument("--strategy", choices=["vm", "tv", "trend"], default="vm",
                         help="Strategy to use for baseline comparison (default: vm)")
     parser.add_argument("--wfv-dir", default="wfv", help="WFV output directory")
     parser.add_argument("--output-dir", default="collated_wfv_results", help="Output directory for collated results")

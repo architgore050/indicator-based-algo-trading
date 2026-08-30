@@ -3,7 +3,7 @@
     "initial_capital_usd": 100000.0,
     "standard_lot_oz": 100.0,
     "trade_size_lots": 0.1,
-    "leverage": 10.0,
+    "leverage": 50.0,
     "maintenance_margin_ratio": 0.5,
     "spread_usd_per_oz": 0.12,
     "slippage_mean_usd_per_oz": 0.03,
@@ -87,6 +87,24 @@
     "take_profit_usd_per_oz": 40.0,
     "trailing_stop_usd_per_oz": 8.0
   },
+  "trend_strategy_params": {
+    "tsm_fast_lb": 240,
+    "tsm_med_lb": 720,
+    "tsm_slow_lb": 2880,
+    "tsm_vol_lb": 480,
+    "tsm_vol_z_entry": 0.0,
+    "tsm_entry_threshold": 0.015,
+    "bo_donchian_lb": 240,
+    "bo_ema_fast_lb": 100,
+    "bo_ema_slow_lb": 400,
+    "bo_atr_lb": 28,
+    "er_lb": 200,
+    "er_min_threshold": 0.30,
+    "min_realized_vol": 0.0005,
+    "stop_loss_usd_per_oz": 25.0,
+    "take_profit_usd_per_oz": 60.0,
+    "trailing_stop_usd_per_oz": 12.0
+  },
   "calibration_params": {
     "wfv_config": {
         "recalibration_windows": 6,
@@ -106,9 +124,9 @@
       "penalty_weight_risk": 2.0
     },
     "optuna_config": {
-      "phase1_trials": 150,
-      "phase2_trials": 50,
-      "phase3_trials": 50,
+      "phase1_trials": 200,
+      "phase2_trials": 100,
+      "phase3_trials": 100,
       "n_startup_trials": 30,
       "top_n_to_enqueue": 5,
       "phase2_refinement_pct": 0.3,
@@ -150,9 +168,9 @@
       "tdi_touch_tolerance": [-10.0, 10.0],
       "min_buy_confirmations": [1, 5],
       "min_sell_confirmations": [1, 10],
-      "stop_loss_usd_per_oz": [15.0, 40.0],
+      "stop_loss_usd_per_oz": [15.0, 50.0],
       "take_profit_usd_per_oz": [20.0, 80.0],
-      "trailing_stop_usd_per_oz": [3.0, 15.0],
+      "trailing_stop_usd_per_oz": [3.0, 20.0],
       "max_hold_bars": [10, 1440]
     },
     "vm_ranges": {
@@ -172,10 +190,28 @@
       "stoch_macd_signal_len_xd": [1, 15],
       "stoch_macd_lookback_xd": [10, 60],
       "confirmation_lookback_bars": [1, 12],
-      "stop_loss_usd_per_oz": [15.0, 40.0],
+      "stop_loss_usd_per_oz": [15.0, 50.0],
       "take_profit_usd_per_oz": [20.0, 80.0],
-      "trailing_stop_usd_per_oz": [3.0, 15.0],
+      "trailing_stop_usd_per_oz": [3.0, 20.0],
       "max_hold_bars": [10, 1440]
+    },
+    "trend_ranges": {
+      "tsm_fast_lb": [60, 480],
+      "tsm_med_lb": [240, 1440],
+      "tsm_slow_lb": [1440, 5760],
+      "tsm_vol_lb": [120, 960],
+      "tsm_entry_threshold": [0.005, 0.08],
+      "bo_donchian_lb": [60, 480],
+      "bo_ema_fast_lb": [20, 240],
+      "bo_ema_slow_lb": [100, 800],
+      "bo_atr_lb": [7, 60],
+      "er_lb": [50, 400],
+      "er_min_threshold": [0.10, 0.70],
+      "min_realized_vol": [0.0001, 0.005],
+      "stop_loss_usd_per_oz": [15.0, 60.0],
+      "take_profit_usd_per_oz": [25.0, 120.0],
+      "trailing_stop_usd_per_oz": [5.0, 25.0],
+      "max_hold_bars": [60, 2880]
     }
   },
   "data_config": {

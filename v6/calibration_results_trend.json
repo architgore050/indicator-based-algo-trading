@@ -1,0 +1,29 @@
+{
+  "best_parameters": {
+    "tsm_fast_lb": 480,
+    "tsm_med_lb": 667,
+    "tsm_slow_lb": 2907,
+    "tsm_vol_lb": 710,
+    "tsm_vol_z_entry": 0.0,
+    "tsm_entry_threshold": 0.010669080455768198,
+    "bo_donchian_lb": 105,
+    "bo_ema_fast_lb": 84,
+    "bo_ema_slow_lb": 509,
+    "bo_atr_lb": 21,
+    "er_lb": 116,
+    "er_min_threshold": 0.1399525793987897,
+    "min_realized_vol": 0.0045242074235554,
+    "stop_loss_usd_per_oz": 39.72480405701153,
+    "take_profit_usd_per_oz": 46.61172764826286,
+    "trailing_stop_usd_per_oz": 9.383259174957034,
+    "max_hold_bars": 2751
+  },
+  "best_score": -7.548213668817739,
+  "calibration_date": "2026-08-30T05:37:59.233249",
+  "dataset_info": {
+    "rows_used": 362880,
+    "strategy": "trend",
+    "end_row": 129601
+  },
+  "optimization_type": "optuna_sota_parallel"
+}

@@ -600,3 +600,170 @@ def calculate_tdi_loxx(
         },
         index=data.index,
     )
+
+
+# ---------------------------------------------------------------------------
+# Trend Following / Time Series Momentum Indicators
+# ---------------------------------------------------------------------------
+
+
+def calculate_time_series_momentum(
+    data: pd.DataFrame,
+    fast_lb: int = 60,
+    med_lb: int = 240,
+    slow_lb: int = 1440,
+    vol_lb: int = 240,
+    vol_z_entry: float = 0.5,
+    source_col: str = "close",
+) -> cudf.DataFrame:
+    """Time-Series Momentum (Moskowitz/Ooi/Pedersen 2012).
+
+    Computes past-N-bar returns over multiple horizons, plus a volatility
+    regime filter (annualised vol z-score vs trailing realised vol).
+
+    Returns
+    -------
+    cudf.DataFrame with columns:
+            Fast_Ret   - return over fast_lb bars
+            Med_Ret    - return over med_lb bars
+            Slow_Ret   - return over slow_lb bars
+            Composite  - average of available horizon returns
+            Realized_Vol - stdev of bar-to-bar returns over vol_lb (annualised via sqrt(bar frequency proxy))
+            Vol_Z      - z-score of Realized_Vol relative to a slow vol baseline
+    """
+    src = data[source_col]
+
+    # Past returns are lagged (use close[t]/close[t-N] - 1) so signals react
+    # only on closed bars.
+    fast_ret = src.pct_change(fast_lb)
+    med_ret = src.pct_change(med_lb)
+    slow_ret = src.pct_change(slow_lb)
+
+    # Composite: simple equal-weight average (only over horizons that are valid).
+    composite = (fast_ret.fillna(0.0) + med_ret.fillna(0.0) + slow_ret.fillna(0.0)) / 3.0
+
+    # Realised volatility (bar-to-bar log returns) — annualised using the
+    # backtester convention bars_per_year so units match across components.
+    bar_ret = src.pct_change()
+    realized_vol = bar_ret.rolling(vol_lb).std(ddof=0)
+    # Annualise using sqrt(bars_per_year / vol_lb) so realised vol units match
+    # the backtester's annualised Sharpe/Calmar. Use a constant factor here
+    # rather than pulling config — the relationship is shape-only.
+    realized_vol_ann = realized_vol * float((525_600.0 / max(1, vol_lb)) ** 0.5)
+
+    # Volatility regime: z-score of realised vol vs its slow SMA baseline.
+    vol_baseline = realized_vol.rolling(vol_lb * 4, min_periods=vol_lb).mean()
+    vol_std = realized_vol.rolling(vol_lb * 4, min_periods=vol_lb).std(ddof=0)
+    vol_z = (realized_vol - vol_baseline) / vol_std.where(vol_std != 0, float("nan"))
+
+    return cudf.DataFrame(
+        {
+            "Fast_Ret": fast_ret,
+            "Med_Ret": med_ret,
+            "Slow_Ret": slow_ret,
+            "Composite": composite,
+            "Realized_Vol": realized_vol_ann,
+            "Vol_Z": vol_z,
+        },
+        index=data.index,
+    )
+
+
+def calculate_breakout_channel(
+    data: pd.DataFrame,
+    donchian_lb: int = 100,
+    ema_fast_lb: int = 50,
+    ema_slow_lb: int = 200,
+    atr_lb: int = 14,
+    source_col: str = "close",
+) -> cudf.DataFrame:
+    """Donchian breakout channel with EMA trend filter and ATR.
+
+    Returns
+    -------
+    cudf.DataFrame with columns:
+            Don_Up      - highest high over donchian_lb
+            Don_Dn      - lowest low over donchian_lb
+            Don_Mid     - midpoint of Don_Up / Don_Dn
+            EMA_Fast    - fast EMA of source
+            EMA_Slow    - slow EMA of source
+            EMA_Trend   - +1 if EMA_Fast > EMA_Slow else -1 (0 if either is NaN)
+            ATR         - average true range over atr_lb
+            Break_Up    - boolean: close > Don_Up (rolled lookback by 1 to avoid peek)
+            Break_Dn    - boolean: close < Don_Dn
+    """
+    src = data[source_col]
+    hi = data["high"]
+    lo = data["low"]
+
+    don_up = highest(hi, donchian_lb)
+    don_dn = lowest(lo, donchian_lb)
+    don_mid = (don_up + don_dn) / 2.0
+
+    ema_fast = ema(src, ema_fast_lb)
+    ema_slow = ema(src, ema_slow_lb)
+
+    # Trend direction: +1 fast > slow, -1 fast < slow, 0 unknown.
+    trend_dir = cudf.Series(0, index=data.index, dtype=int)
+    fast_gt_slow = (ema_fast > ema_slow).fillna(False)
+    fast_lt_slow = (ema_fast < ema_slow).fillna(False)
+    trend_dir = trend_dir.where(~fast_gt_slow, 1)
+    trend_dir = trend_dir.where(~fast_lt_slow, -1)
+
+    # True range & ATR
+    prev_close = src.shift(1)
+    tr1 = hi - lo
+    tr2 = (hi - prev_close).abs()
+    tr3 = (lo - prev_close).abs()
+    # Elementwise max across the three TR components (vectorised, no concat).
+    tr = (tr1.where(tr1 >= tr2, tr2)).where(((tr1.where(tr1 >= tr2, tr2))) >= tr3, tr3)
+    atr = tr.rolling(atr_lb, min_periods=1).mean()
+
+    # Breakouts are evaluated against the PREVIOUS bar's channel so we don't
+    # peek at the current bar's extremes. Use shift(1) on the channel.
+    don_up_prev = don_up.shift(1)
+    don_dn_prev = don_dn.shift(1)
+    break_up = (src > don_up_prev).fillna(False).astype(bool)
+    break_dn = (src < don_dn_prev).fillna(False).astype(bool)
+
+    return cudf.DataFrame(
+        {
+            "Don_Up": don_up,
+            "Don_Dn": don_dn,
+            "Don_Mid": don_mid,
+            "EMA_Fast": ema_fast,
+            "EMA_Slow": ema_slow,
+            "EMA_Trend": trend_dir,
+            "ATR": atr,
+            "Break_Up": break_up,
+            "Break_Dn": break_dn,
+        },
+        index=data.index,
+    )
+
+
+def calculate_efficiency_ratio(
+    data: pd.DataFrame,
+    er_lb: int = 50,
+    source_col: str = "close",
+) -> cudf.DataFrame:
+    """Kaufman Efficiency Ratio.
+
+    ER = |close[t] - close[t-N]| / sum(|close[i] - close[i-1]|, i=t-N..t)
+
+    Values close to 1.0 = strongly trending. Values close to 0.0 = choppy.
+    """
+    src = data[source_col]
+    abs_net = (src - src.shift(er_lb)).abs()
+    bar_moves = (src - src.shift(1)).abs()
+    abs_gross = bar_moves.rolling(er_lb, min_periods=1).sum()
+    er = abs_net / abs_gross.where(abs_gross != 0, float("nan"))
+
+    return cudf.DataFrame(
+        {
+            "ER": er,
+            "Net_Move": abs_net,
+            "Gross_Move": abs_gross,
+        },
+        index=data.index,
+    )

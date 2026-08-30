@@ -48,16 +48,18 @@ def get_env_activation():
 # Measured: full run with 20 workers peaked at ~30.5GB / 32GB (~1.5GB per worker).
 # NOTE: 2GB/worker caused PCIe saturation with 11 concurrent cudf.from_pandas() calls.
 # 4GB/worker limits to ~5 workers, keeping the GPU busy without saturating the bus.
-RAM_PER_WORKER_GB = 3.0        # per-worker RSS budget (CPU RAM + GPU VRAM overhead)
-SYSTEM_HEADROOM_GB = 0.0       # OS + orchestrator + transient parent/child overlap
+RAM_PER_WORKER_GB = 4.0        # per-worker RSS budget (CPU RAM + GPU VRAM overhead)
+SYSTEM_HEADROOM_GB = 4.0       # OS + orchestrator + transient parent/child overlap
 MAX_WINDOW_RETRIES = 5         # max attempts before aborting the entire WFV run
 
 # Strategy-aware memory multipliers.
 # TV has 38 tunable params vs VM's 19 — roughly 2x the indicator computations
 # and intermediate tensors. Each TV worker needs ~2x the RAM of a VM worker.
+# Trend uses 16, intermediate, so 1.3x is a reasonable estimate.
 STRATEGY_MEMORY_MULTIPLIER = {
     "vm": 1.0,
     "tv": 2.0,
+    "trend": 1.3,
 }
 
 
@@ -180,7 +182,7 @@ def get_calibration_script(strategy: str) -> str:
     return f"optuna_calibrate_{strategy}.py"
 
 def get_signal_script(strategy: str) -> str:
-    return f"generate_{'tv_strategy1' if strategy == 'tv' else 'vm_automation_logic'}_signals.py"
+    return f"generate_{'tv_strategy1' if strategy == 'tv' else 'vm_automation_logic' if strategy == 'vm' else 'trend_following'}_signals.py"
 
 def run_step(cmd):
     env_activation = get_env_activation()
@@ -409,6 +411,8 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         sig_suffix = "_test.csv"
     if strategy == "tv":
         base_sig = "tv_strategy1_signals"
+    elif strategy == "trend":
+        base_sig = "trend_strategy_signals"
     else:
         base_sig = "vm_automation_logic_signals"
     signal_file_path = current_dir / f"{base_sig}{sig_suffix}"
@@ -447,7 +451,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", type=str, choices=["tv", "vm"], required=True)
+    parser.add_argument("--strategy", type=str, choices=["tv", "vm", "trend"], required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workers")
     args = parser.parse_args()

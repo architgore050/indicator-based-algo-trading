@@ -133,6 +133,9 @@ def main():
             ("calculate_stochastic_macd", lambda: cur_mod.calculate_stochastic_macd(gdf, fast_len=12, slow_len=26, signal_len=9, lookback=45, fast_len_xd=6, slow_len_xd=12, signal_len_xd=3, lookback_xd=22, trend_period=10, **base_params)),
             ("calculate_rsi_8_21", lambda: cur_mod.calculate_rsi_8_21(gdf, rsi_len=14, ma8_len=8, ma21_len=21, **base_params)),
             ("calculate_tdi_loxx", lambda: cur_mod.calculate_tdi_loxx(gdf, rsi_period=14, price_line_period=2, signal_line_period=14, vol_band_period=34, vol_band_mult=1.6185, source_type="Close")),
+            ("calculate_time_series_momentum", lambda: cur_mod.calculate_time_series_momentum(gdf, fast_lb=60, med_lb=240, slow_lb=1440, vol_lb=240, vol_z_entry=0.0, **base_params)),
+            ("calculate_breakout_channel", lambda: cur_mod.calculate_breakout_channel(gdf, donchian_lb=100, ema_fast_lb=50, ema_slow_lb=200, atr_lb=14, **base_params)),
+            ("calculate_efficiency_ratio", lambda: cur_mod.calculate_efficiency_ratio(gdf, er_lb=50, **base_params)),
         ]:
             try:
                 t0 = time.perf_counter()

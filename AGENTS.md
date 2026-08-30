@@ -27,10 +27,10 @@ The active codebase lives in `v6/`. It consists of:
 
 | Component | Files | Purpose |
 |---|---|---|
-| **Indicator Engine** | `definitions.py` | Fully GPU-native indicator computation (cudf/cupy). 17 functions, zero pandas fallback. |
+| **Indicator Engine** | `definitions.py` | Fully GPU-native indicator computation (cudf/cupy). 20 functions, zero pandas fallback. |
 | **CSV I/O** | `gpu_io.py` | Minimal CSV I/O helpers. Pandas used only at data boundaries. |
 | **Calibration Pipeline** | `orchestrate_calibration.py`, `optuna_calibrate_*.py` | WFV orchestrator + Bayesian optimization per strategy. All GPU-native. |
-| **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py` | Produce window-specific signal CSVs from calibrated parameters. All GPU-native. |
+| **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py`, `generate_trend_following_signals.py` | Produce window-specific signal CSVs from calibrated parameters. All GPU-native. |
 | **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals. 305-820% speedup over pandas baseline. All GPU-native. |
 | **Collation** | `collate_wfv_results.py` | Aggregate WFV results across windows |
 | **Utilities** | `logging_utils.py`, `data_download.py` | Structured logging, 1-minute XAUUSD data ingestion |
@@ -38,9 +38,10 @@ The active codebase lives in `v6/`. It consists of:
 | **Configuration** | `config.json`, `best_manual_params_vm.json`, `calibration_results_vm.json` | Baseline parameters (DO NOT MODIFY), manual tuning reference, calibration overrides |
 | **Data** | `data.csv` | Raw 1-minute XAUUSD OHLCV data |
 
-Two strategies are implemented:
+Three strategies are implemented:
 1. **VM Strategy** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD.
 2. **TV Strategy** — Inspired by TradingView community indicators (TDI, Loxx, Donchian Bands).
+3. **Trend Strategy** — Time-series momentum with Donchian breakout channel, Kaufman efficiency ratio, and multi-horizon return composite.
 
 ## GPU Migration Status (COMPLETE)
 The pandas→cudf migration is complete. All dual-path code (~560 lines) has been removed from 7 files. The codebase is now fully GPU-native with pandas used only at CSV I/O boundaries.
@@ -48,7 +49,7 @@ The pandas→cudf migration is complete. All dual-path code (~560 lines) has bee
 **Migration docs:** `docs/gpu_migration/M14_cudf_migration_final_audit.md` (comprehensive audit)
 
 **Key changes:**
-- `definitions.py` — 17 indicator functions, cudf-only, zero pandas fallback
+- `definitions.py` — 20 indicator functions, cudf-only, zero pandas fallback
 - `gpu_io.py` — simplified to CSV I/O helpers only
 - `optuna_calibrate_*.py` — single cudf path, no `--gpu` flag
 - `generate_*_signals.py` — single cudf path, no `--gpu` flag
@@ -57,9 +58,10 @@ The pandas→cudf migration is complete. All dual-path code (~560 lines) has bee
 
 **15 bugs fixed during migration, all parity tests pass with zero skips.**
 
-Two strategies are implemented:
+Three strategies are implemented:
 1. **VM Strategy** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD.
 2. **TV Strategy** — Inspired by TradingView community indicators (TDI, Loxx, Donchian Bands).
+3. **Trend Strategy** — Time-series momentum with Donchian breakout channel, Kaufman efficiency ratio, and multi-horizon return composite.
 
 ## Legacy Systems (Retired)
 All legacy version directories (v2–v5) have been removed. Only `v6/` remains as the active codebase. No migration awareness or cross-version comparison is needed.
@@ -188,6 +190,21 @@ python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 -
 python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results
 ```
 
+### Trend Strategy — Calibration
+```powershell
+python optuna_calibrate_trend.py --smoke --start-row 2999000 --end-row 3000000
+```
+
+### Trend Strategy — Signal Generation
+```powershell
+python generate_trend_following_signals.py --mode test --start-row 3000000 --end-row 3043200
+```
+
+### Trend Strategy — WFV Pipeline
+```powershell
+python orchestrate_calibration.py --strategy trend --smoke
+```
+
 ## System Knowledge Base
 
 ### WFV Architecture & Data Partitioning
@@ -206,7 +223,7 @@ All indicator functions are cudf-only. The three-tier dispatch pattern has been 
 Function signatures are preserved for consumer scripts.
 
 ### Algorithmic Soundness by Component
-- **Indicator Engine (`definitions.py`):** Fully vectorized. All 9 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
+- **Indicator Engine (`definitions.py`):** Fully vectorized. All 20 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
 - **Signal Generation (`generate_*_signals.py`):** State machine loop replaced with sparse event iteration — `np.where(has_event)[0]` reduces iterations from O(n) to O(events) where events are typically 0.1-1% of bars. Reasons pre-computed via numpy column_stack. Remaining loop is fundamentally sequential (position at t depends on position at t-1) but over sparse events only. GPU data loading available via `--gpu` flag.
 - **Backtesting (`backtest_xauusd_signal_csv.py`):** Per-bar state machine loop with sequential equity compounding. Numeric data (OHLCV) pre-extracted to cupy arrays before the loop. Timestamps remain as numpy (cupy doesn't support datetime64). The sequential loop remains — trade-level vectorization is the next optimization target. See `docs/gpu_migration/M09_backtest_migration.md`.
 - **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with RAM-based worker limits. Optuna studies run fully in-memory (SQLite RDBStorage disabled 2026-08-24 — caused `database is locked` crashes; per-process DB files were write-only). One study object is shared across phases to preserve cross-phase TPE history and enqueued warm-starts. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
@@ -215,6 +232,7 @@ Function signatures are preserved for consumer scripts.
 - `config.json` holds baseline parameters consumed by all scripts. **DO NOT MODIFY without explicit developer approval.** Contains delicately tuned values from months of manual experimentation. If a subagent determines that a task is best solved through config changes, it should do nothing and report back rather than making changes.
 - `calibration_results_*.json` files are runtime overrides produced by calibration runs.
 - `best_manual_params_vm.json` (formerly `backtesting_params_vm.json`) is a **developer reference only** — it stores the parameter set that performed best through manual experimentation. No Python scripts read this file. All scripts load `config.json` exclusively.
+- `calibration_results_trend.json` is produced by the trend strategy calibrator.
 
 ## Roadmap & Current Status
 See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
@@ -389,4 +407,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Record new lessons in Experience Learning.** Every bug fix, design decision, or tool usage lesson should be recorded for future reference.
 
 ---
-*Last updated: 2026-08-26 — WFV pipeline restructuring complete: two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections (exit flags ON, 13 ranges widened, confirmation_lookback_bars floor 2→1), trial counts (P1: 100→150, P3: 30→50), SQLite trial logging on WSL-native fs. TV calibrator --phase3-only fallback fixed. See docs/wfv_restructuring_implementation.md.*
+*Last updated: 2026-08-30 — Trend-following / time-series momentum strategy added (3 new indicators, signal generator, calibrator, orchestrator integration). All parity tests pass. See docs/trend_strategy_implementation.md.*

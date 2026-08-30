@@ -1217,7 +1217,7 @@ def save_plots(data: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, o
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", type=str, choices=["tv", "vm"], default="tv")
+    parser.add_argument("--strategy", type=str, choices=["tv", "vm", "trend"], default="tv")
     parser.add_argument("--mode", type=str, choices=["smoke", "test", "full"], default="smoke")
     parser.add_argument("--start-row", type=int, default=0)
     parser.add_argument("--end-row", type=int, default=None)
@@ -1254,6 +1254,8 @@ def main() -> None:
     else:
         if args.strategy == "tv":
             base_file = "tv_strategy1_signals.csv"
+        elif args.strategy == "trend":
+            base_file = "trend_strategy_signals.csv"
         else:
             base_file = "vm_automation_logic_signals.csv"
 

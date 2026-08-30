@@ -55,6 +55,7 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 - [x] **Task 4.1: Signal Generation — Sparse Event Loop**: Replaced `for i in tqdm(range(len(data)))` bar-by-bar loop with `for i in np.where(has_event)[0]` sparse event iteration. Uses fast numpy OR across all boolean arrays to find signal bars, then only iterates those (typically 0.1-1% of total bars). Applied to both VM and TV signal generators. Function signature preserved for parity.
 - [x] **Task 4.2: Signal Generation — GPU Data Loading**: Added `--gpu` flag to both signal generators. When enabled, loads CSV via `gpu_io.load_csv_to_gpu()` → cudf → converts to pandas for processing. Indicator computation in `definitions.py` auto-dispatches to GPU via `_use_gpu()`. Backward compatible — defaults to pandas path.
 - [x] **Task 4.6: WFV Pipeline Restructuring** (2026-08-26): Implemented two-phase scheduling (annual windows before monthly), removed Phase 3 hard narrowing (was collapsing search space to single point), re-introduced SQLite trial logging on WSL-native filesystem, implemented distribution-based prior inheritance from parent annual's Phase 1+2 trials, widened search space for edge-pinned parameters, permanently enabled exit flags, adjusted trial counts (P1: 100→150, P3: 30→50). See `docs/wfv_restructuring_implementation.md` for full details.
+- [x] **Task 4.7: Trend-Following Strategy** (2026-08-30): Added third strategy — time-series momentum with Donchian breakout channel, Kaufman efficiency ratio, and multi-horizon return composite. 3 new GPU-native indicators in `definitions.py`, signal generator, Optuna calibrator, orchestrator integration, config entries. All parity tests pass. See `docs/trend_strategy_implementation.md` for full details.
 - [ ] **Task 4.3: Backtesting — Loop Breaking Strategy**: The backtester has sequential dependencies (equity compounds bar-to-bar). Explore algorithmic approaches: (a) vectorize trade-by-trade PnL instead of bar-by-bar, (b) batch equity curve computation using cumulative operations on trade-level data, (c) identify which metrics truly need per-bar granularity vs. which can be computed from trade summaries. GPU porting is secondary to finding a non-sequential formulation.
 - [ ] **Task 4.4: Optuna Search Space Reduction**: Profile calibration trials to identify which parameters actually move the needle. Fix low-sensitivity parameters at their calibrated values and reduce search space dimensionality. Fewer dimensions = fewer trials needed for Bayesian convergence. Target: reduce trial count by 30-50% without sacrificing reward quality.
 - [ ] **Task 4.5: Parity Validation**: Run smoke tests comparing optimized signal generation + backtesting vs existing implementations (atol=1e-8 for equity curves, metric values within 0.1%).
@@ -99,14 +100,15 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 - **Fixed `EmptyDataError` in backtest** (`backtest_xauusd_signal_csv.py:108`): Signal files with headers but no data rows caused pandas crash. Added zero-byte check + try/except around `pd.read_csv()` to return empty DataFrame gracefully.
 
 ### 📍 Current Action
-**Status:** Phase 1-3 COMPLETE. Phase 4 Tasks 4.1, 4.2, 4.6 COMPLETE. WFV pipeline restructuring implemented and smoke-tested for both VM and TV strategies. Two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections, trial count adjustments, and SQLite trial logging all working. Remaining: backtesting loop-breaking (4.3), Optuna search space reduction (4.4), full WFV run on all windows.
+**Status:** Phase 1-3 COMPLETE. Phase 4 Tasks 4.1, 4.2, 4.6, 4.7 COMPLETE. WFV pipeline restructuring implemented and smoke-tested for all three strategies (VM, TV, Trend). Two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections, trial count adjustments, and SQLite trial logging all working. Trend-following strategy fully integrated (3 new GPU-native indicators, signal generator, calibrator, orchestrator, config). Remaining: backtesting loop-breaking (4.3), Optuna search space reduction (4.4), full WFV run on all windows for all strategies.
 
 ### 📊 Algorithmic Soundness by Component
 | Component | Vectorized? | Loop Status | GPU Path |
 |---|---|---|---|
-| `definitions.py` (indicators) | ✅ Yes — all 9 functions use numpy/pandas/cudf vectorized ops | No row loops | ✅ `_use_gpu()` auto-dispatches cupy |
+| `definitions.py` (indicators) | ✅ Yes — all 20 functions use numpy/pandas/cudf vectorized ops | No row loops | ✅ `_use_gpu()` auto-dispatches cupy |
 | `generate_vm_automation_logic_signals.py` | ✅ Boolean conditions vectorized | Sparse event loop only (`np.where(has_event)[0]`) — events are 0.1-1% of bars | ✅ `--gpu` flag loads via cudf |
 | `generate_tv_strategy1_signals.py` | ✅ Boolean conditions vectorized | Sparse event loop only (`np.where(has_event)[0]`) — events are 0.1-1% of bars | ✅ `--gpu` flag loads via cudf |
+| `generate_trend_following_signals.py` | ✅ Boolean conditions vectorized | Sparse event loop only (`np.where(has_event)[0]`) — events are 0.1-1% of bars | ✅ `--gpu` flag loads via cudf |
 | `backtest_xauusd_signal_csv.py` | ⚠️ Partial — PnL math vectorized, but equity compounds bar-to-bar | Per-bar state machine loop (O(n)) | Pending — next optimization target |
 | `orchestrate_calibration.py` | ✅ Parallel WFV with VRAM-based worker limits | Sequential Optuna Bayesian optimization | N/A — orchestrator |
 
@@ -163,25 +165,52 @@ The bottleneck is no longer indicator math (already vectorized). The real cost c
 15. [ ] Run GPU parity tests: feed cudf DataFrames into indicator functions, convert results to pandas, compare against pure-pandas outputs for all 11 helpers + 9 indicators (atol=1e-8)
 16. [x] **Phase 4 Task 4.1**: Sparse event loop optimization — `np.where(has_event)[0]` reduces loop iterations from O(n) to O(events) where events are typically 0.1-1% of bars (both VM + TV)
 17. [x] **Phase 4 Task 4.2**: GPU data loading via `--gpu` flag — uses `gpu_io.load_csv_to_gpu()` when available, falls back to pandas. Indicator computation auto-dispatches via definitions.py
-19. [ ] **Phase 4 Task 4.3**: Backtesting loop-breaking strategy — explore trade-level vectorization, batch equity computation, identify which metrics need per-bar granularity
-20. [ ] **Phase 4 Task 4.4**: Optuna search space reduction — profile parameter sensitivity, fix low-sensitivity params, reduce trial count by 30-50%
-21. [ ] **Phase 4 Task 4.5 / Phase 5**: Parity validation — run `parity_test_signal_generators.py` to verify signal output matches backup
-22. [ ] **New**: Full WFV run on all windows (VM + TV) with new restructuring — see `docs/wfv_restructuring_implementation.md`
+18. [x] **Phase 4 Task 4.6**: WFV pipeline restructuring — two-phase scheduling, Phase 3 narrowing removal, distribution-based prior inheritance, search space corrections, trial count adjustments, SQLite trial logging. See `docs/wfv_restructuring_implementation.md`.
+19. [x] **Phase 4 Task 4.7**: Trend-following / time-series momentum strategy — 3 new GPU-native indicators, signal generator, Optuna calibrator, orchestrator integration, config entries, parity tests. See `docs/trend_strategy_implementation.md`.
+20. [ ] **Phase 4 Task 4.3**: Backtesting loop-breaking strategy — explore trade-level vectorization, batch equity computation, identify which metrics need per-bar granularity
+21. [ ] **Phase 4 Task 4.4**: Optuna search space reduction — profile parameter sensitivity, fix low-sensitivity params, reduce trial count by 30-50%
+22. [ ] **Phase 4 Task 4.5 / Phase 5**: Parity validation — run `parity_test_signal_generators.py` to verify signal output matches backup
+23. [ ] **New**: Full WFV run on all windows (VM + TV + Trend) with new restructuring — see `docs/wfv_restructuring_implementation.md`
 
 ### 🚀 Commands (Unchanged — No Breaking Changes)
 ```powershell
 # WFV Pipeline (Orchestrator)
 python orchestrate_calibration.py --strategy vm --smoke
+python orchestrate_calibration.py --strategy tv --smoke
+python orchestrate_calibration.py --strategy trend --smoke
 
 # SOTA Calibration (Optuna)
 python optuna_calibrate_vm.py --smoke --start-row 2999000 --end-row 3000000
+python optuna_calibrate_tv.py --smoke --start-row 2999000 --end-row 3000000
+python optuna_calibrate_trend.py --smoke --start-row 2999000 --end-row 3000000
 
 # Signal Generation
 python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 --end-row 3043200
+python generate_tv_strategy1_signals.py --mode test --start-row 3000000 --end-row 3043200
+python generate_trend_following_signals.py --mode test --start-row 3000000 --end-row 3043200
 
 # Backtesting
 python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results
+python backtest_xauusd_signal_csv.py --strategy tv --mode test --headless --output-dir path/to/results
+python backtest_xauusd_signal_csv.py --strategy trend --mode test --headless --output-dir path/to/results
 ```
+
+---
+### 🧹 Cleanup Log (2026-08-30)
+- **Trend-Following / Time-Series Momentum Strategy (Phase 4 Task 4.7):**
+  - Created: `v6/generate_trend_following_signals.py` — signal generator with sparse event loop, GPU-native cudf data loading, config/calibration-aware parameter loading
+  - Created: `v6/optuna_calibrate_trend.py` — Optuna calibrator (Phase 1/2/3, in-memory study, distribution prior inheritance, survival-of-the-fittest check, 16 tunable params)
+  - Modified: `v6/definitions.py` — added 3 GPU-native indicators: `calculate_time_series_momentum` (multi-horizon returns + realized vol + vol z-score), `calculate_breakout_channel` (Donchian + EMA trend filter + ATR), `calculate_efficiency_ratio` (Kaufman ER)
+  - Modified: `v6/config.json` — added `trend_strategy_params` (16 defaults) and `trend_ranges` (16 Optuna search ranges)
+  - Modified: `v6/orchestrate_calibration.py` — strategy choice `"trend"`, signal filename dispatch, 1.3× memory multiplier for trend workers
+  - Modified: `v6/backtest_xauusd_signal_csv.py` — accepts `--strategy trend` for signal file auto-detection
+  - Modified: `v6/collate_wfv_results.py` — signal script/filename dispatch for `trend` strategy
+  - Modified: `v6/parity_maintenance/parity_test_definitions.py` — parity tests for 3 new indicators (all PASS)
+  - Fixed: `cudf.concat().max(axis=1)` bug in `calculate_breakout_channel` — replaced with elementwise max to avoid numba CUDA context crash
+  - Fixed: `crossed_below/above` scalar comparison — uses `cudf.Series(0.0, index=data.index)` instead of bare float for zero-crossing detection
+  - Smoke-tested: signal generation (166 signals on 50K bars, ~15s), backtest (end-to-end, $124.41 net profit on 4 signals), calibrator (100 trials, best score -13.93), orchestrator WFV (5 windows, two-phase scheduling verified)
+  - Updated: `AGENTS.md` (architecture table, strategy count 2→3, developer commands, experience learning)
+  - Updated: `PLAN.md` (Phase 4 Task 4.7, algorithmic soundness table, TODO list, commands)
 
 ---
 ### 🧹 Cleanup Log (2026-08-26)
