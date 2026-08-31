@@ -9,13 +9,18 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import multiprocessing
+import os
 import uuid
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from definitions import (
     calculate_breakout_channel,
@@ -43,6 +48,7 @@ def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
     return (left.shift(1) >= right.shift(1)) & (left < right)
 
 def clean_bool(series: pd.Series) -> pd.Series:
+    """Ensures a series is boolean and fills NaNs with False."""
     if hasattr(series, 'dtype'):
         if str(series.dtype) in ('bool', 'boolean', 'bool_'):
             return series.fillna(False)
@@ -73,7 +79,84 @@ TREND_DEFAULTS = CONFIG["trend_strategy_params"]
 CALIB_PARAMS = CONFIG["calibration_params"]
 OPTUNA_CONF = CALIB_PARAMS["optuna_config"]
 CONSTRAINTS = CALIB_PARAMS["scoring_constraints"]
+TREND_CONSTRAINTS = CALIB_PARAMS.get("trend_strategy_constraints", CONSTRAINTS)
 DATA_CONFIG = CONFIG["data_config"]
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL Configuration & Retry Helpers
+# ---------------------------------------------------------------------------
+
+def get_postgres_url() -> str:
+    """Get PostgreSQL connection URL.
+
+    Uses trust authentication (no password) since this is a local dev DB.
+    Database: optuna_db, User: gorea, Host: localhost (via Unix socket).
+    """
+    return "postgresql://gorea@localhost/optuna_db"
+
+
+def _get_storage_url(study) -> str:
+    """Extract the storage URL from a study's storage backend.
+
+    Optuna wraps the storage in CachedStorage, so we need to unwrap it.
+    For PostgreSQL, the URL is stored in the backend's url attribute.
+    """
+    storage = study._storage
+    # Unwrap CachedStorage if present
+    if hasattr(storage, "_backend"):
+        storage = storage._backend
+    if hasattr(storage, "url"):
+        return storage.url
+    return None
+
+
+def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20):
+    """Run study.optimize() with randomized backoff on PostgreSQL lock errors.
+
+    Catches StorageInternalError (wraps psycopg2.errors.DeadlockDetected /
+    serialization failures) and retries with randomized backoff (2-10s) to
+    avoid thundering herd. PostgreSQL handles concurrent writes natively —
+    this retry is a safety net for rare serialization conflicts.
+    On retry, creates a fresh study from the persisted DB so Optuna's internal
+    state is clean. Other exceptions are raised immediately.
+
+    Note: Optuna's internal state machine converts StorageInternalError to
+    AssertionError("Should not reach.") when the trial state becomes
+    inconsistent. Both are caught.
+    """
+    from optuna.exceptions import StorageInternalError
+    import optuna
+    import random
+
+    for attempt in range(max_retries):
+        try:
+            study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
+            return study
+        except (StorageInternalError, AssertionError) as e:
+            msg = str(e).lower()
+            is_locked = "locked" in msg or "should not reach" in msg or "deadlock" in msg or "serialization" in msg
+            if not is_locked:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            delay = random.uniform(2.0, 10.0)
+            logger.warning(
+                f"PostgreSQL contention (attempt {attempt + 1}/{max_retries}): {e}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            run_id = uuid.uuid4().hex[:8]
+            storage_url = get_postgres_url()
+            study = optuna.create_study(
+                study_name=f"trend_discovery_{run_id}",
+                storage=storage_url,
+                direction="maximize",
+                pruner=optuna.pruners.MedianPruner(),
+                load_if_exists=True,
+            )
+            import time
+            time.sleep(delay)
+    return study
 
 
 # ---------------------------------------------------------------------------
@@ -94,28 +177,34 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
 # Signal Generation (Trend Strategy Wrapper)
 # ---------------------------------------------------------------------------
 
-def generate_trend_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
+def generate_trend_signals_local(data: cudf.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
     p = {**TREND_DEFAULTS, **params}
 
-    tsm = calculate_time_series_momentum(
-        data,
-        fast_lb=p["tsm_fast_lb"],
-        med_lb=p["tsm_med_lb"],
-        slow_lb=p["tsm_slow_lb"],
-        vol_lb=p["tsm_vol_lb"],
-        vol_z_entry=p["tsm_vol_z_entry"],
-    )
-    breakout = calculate_breakout_channel(
-        data,
-        donchian_lb=p["bo_donchian_lb"],
-        ema_fast_lb=p["bo_ema_fast_lb"],
-        ema_slow_lb=p["bo_ema_slow_lb"],
-        atr_lb=p["bo_atr_lb"],
-    )
-    er = calculate_efficiency_ratio(
-        data,
-        er_lb=p["er_lb"],
-    )
+    with tqdm(total=3, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
+        tsm = calculate_time_series_momentum(
+            data,
+            fast_lb=p["tsm_fast_lb"],
+            med_lb=p["tsm_med_lb"],
+            slow_lb=p["tsm_slow_lb"],
+            vol_lb=p["tsm_vol_lb"],
+            vol_z_entry=p["tsm_vol_z_entry"],
+        )
+        pbar.update()
+
+        breakout = calculate_breakout_channel(
+            data,
+            donchian_lb=p["bo_donchian_lb"],
+            ema_fast_lb=p["bo_ema_fast_lb"],
+            ema_slow_lb=p["bo_ema_slow_lb"],
+            atr_lb=p["bo_atr_lb"],
+        )
+        pbar.update()
+
+        er = calculate_efficiency_ratio(
+            data,
+            er_lb=p["er_lb"],
+        )
+        pbar.update()
 
     composite = tsm["Composite"]
     tsm_bull = composite > p["tsm_entry_threshold"]
@@ -140,7 +229,7 @@ def generate_trend_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataF
     long_exit = crossed_below(composite, cudf.Series(0.0, index=data.index)) | (breakout["EMA_Trend"] < 0)
     short_exit = crossed_above(composite, cudf.Series(0.0, index=data.index)) | (breakout["EMA_Trend"] > 0)
 
-    # Sparse event iteration — same as VM/TV calibrators
+    # Convert to pandas/numpy for the state machine loop (inherently sequential)
     data_pd = data.to_arrow().to_pandas()
     buy_setup_pd = buy_setup.to_arrow().to_pandas()
     sell_setup_pd = sell_setup.to_arrow().to_pandas()
@@ -156,6 +245,7 @@ def generate_trend_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataF
     lx_arr = np.asarray(clean_bool(long_exit_pd), dtype=bool)
     sx_arr = np.asarray(clean_bool(short_exit_pd), dtype=bool)
 
+    # Sparse event iteration — only visit bars where something happens
     all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
 
     for i in all_event_indices:
@@ -186,14 +276,14 @@ def generate_trend_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataF
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
     # Apply SL/TP overrides from sampled params to BP (backtest reads from BP)
     for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars"):
         if key in params:
             BP[key] = params[key]
 
     # 1. Generate Signals
-    signals = generate_trend_signals_local(data, params)
+    signals = generate_trend_signals_local(data, params, trial_id=trial_id)
     if signals.empty:
         return -9999.0
 
@@ -205,6 +295,7 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     # 3. Checkpoint: evaluate early-fail conditions on already-computed equity
     limit = int(len(data) * 0.25)
     limit_ts = pd.Timestamp(data["timestamp"].iloc[limit])
+    # Ensure both timestamps are tz-naive before comparison
     if limit_ts.tz is not None:
         limit_ts = limit_ts.tz_localize(None)
     equity_ts = equity["timestamp"]
@@ -226,25 +317,27 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
     calmar = summary.get("calmar_ratio", 0)
     cagr = summary.get("cagr_pct", -100)
     max_dd = summary.get("max_drawdown_pct", 100)
+    # Wrap timedelta in pd.Timedelta to handle numpy.timedelta64 from cudf
     _td = pd.Timedelta(data["timestamp"].iloc[-1] - data["timestamp"].iloc[0])
     trades_per_day = len(trades) / max(1, _td.days)
 
+    # Use trend-specific constraints (lower tpd threshold, softer Sharpe/Calmar)
     penalty = 0.0
-    if trades_per_day < CONSTRAINTS["min_trades_per_day"]:
-        penalty += (CONSTRAINTS["min_trades_per_day"] - trades_per_day) * CONSTRAINTS["penalty_weight_trades"]
-    elif trades_per_day > CONSTRAINTS["max_trades_per_day"]:
-        penalty += (trades_per_day - CONSTRAINTS["max_trades_per_day"]) * (CONSTRAINTS["penalty_weight_trades"] / 2.0)
+    if trades_per_day < TREND_CONSTRAINTS["min_trades_per_day"]:
+        penalty += (TREND_CONSTRAINTS["min_trades_per_day"] - trades_per_day) * TREND_CONSTRAINTS["penalty_weight_trades"]
+    elif trades_per_day > TREND_CONSTRAINTS["max_trades_per_day"]:
+        penalty += (trades_per_day - TREND_CONSTRAINTS["max_trades_per_day"]) * (TREND_CONSTRAINTS["penalty_weight_trades"] / 2.0)
 
-    if cagr < CONSTRAINTS["min_cagr_pct"]:
-        penalty += (CONSTRAINTS["min_cagr_pct"] - cagr) * CONSTRAINTS["penalty_weight_risk"]
-    if max_dd > CONSTRAINTS["max_max_drawdown_pct"]:
-        penalty += (max_dd - CONSTRAINTS["max_max_drawdown_pct"]) * CONSTRAINTS["penalty_weight_risk"]
+    if cagr < TREND_CONSTRAINTS["min_cagr_pct"]:
+        penalty += (TREND_CONSTRAINTS["min_cagr_pct"] - cagr) * TREND_CONSTRAINTS["penalty_weight_risk"]
+    if max_dd > TREND_CONSTRAINTS["max_max_drawdown_pct"]:
+        penalty += (max_dd - TREND_CONSTRAINTS["max_max_drawdown_pct"]) * TREND_CONSTRAINTS["penalty_weight_risk"]
 
     objective_score = cagr
-    if sharpe < CONSTRAINTS["min_sharpe"]:
-        objective_score -= (CONSTRAINTS["min_sharpe"] - sharpe) * CONSTRAINTS["penalty_weight_risk"]
-    if calmar < CONSTRAINTS["min_calmar"]:
-        objective_score -= (CONSTRAINTS["min_calmar"] - calmar) * CONSTRAINTS["penalty_weight_risk"]
+    if sharpe < TREND_CONSTRAINTS["min_sharpe"]:
+        objective_score -= (TREND_CONSTRAINTS["min_sharpe"] - sharpe) * TREND_CONSTRAINTS["penalty_weight_risk"]
+    if calmar < TREND_CONSTRAINTS["min_calmar"]:
+        objective_score -= (TREND_CONSTRAINTS["min_calmar"] - calmar) * TREND_CONSTRAINTS["penalty_weight_risk"]
     objective_score -= penalty
     return float(objective_score)
 
@@ -254,6 +347,7 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
 # ---------------------------------------------------------------------------
 
 def save_phase_trials(study, output_dir, phase, n_trials_phase):
+    """Save Phase 1, 2, or 3 trial data to JSON for child windows to inherit."""
     trials = study.trials
     phase_trials = []
     for t in trials:
@@ -270,7 +364,35 @@ def save_phase_trials(study, output_dir, phase, n_trials_phase):
     logger.info(f"Saved {len(phase_trials)} Phase {phase} trials to {path}")
 
 
+def compute_distribution_stats(trials_data, top_pct):
+    """Compute per-parameter mean and std from top-N% trials."""
+    values = [t for t in trials_data if t["state"] != "PRUNED" and t["value"] is not None]
+    if not values:
+        return None
+    n_top = max(1, int(len(values) * top_pct))
+    top_trials = sorted(values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:n_top]
+
+    all_params = set()
+    for t in top_trials:
+        all_params.update(t["params"].keys())
+
+    stats = {}
+    for param in all_params:
+        vals = [t["params"][param] for t in top_trials if param in t["params"]]
+        if not vals:
+            continue
+        mean = float(np.mean(vals))
+        std = float(np.std(vals))
+        stats[param] = {"mean": mean, "std": std}
+    return stats
+
+
 def combine_prior(phase1_stats, phase2_stats, ranges):
+    """Combine Phase 1 and Phase 2 stats into child search space bounds.
+
+    Returns dict of {param: (low, high)} clamped to original bounds,
+    with 40% guardrail.
+    """
     combined = {}
     all_params = set()
     if phase1_stats:
@@ -285,6 +407,7 @@ def combine_prior(phase1_stats, phase2_stats, ranges):
         p1 = phase1_stats.get(param, {})
         p2 = phase2_stats.get(param, {})
 
+        # Equal weight combination
         if p1 and p2:
             mean = (p1["mean"] + p2["mean"]) / 2.0
             std = (p1["std"] + p2["std"]) / 2.0
@@ -303,6 +426,7 @@ def combine_prior(phase1_stats, phase2_stats, ranges):
         orig_low = ranges[param][0]
         orig_high = ranges[param][1]
 
+        # Guardrail: if combined range < 60% of original, use original
         combined_width = high - low
         original_width = orig_high - orig_low
         if combined_width < 0.6 * original_width:
@@ -318,11 +442,17 @@ def combine_prior(phase1_stats, phase2_stats, ranges):
 # ---------------------------------------------------------------------------
 
 def get_optimal_n_jobs():
+    """Return optimal parallel workers for Optuna.
+
+    Uses all available CPU cores (capped at 20) for maximum throughput.
+    PostgreSQL handles concurrent writes natively — no SQLite contention.
+    """
     cpu_count = multiprocessing.cpu_count()
     return min(cpu_count, 20)
 
 
 def enqueue_top_trials(study, ranges: dict, n: int = None):
+    """Enqueue the top-N trials from a study as warm-start candidates."""
     if n is None:
         n = OPTUNA_CONF["top_n_to_enqueue"]
     trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else -np.inf, reverse=True)
@@ -341,6 +471,7 @@ def enqueue_top_trials(study, ranges: dict, n: int = None):
 def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None, distribution_prior: dict = None):
     ranges = CALIB_PARAMS["trend_ranges"]
 
+    # Port over the distribution/warm start by enqueuing the current best
     if current_best:
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
 
@@ -349,9 +480,11 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
         for k, v in ranges.items():
             if isinstance(v[0], int) and isinstance(v[1], int):
                 if distribution_prior and phase == 3 and k in distribution_prior:
+                    # Use inherited distribution bounds (no narrowing)
                     low, high = distribution_prior[k]
                     trial_params[k] = trial.suggest_int(k, int(low), int(high))
                 elif current_best and phase == 2:
+                    # Phase 2 only: narrow refinement around best
                     width = v[1] - v[0]
                     refine_pct = OPTUNA_CONF["phase2_refinement_pct"]
                     r_width = max(1, int(width * refine_pct))
@@ -362,9 +495,11 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
                     trial_params[k] = trial.suggest_int(k, v[0], v[1])
             else:
                 if distribution_prior and phase == 3 and k in distribution_prior:
+                    # Use inherited distribution bounds (no narrowing)
                     low, high = distribution_prior[k]
                     trial_params[k] = trial.suggest_float(k, low, high)
                 elif current_best and phase == 2:
+                    # Phase 2 only: narrow refinement around best
                     width = v[1] - v[0]
                     refine_pct = OPTUNA_CONF["phase2_refinement_pct"]
                     r_width = width * refine_pct
@@ -374,10 +509,10 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
 
-        return objective_wrapper(trial_params, data)
+        return objective_wrapper(trial_params, data, trial_id=str(trial.number))
 
     n_jobs = get_optimal_n_jobs()
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
+    study = sqlite_retry_optimize(study, objective, n_trials, n_jobs)
     return study
 
 
@@ -393,11 +528,12 @@ def main():
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--phase3-only", action="store_true", help="Skip phases 1 and 2, use existing results as baseline.")
     parser.add_argument("--annual-baseline", type=str, help="Path to annual calibration results for survival comparison.")
-    parser.add_argument("--distribution-prior", type=str, help="Path to JSON file with distribution prior from parent annual's Phase 1+2 trials.")
+    parser.add_argument("--distribution-prior", type=str, help="Path to JSON file with distribution prior (mean, std) from parent annual's Phase 1+2 trials.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_trend.json).")
     parser.add_argument("--window-index", type=int, default=0, help="Window index for per-window SQLite DB naming.")
     args = parser.parse_args()
 
+    # Override results path for per-window isolation (parallel WFV safety)
     if args.output:
         RESULTS_PATH = Path(args.output)
         RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -413,13 +549,17 @@ def main():
     logger.info(f"SOTA Trend Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
 
-    # In-memory Optuna study (one study per process). Cross-phase TPE history
-    # is preserved automatically because the same study object is reused.
+    # PostgreSQL for persistent trial logging with native concurrent write support.
+    storage_url = get_postgres_url()
+
+    # Unique study name per process to avoid DuplicatedStudyError across WFV runs
     run_id = uuid.uuid4().hex[:8]
     shared_study = optuna.create_study(
         study_name=f"trend_discovery_{run_id}",
+        storage=storage_url,
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(),
+        load_if_exists=True
     )
 
     current_best = None
@@ -427,6 +567,7 @@ def main():
     baseline_annual_score = -np.inf
     distribution_prior = None
 
+    # Load Baseline from Annual results if provided
     if args.annual_baseline:
         baseline_path = Path(args.annual_baseline)
         if baseline_path.exists():
@@ -434,9 +575,10 @@ def main():
                 annual_res = json.load(f)
                 baseline_annual_params = {k: v for k, v in annual_res["best_parameters"].items() if k in CALIB_PARAMS["trend_ranges"]}
                 logger.info("Evaluating annual baseline performance on current IS window...")
-                baseline_annual_score = objective_wrapper(baseline_annual_params, data)
+                baseline_annual_score = objective_wrapper(baseline_annual_params, data, trial_id="annual_baseline")
                 logger.info(f"Annual Baseline IS Score: {baseline_annual_score:.4f}")
 
+    # Load distribution prior from parent annual (monthly windows only)
     if args.distribution_prior:
         prior_path = Path(args.distribution_prior)
         if prior_path.exists():
@@ -455,6 +597,7 @@ def main():
 
     if args.phase3_only:
         if not RESULTS_PATH.exists():
+            # Parallel WFV race: shared file not written yet, fall back to config defaults
             logger.warning(f"Phase3-only requested but {RESULTS_PATH} not found. Using config defaults.")
             current_best = None
             logger.info("PHASE 3 ONLY (fallback): Using default parameters from config.json.")
@@ -468,23 +611,25 @@ def main():
         # PHASE 1
         logger.info("PHASE 1: Sobol Quasi-random Exploration...")
         p1_trials = 5 if args.smoke else OPTUNA_CONF["phase1_trials"]
-        sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"])
-        study = run_study(1, p1_trials, sampler, data, shared_study)
+        study = run_study(1, p1_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study)
 
         if args.smoke:
             logger.info("Smoke Phase 1 complete.")
             try:
                 current_best = study.best_params
             except ValueError:
+                # All trials returned -9999 (empty signals) — use defaults
                 logger.warning("All trials returned -9999. Using default parameters.")
                 current_best = None
         else:
             current_best = study.best_params
             logger.info(f"Phase 1 Best Score: {study.best_value:.4f}")
 
+            # Save Phase 1 trials for distribution-based inheritance by child monthly windows
             output_dir = str(RESULTS_PATH.parent)
             save_phase_trials(study, output_dir, 1, p1_trials)
 
+            # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
             enqueue_top_trials(study, CALIB_PARAMS["trend_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
 
             # PHASE 2
@@ -495,14 +640,21 @@ def main():
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
 
+            # Save Phase 2 trials for distribution-based inheritance by child monthly windows
             save_phase_trials(study, output_dir, 2, p2_trials)
 
+            # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
             enqueue_top_trials(study, CALIB_PARAMS["trend_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
 
-    # PHASE 3
+    # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
     study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best, distribution_prior=distribution_prior)
+
+    # Save Phase 3 trials to disk (for child monthly windows to inherit)
+    if not args.smoke:
+        output_dir = str(RESULTS_PATH.parent)
+        save_phase_trials(study, output_dir, 3, p3_trials)
 
     # Survival of the Fittest Check
     try:

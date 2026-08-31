@@ -1,29 +1,29 @@
 {
   "best_parameters": {
-    "tsm_fast_lb": 480,
-    "tsm_med_lb": 667,
-    "tsm_slow_lb": 2907,
-    "tsm_vol_lb": 710,
+    "tsm_fast_lb": 316,
+    "tsm_med_lb": 999,
+    "tsm_slow_lb": 4909,
+    "tsm_vol_lb": 846,
     "tsm_vol_z_entry": 0.0,
-    "tsm_entry_threshold": 0.010669080455768198,
-    "bo_donchian_lb": 105,
-    "bo_ema_fast_lb": 84,
-    "bo_ema_slow_lb": 509,
-    "bo_atr_lb": 21,
-    "er_lb": 116,
-    "er_min_threshold": 0.1399525793987897,
-    "min_realized_vol": 0.0045242074235554,
-    "stop_loss_usd_per_oz": 39.72480405701153,
-    "take_profit_usd_per_oz": 46.61172764826286,
-    "trailing_stop_usd_per_oz": 9.383259174957034,
-    "max_hold_bars": 2751
+    "tsm_entry_threshold": 0.05802620707880935,
+    "bo_donchian_lb": 346,
+    "bo_ema_fast_lb": 82,
+    "bo_ema_slow_lb": 140,
+    "bo_atr_lb": 43,
+    "er_lb": 90,
+    "er_min_threshold": 0.6687093775828714,
+    "min_realized_vol": 0.0034370321846978105,
+    "stop_loss_usd_per_oz": 26.360631850800345,
+    "take_profit_usd_per_oz": 27.250313320370534,
+    "trailing_stop_usd_per_oz": 17.088039190566704,
+    "max_hold_bars": 281
   },
-  "best_score": -7.548213668817739,
-  "calibration_date": "2026-08-30T05:37:59.233249",
+  "best_score": -9999.0,
+  "calibration_date": "2026-08-31T16:10:26.627362",
   "dataset_info": {
-    "rows_used": 362880,
+    "rows_used": 1000,
     "strategy": "trend",
-    "end_row": 129601
+    "end_row": 3000000
   },
   "optimization_type": "optuna_sota_parallel"
 }

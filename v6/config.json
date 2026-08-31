@@ -123,6 +123,16 @@
       "penalty_weight_trades": 3.5,
       "penalty_weight_risk": 2.0
     },
+    "trend_strategy_constraints": {
+      "min_trades_per_day": 0.4,
+      "max_trades_per_day": 25.0,
+      "min_cagr_pct": -5.0,
+      "max_max_drawdown_pct": 25.0,
+      "min_sharpe": -2.0,
+      "min_calmar": -1.0,
+      "penalty_weight_trades": 0.5,
+      "penalty_weight_risk": 2.0
+    },
     "optuna_config": {
       "phase1_trials": 200,
       "phase2_trials": 100,
@@ -200,7 +210,7 @@
       "tsm_med_lb": [240, 1440],
       "tsm_slow_lb": [1440, 5760],
       "tsm_vol_lb": [120, 960],
-      "tsm_entry_threshold": [0.005, 0.08],
+      "tsm_entry_threshold": [0.001, 0.08],
       "bo_donchian_lb": [60, 480],
       "bo_ema_fast_lb": [20, 240],
       "bo_ema_slow_lb": [100, 800],
