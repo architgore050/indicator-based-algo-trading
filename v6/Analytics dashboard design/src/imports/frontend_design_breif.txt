@@ -1,0 +1,291 @@
+Figma Frontend Design Brief — XAUUSD Algorithmic Trading Analytics Dashboard
+Project: This is a high-frequency (1-minute) XAUUSD (Gold) algorithmic backtesting system spanning ~14 years of data (~4M bars). It runs three strategies through a Walk-Forward Validation (WFV) pipeline. The frontend is an analytics dashboard — a Figma prototype that will later be implemented as a real web app. Design for extreme information density.
+1. STRATEGIES (Top Tabs)
+Three strategies, each with different indicators and signal logic. The top nav bar has three tabs:
+- VM (Volatility Momentum) — Confluence-based strategy. Three indicators must be bullish simultaneously for a buy: Multi-RSI (3-period RSI chain with WMA smoothing), Cyclic RSI (Eddy oscillator with upper/lower bands), Stochastic MACD (slow + fast versions with 4-color histogram). Exit on either fast or slow MACD cross.
+- TV (TradingView-Inspired) — 7-indicator confluence. TDI (Traders Dynamic Index with RSI bands), EL RSI Cross (dual RSI + MACD), Cyclic RSI, RSI 8-21 (dual MA crossover), BBBO (Bollinger on Bollinger Oscillator), Loxx TDI variant, Donchian RSI Bands. Requires minimum N confirmations (configurable, default 2). Exit on band touch/reject signals.
+- Trend (Time-Series Momentum) — Breakout + momentum strategy. Time-Series Momentum (3-horizon returns: 60/240/1440 bars, composite average + volatility z-score filter), Donchian Breakout Channel (upper/lower bands, EMA fast/slow trend filter, ATR), Kaufman Efficiency Ratio (trending vs choppy filter). Exit on momentum zero-cross or EMA trend flip.
+2. LAYOUT — 3-ZONE HORIZONTAL SPLIT
+Zone A (Left, ~60% width): Main Chart + Indicator Panels
+Zone B (Right, ~40% width): Trade Log + Trade Detail
+The right side splits vertically:
+- Zone B1 (top ~60%): Scrollable trade log table
+- Zone B2 (bottom ~40%): Detailed trade panel (appears when a trade row or chart arrow is clicked)
+3. ZONE A — CHART AREA (Left 60%)
+3.1 Main Price Chart (top ~55% of Zone A)
+- Candlestick chart (OHLC) of XAUUSD at 1-minute resolution
+- Zoom/pan with time range selector (1D, 1W, 1M, 3M, 1Y, ALL)
+- Vertical calibration/regime change markers: solid grey lines for annual recalibration points, dashed grey for monthly refinements (from WFV pipeline)
+- Trade entry markers: Triangular arrows overlaid on price
+- Long entry: ▲ green arrow (upward-pointing)
+- Short entry: ▼ red arrow (downward-pointing)
+- Size: large enough to be clickable
+- Edge color: white stroke for visibility on any background
+- Trade exit markers: X marks on price
+- Take Profit exit: bright green X
+- Stop Loss exit: bright red X
+- Trailing Stop exit: yellow X
+- Max Hold Bars exit: black X
+- Strategy signal exit: blue X
+- Margin Call exit: orange X
+- Forced Exit (end of data): grey X
+- Trade connection lines: Thin semi-transparent lines connecting entry → exit for each trade, color-coded by PnL
+- Winning trades: green lines
+- Losing trades: red lines
+- Buy-and-hold benchmark: Grey line showing what $100K in raw XAUUSD would be (for comparison)
+- Baseline strategy line: Green line showing unoptimized default parameters (if baseline data available)
+3.2 Indicator Panels (bottom ~45% of Zone A)
+Stacked below the main chart. Each strategy shows different indicators. Each panel has:
+- Panel title (indicator name)
+- Y-axis labels with values
+- Color-coded sub-components where applicable
+- Resizable panels (drag bottom edge to resize height)
+- Toggle visibility (eye icon)
+VM Strategy indicators (bottom to top):
+1. Stochastic MACD — Two sub-plots: Slow (MACD line, Signal line, Histogram with 4 colors: green=positive rising, red=positive falling, dark green=negative falling, dark red=negative rising) + Fast (MACD, Signal, Histogram) + Trend line (+1/-1)
+2. Multi-RSI+ — Three RSI lines (RSI1, RSI2, RSI3) + three WMA-smoothed versions (R1MAVW, R2MAVW, R3MAVW). Buy zone shading below 40, sell zone shading above 60
+3. Cyclic RSI — CRSI line + Upper Band + Lower Band. CRSI oscillates, bands define overbought/oversold
+TV Strategy indicators (bottom to top):
+1. TDI (Traders Dynamic Index) — RSI_PL line, Signal line, BB_Mid, BB_Upper, BB_Lower. Bullish cross = RSI_PL crosses above Signal
+2. EL RSI Cross — RSI2, RSI3, Signal_K, MACD, MACD_Signal
+3. Cyclic RSI — CRSI, Upper_Band, Lower_Band
+4. RSI 8-21 — RSI, MA8_RSI, MA21_RSI
+5. BBBO — Oscillator, Basis, Upper, Lower
+6. Loxx TDI — RSI_PL, RSI_SL, Band_Up, Band_Dn, Band_Mid, Trend (+1/-1)
+7. Donchian RSI Bands — RSI, BB_Basis, BB_Upper_Inner, BB_Upper_Outer, BB_Lower_Inner, BB_Lower_Outer, DC_Upper, DC_Lower, DC_Basis
+Trend Strategy indicators (bottom to top):
+1. Time-Series Momentum — Fast_Ret, Med_Ret, Slow_Ret, Composite line, Realized_Vol, Vol_Z
+2. Donchian Breakout Channel — Don_Up, Don_Dn, Don_Mid, EMA_Fast, EMA_Slow, EMA_Trend (+1/-1), ATR, Break_Up/Break_Dn markers
+3. Kaufman Efficiency Ratio — ER, Net_Move, Gross_Move
+3.3 Crosshair / Data Cursor
+Hovering any point on the chart shows a floating tooltip with:
+- Timestamp
+- OHLCV values
+- Current position (if in a trade): side, entry price, unrealized PnL
+- Indicator values at that bar (context-dependent on visible panels)
+4. ZONE B1 — TRADE LOG (Right top ~60%)
+A scrollable, filterable table showing ALL trades across the full backtest period. Default sorted by entry time (chronological).
+Columns (left to right):
+ 1. # — Trade number (sequential)
+ 2. Date/Time — Entry timestamp (e.g., "2019-03-15 14:32")
+ 3. Side — LONG (green badge) / SHORT (red badge)
+ 4. Entry Signal — Signal name that triggered entry (e.g., "multi_bull, stoch_bull, cyclic_bull" for VM)
+ 5. Exit Signal — Signal name that triggered exit
+ 6. Entry Price — Entry mid price
+ 7. Exit Price — Exit mid price
+ 8. PnL $ — Net PnL in USD (color-coded: green positive, red negative, bold)
+ 9. PnL % — Return on margin percentage
+10. Duration — Bars held / hours held (e.g., "142 bars / 2.4h")
+11. MFE $ — Maximum favorable excursion (best price reached during trade)
+12. MAE $ — Maximum adverse excursion (worst price reached during trade)
+13. Exit Reason — Badge: TP (green), SL (red), TSL (yellow), MaxHold (black), Strategy (blue), MarginCall (orange), Forced (grey)
+Row interaction:
+- Clicking any row selects the trade and opens Zone B2 with details
+- Clicking a trade arrow on the chart also selects and opens Zone B2
+- Selected row highlighted with a border/background color
+- Hovering a row highlights the corresponding trade on the chart (entry arrow + exit marker + connection line)
+Filters (above the table):
+- Date range picker
+- Side filter: All / Long / Short
+- PnL filter: All / Profitable / Losing
+- Exit reason filter: All / TP / SL / TSL / MaxHold / Strategy / MarginCall / Forced
+- Duration filter: Min bars / Max bars
+- Search by signal name
+- Sort by: Date, PnL $, PnL %, Duration, MFE
+- Trade count badge: "1,247 trades"
+5. ZONE B2 — TRADE DETAIL PANEL (Right bottom ~40%)
+Appears when a trade is selected. Shows comprehensive breakdown.
+Header section (top of panel):
+- Trade # (large number)
+- Side badge (LONG/SHORT)
+- Status badge: WIN (green) / LOSS (red) / BREAKEVEN (grey)
+- Entry timestamp → Exit timestamp
+- Duration: X bars / X hours / X days
+Price section:
+- Entry Mid Price
+- Entry Fill Price (with slippage)
+- Exit Mid Price
+- Exit Fill Price (with slippage)
+- Best Price (MFE point)
+- Worst Price (MAE point)
+- Price difference (entry → exit)
+PnL breakdown (color-coded, top to bottom):
+- Gross PnL — Raw price movement PnL (before costs)
+- Swap — Accrued overnight swap (positive or negative, in USD)
+- Commission — Entry commission + Exit commission (total, broken down as "Entry: $X.XX | Exit: $X.XX")
+- Spread & Slippage — Entry friction + Exit friction (total, broken down as "Entry: $X.XX | Exit: $X.XX")
+- Spread cost: $X.XX (at $0.12/oz per side)
+- Slippage: $X.XX (random, normally distributed, mean=$0.03, std=$0.02)
+- Net PnL — Gross PnL + Swap - Commission - Spread/Slippage (bold, large, color-coded)
+- Net PnL (INR) — Same as Net PnL converted at 92 INR/USD
+- Return on Margin — Net PnL / margin required at entry (as %)
+Trade parameters:
+- Lots: 0.1
+- Units (oz): 10.0
+- Leverage: 50x
+- Margin Required: $X.XX
+- Commission per lot per side: $3.50
+Risk metrics:
+- MFE (Maximum Favorable Excursion): $X.XX — how far price went in your favor
+- MAE (Maximum Adverse Excursion): $X.XX — how far price went against you
+- MFE vs TP: If MFE exceeded take-profit level, show "Missed TP by $X.XX"
+- MAE vs SL: If MAE exceeded stop-loss level, show "Exceeded SL by $X.XX"
+- Breakeven point: Price at which trade becomes net-positive (after all costs)
+Exit analysis:
+- Exit reason: badge
+- Exit trigger: Stop Loss at $X / Trailing Stop at $X / Take Profit at $X / Strategy signal / Max Hold (60 bars) / Margin Call
+- If trailing stop: trailing stop level at exit, how much profit was retained
+- If stop loss: was it a good idea? (did price reverse after? yes/no)
+- If trailing stop: retention ratio (net PnL / MFE as %), whipsaw detected? (yes/no), closed after peak (yes/no, bars after peak)
+Signal context:
+- Entry reason: comma-separated indicator conditions that triggered entry
+- VM example: "multi_bull, stoch_bull, cyclic_bull"
+- TV example: "TDI bullish cross, EL RSI bullish, CRSI lower-band buy" (with count out of 5)
+- Trend example: "tsm_bull, ema_bull, bo_bull, er_bull, vol_regime_ok" (with count out of 5)
+- Exit reason: indicator conditions that triggered exit
+Calibrated parameters (at time of trade):
+- Show the calibrated parameter values that were active for this trade's WFV window
+- Grouped by strategy component
+- VM example: multi_rsi_p1=26, crsi_dom_cycle=20, stoch_macd_fast_len=22, stop_loss=37.05, take_profit=20.19, trailing_stop=10.97, max_hold=911
+- Trend example: tsm_fast_lb=240, bo_donchian_lb=240, er_min_threshold=0.30, stop_loss=25.0, take_profit=60.0
+6. SUMMARY STATS BAR (Above Zone B1, or as a floating strip)
+Always-visible summary statistics for the currently visible time range:
+- Total Trades: N
+- Win Rate: X% (green/red progress bar)
+- Net Profit: $X,XXX.XX (X.XX%)
+- CAGR: X.XX%
+- Sharpe Ratio: X.XX
+- Sortino Ratio: X.XX
+- Calmar Ratio: X.XX
+- Max Drawdown: X.XX% ($X,XXX.XX)
+- Profit Factor: X.XX
+- Expectancy: $X.XX per trade
+- Avg Win: $X.XX | Avg Loss: $X.XX
+- Payoff Ratio: X.XX
+- Best Trade: $X,XXX.XX | Worst Trade: -$X,XXX.XX
+- Max Consecutive Wins: N | Max Consecutive Losses: N
+- Exposure: X.XX% (time in market)
+- Total Commission: $X,XXX.XX
+- Total Spread/Slippage: $X,XXX.XX
+- Total Swap: $X,XXX.XX
+- Total Costs: $X,XXX.XX (commission + spread/slippage + swap)
+7. EQUITY CURVE VIEW (Alternative to price chart)
+Toggle between "Price Chart" and "Equity Curve" view. Equity curve shows:
+- Equity USD line (blue)
+- Cash USD line (darker blue, below equity when in position)
+- Unrealized PnL as area fill between equity and cash
+- Drawdown as red area chart below
+- Buy-and-hold benchmark (grey)
+- Baseline strategy (green, if available)
+- Calibration regime markers
+8. CALIBRATION / WFV METRICS
+A section or tab showing the Walk-Forward Validation results:
+- Per-window CAGR, Sharpe, Max DD, Win Rate, Profit Factor
+- Window comparison table (Window #, Regime type, CAGR%, Sharpe, MaxDD%, Trades, WinRate%, ProfitFactor)
+- Aggregate statistics across all windows (mean, median, std, min, max for each metric)
+- Regime breakdown: annual recalibration vs monthly refinement performance
+- Calibration parameter evolution: show how key parameters changed across windows
+- Distribution prior visualization (if available): show parameter distributions from parent annual's Phase 1+2 trials
+9. SKIPPED SIGNALS LOG
+A separate view/tab for signals that were generated but not executed:
+- Reason: "insufficient_margin"
+- Needed margin vs available cash at time
+- Signal type that was skipped
+10. UI/UX SPECIFICS
+Color scheme:
+- Dark theme (trading dashboard standard)
+- Background: #0d1117 or similar dark grey
+- Grid lines: #1e2329
+- Text primary: #e6edf3
+- Text secondary: #8b949e
+- Green (profit/long): #238636 or #2ea043
+- Red (loss/short): #da3633
+- Yellow (trailing stop): #d29922
+- Blue (strategy exit): #58a6ff
+- Orange (margin call): #f0883e
+- Grey (forced exit): #6e7681
+Typography:
+- Monospace font for numbers (JetBrains Mono, Fira Code, or similar)
+- Sans-serif for labels (Inter, SF Pro, or similar)
+- Trade PnL values: large, bold, color-coded
+- Timestamps: smaller, secondary color
+Interactions:
+- Hover on trade arrow → tooltip with quick PnL, duration, exit reason
+- Click trade arrow → select trade, populate detail panel
+- Click trade log row → same as clicking arrow
+- Click "back to all" → deselect, return to full chart view
+- Time range selector → zoom chart, filter trades to visible range
+- Indicator panel resize → drag to adjust height
+- Toggle indicators → show/hide individual indicator panels
+- Export → button to download trade data as CSV
+Scroll behavior:
+- Left chart area: horizontal scroll for time, vertical scroll for indicator panels
+- Right trade log: independent vertical scroll
+- Trade detail panel: scrollable if content exceeds height
+11. ADDITIONAL ANALYTICS CHARTS TO DESIGN (accessible via tabs or expandable panels)
+These are not currently produced by the pipeline but should be designed as dashboard views:
+A. Trade PnL Distribution Histogram
+- X-axis: Net PnL USD
+- Y-axis: Count of trades
+- Vertical line at $0 (breakeven)
+- Green area for profitable trades, red for losing
+B. Duration vs PnL Scatter Plot
+- X-axis: Hours Held
+- Y-axis: Net PnL USD
+- Points colored green (win) / red (loss)
+- Helps identify if longer trades are more/less profitable
+C. Monthly Returns Heatmap
+- Rows: Years (2011-2024)
+- Columns: Jan-Dec
+- Color scale: red (negative) → yellow (zero) → green (positive)
+- Values displayed in each cell as percentage
+D. MFE vs MAE Scatter
+- X-axis: MAE (negative, so left side)
+- Y-axis: MFE (positive, so upper side)
+- Quadrants: ideal trade (high MFE, low MAE) = top-left
+- Helps visualize trade quality
+E. Drawdown Timeline
+- Full drawdown history as area chart
+- Labels for largest drawdown periods
+- Duration of each drawdown
+F. Exit Reason Breakdown
+- Donut/pie chart: % of exits by reason (TP, SL, TSL, MaxHold, Strategy, MarginCall, Forced)
+- For each exit reason: show avg PnL, count, win rate
+G. Win/Loss Streak Timeline
+- Sequential bars showing win (green) / loss (red) streaks
+- Helps identify hot/cold periods
+- Shows max consecutive wins/losses
+H. Parameter Sensitivity
+- For each calibrated parameter: show how PnL changes as parameter varies
+- Helps understand which parameters matter most
+I. Strategy Comparison
+- If multiple strategies are backtested: overlay equity curves
+- Compare CAGR, Sharpe, MaxDD side by side
+12. DATA CONTEXT (for the designer to understand scale)
+- Data: 1-minute XAUUSD OHLCV, ~4M bars, ~14 years
+- Initial capital: $100,000 USD
+- Trade size: 0.1 standard lots (10 oz per lot)
+- Leverage: 50x
+- Commission: $3.50 per standard lot per side
+- Spread: $0.12/oz
+- Slippage: mean $0.03/oz, std $0.02/oz
+- Long swap: -$12.00/lot/day (config default)
+- Short swap: -$4.00/lot/day (config default)
+- INR conversion rate: 92
+- WFV windows: ~93 windows total (17 annual + 76 monthly per full run)
+- Rows per window: 21,600 (15 days of 1-minute data)
+- Warmup period: 500 bars
+13. WHAT THE DESIGNER SHOULD NOT WORRY ABOUT
+- Data loading, API calls, or backend implementation
+- Which specific library/framework to use for the eventual implementation
+- The GPU/cudf/cupy pipeline details
+- Optuna calibration mechanics
+- These are implementation concerns, not design concerns
+WHAT THE DESIGNER SHOULD FOCUS ON:
+- Information hierarchy: what's most important should be most prominent
+- Scanability: a user should find specific trade info within 2 seconds
+- Consistency: same color coding, same badge styles, same number formatting throughout
+- Density without clutter: show a lot of data but keep it organized
+- State management: how the UI responds to selection, filtering, zooming
+- Responsiveness: how panels resize and reflow
+- The relationship between the chart view and the trade log (clicking one highlights in the other)

@@ -80,6 +80,54 @@ python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 -
 python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results
 ```
 
+## Analytics Dashboard
+
+A FastAPI backend + React frontend for visualizing backtest results and strategy analytics.
+
+### Prerequisites
+
+Backend dependencies (install on Windows, no WSL needed):
+
+```powershell
+pip install fastapi uvicorn pandas numpy pydantic
+```
+
+Frontend dependencies (inside `v6/Analytics dashboard design/`):
+
+```powershell
+cd "Analytics dashboard design"
+pnpm install
+```
+
+### Starting the servers
+
+**1. Start the backend** (runs on Windows, reads pre-computed CSV results):
+
+```powershell
+cd v6\backend
+python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+```
+
+The backend serves on `http://localhost:8001` and supports CORS for the frontend at `http://localhost:8443`.
+
+**2. Start the frontend** (Vite dev server):
+
+```powershell
+cd v6\Analytics dashboard design
+pnpm dev
+```
+
+The frontend serves on `http://localhost:8443` and reads `VITE_API_URL` from `.env` (defaults to `http://localhost:8001`).
+
+### What the dashboard shows
+
+- Summary statistics (CAGR, Sharpe, Calmar, win rate, max drawdown)
+- Equity curve with baseline and buy-and-hold comparisons
+- Trade detail view with entry/exit indicators, MFE/MAE, breakeven analysis
+- Walk-Forward Validation window results and parameter evolution
+- Analysis charts: PnL distribution, monthly returns, exit reasons, win/loss streaks, MFE vs MAE scatter, duration vs PnL, drawdown timeline
+- Live signal generation and backtesting via POST `/api/compute/backtest`
+
 ## Project structure
 
 ```

@@ -3,7 +3,7 @@
     "initial_capital_usd": 100000.0,
     "standard_lot_oz": 100.0,
     "trade_size_lots": 0.1,
-    "leverage": 50.0,
+    "leverage": 200.0,
     "maintenance_margin_ratio": 0.5,
     "spread_usd_per_oz": 0.12,
     "slippage_mean_usd_per_oz": 0.03,

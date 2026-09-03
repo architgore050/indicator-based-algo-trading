@@ -1,0 +1,10 @@
+{
+  "description": "This analytics dashboard empowers traders to conduct in-depth analysis of their trades, enhancing decision-making and optimizing performance.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
