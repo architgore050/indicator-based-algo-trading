@@ -103,6 +103,8 @@ def _trades_to_list(df: pd.DataFrame | None) -> list[dict]:
         return []
     trades = []
     for _, r in df.iterrows():
+        entry_bar = int(r.get("entry_bar", 0))
+        bars_held = int(r.get("bars_held", 0))
         trades.append({
             "trade_id": int(r.get("trade_id", r.get("index", 0))),
             "entry_time": str(r.get("entry_time", "")),
@@ -125,12 +127,14 @@ def _trades_to_list(df: pd.DataFrame | None) -> list[dict]:
             "net_pnl_usd": float(r.get("net_pnl_usd", 0)),
             "net_pnl_inr": float(r.get("net_pnl_inr", 0)),
             "return_on_margin_pct": float(r.get("return_on_margin_pct", 0)),
-            "bars_held": int(r.get("bars_held", 0)),
+            "bars_held": bars_held,
             "hours_held": float(r.get("hours_held", 0)),
             "mfe_usd": float(r.get("mfe_usd", 0)),
             "mae_usd": float(r.get("mae_usd", 0)),
             "win": bool(r.get("net_pnl_usd", 0) > 0),
             "exit_reason_category": str(r.get("exit_reason", "")),
+            "entry_bar": entry_bar,
+            "exit_bar": entry_bar + bars_held,
         })
     return trades
 

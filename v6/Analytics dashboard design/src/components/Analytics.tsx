@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import type { Trade, WFVWindow } from '../types';
+import type { MonthlyReturns } from '../api/types';
 
 interface Props {
   trades: Trade[];
   wfv: WFVWindow[];
+  monthlyReturns?: MonthlyReturns | null;
 }
 
 const TABS = [
@@ -18,6 +20,9 @@ const TABS = [
 
 // ── PnL Distribution Histogram ──────────────────────────────────────────────
 function PnlDistribution({ trades }: { trades: Trade[] }) {
+  if (trades.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No trade data available</div>;
+  }
   const pnls = trades.map(t => t.netPnl);
   const min = Math.min(...pnls), max = Math.max(...pnls);
   const bins = 24;
@@ -40,7 +45,6 @@ function PnlDistribution({ trades }: { trades: Trade[] }) {
       </div>
       <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
         <rect x={PL} y={PT} width={cW} height={cH} fill="#0a0e14" />
-        {/* Grid */}
         {[0, 0.25, 0.5, 0.75, 1].map(f => {
           const y = PT + f * cH;
           const v = Math.round(maxCount * (1 - f));
@@ -51,10 +55,8 @@ function PnlDistribution({ trades }: { trades: Trade[] }) {
             </g>
           );
         })}
-        {/* Zero line */}
         <line x1={zeroX} y1={PT} x2={zeroX} y2={PT + cH} stroke="#484f58" strokeWidth="1.5" />
         <text x={zeroX} y={PT + cH + 10} textAnchor="middle" fill="#6e7681" fontSize="9">$0</text>
-        {/* Bars */}
         {counts.map((count, i) => {
           const x = PL + i * bW;
           const binMid = min + (i + 0.5) * step;
@@ -67,7 +69,6 @@ function PnlDistribution({ trades }: { trades: Trade[] }) {
             </g>
           );
         })}
-        {/* X-axis labels */}
         {[0, 0.25, 0.5, 0.75, 1].map(f => {
           const v = min + f * (max - min);
           const x = PL + f * cW;
@@ -84,6 +85,9 @@ function PnlDistribution({ trades }: { trades: Trade[] }) {
 
 // ── Duration vs PnL Scatter ──────────────────────────────────────────────────
 function DurationScatter({ trades }: { trades: Trade[] }) {
+  if (trades.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No trade data available</div>;
+  }
   const W = 800, H = 220, PL = 48, PR = 15, PT = 15, PB = 30;
   const cW = W - PL - PR, cH = H - PT - PB;
   const maxH = Math.max(...trades.map(t => t.durationHours));
@@ -100,17 +104,14 @@ function DurationScatter({ trades }: { trades: Trade[] }) {
       </div>
       <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
         <rect x={PL} y={PT} width={cW} height={cH} fill="#0a0e14" />
-        {/* Grid */}
         {[0, 0.5, 1].map(f => (
           <g key={f}>
             <line x1={PL} y1={PT + f * cH} x2={W - PR} y2={PT + f * cH} stroke="#1e2329" strokeWidth="1" />
             <line x1={PL + f * cW} y1={PT} x2={PL + f * cW} y2={PT + cH} stroke="#1e2329" strokeWidth="1" />
           </g>
         ))}
-        {/* Zero line */}
         <line x1={PL} y1={zeroY} x2={W - PR} y2={zeroY} stroke="#484f58" strokeWidth="1" strokeDasharray="4 3" />
         <text x={PL - 3} y={zeroY + 3} textAnchor="end" fill="#6e7681" fontSize="9">$0</text>
-        {/* Points */}
         {trades.map(t => (
           <circle
             key={t.id}
@@ -121,7 +122,6 @@ function DurationScatter({ trades }: { trades: Trade[] }) {
             fillOpacity="0.75"
           />
         ))}
-        {/* Axis labels */}
         <text x={PL + cW / 2} y={H - 5} textAnchor="middle" fill="#6e7681" fontSize="9">Duration (hours)</text>
         {[0, maxH * 0.5, maxH].map(h => (
           <text key={h} x={xscale(h)} y={PT + cH + 12} textAnchor="middle" fill="#6e7681" fontSize="9" fontFamily="'JetBrains Mono',monospace">{h.toFixed(1)}h</text>
@@ -132,21 +132,12 @@ function DurationScatter({ trades }: { trades: Trade[] }) {
 }
 
 // ── Monthly Returns Heatmap ──────────────────────────────────────────────────
-function MonthlyHeatmap() {
-  const years = Array.from({ length: 14 }, (_, i) => 2011 + i);
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-  function seeded(s: number) {
-    let x = s;
-    return () => { x = (x * 1664525 + 1013904223) & 0xffffffff; return (x >>> 0) / 4294967296; };
+function MonthlyHeatmap({ monthlyReturns }: { monthlyReturns?: MonthlyReturns | null }) {
+  if (!monthlyReturns || !monthlyReturns.years || monthlyReturns.years.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No monthly returns data available</div>;
   }
-  const r = seeded(17);
-  const data = years.map((y, yi) =>
-    months.map((_, mi) => {
-      const base = r() - 0.42;
-      return +(base * 8 + (yi > 5 ? 1.5 : -0.5) + (mi >= 9 ? -1 : 0.5)).toFixed(2);
-    })
-  );
+
+  const { years, months, returns } = monthlyReturns;
 
   function cellColor(v: number): string {
     if (v > 4) return '#186d32';
@@ -166,18 +157,16 @@ function MonthlyHeatmap() {
     <div style={{ overflowX: 'auto' }}>
       <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 8 }}>Monthly returns by year (%) — green=positive, red=negative</div>
       <svg width={svgW} height={svgH} style={{ display: 'block' }}>
-        {/* Month headers */}
         {months.map((m, mi) => (
           <text key={mi} x={LABEL_W + mi * CW + CW / 2} y={13} textAnchor="middle" fill="#6e7681" fontSize="9" fontWeight="600">
             {m}
           </text>
         ))}
-        {/* Rows */}
         {years.map((y, yi) => (
           <g key={y}>
             <text x={LABEL_W - 4} y={HEAD_H + yi * CH + CH / 2 + 3.5} textAnchor="end" fill="#6e7681" fontSize="9" fontFamily="'JetBrains Mono',monospace">{y}</text>
             {months.map((_, mi) => {
-              const v = data[yi][mi];
+              const v = returns[yi]?.[mi] ?? 0;
               const x = LABEL_W + mi * CW;
               const yy = HEAD_H + yi * CH;
               return (
@@ -198,6 +187,9 @@ function MonthlyHeatmap() {
 
 // ── MFE vs MAE Scatter ────────────────────────────────────────────────────────
 function MFEvsMAE({ trades }: { trades: Trade[] }) {
+  if (trades.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No trade data available</div>;
+  }
   const W = 800, H = 240, PL = 50, PR = 15, PT = 15, PB = 30;
   const cW = W - PL - PR, cH = H - PT - PB;
   const maxMFE = Math.max(...trades.map(t => t.mfe));
@@ -212,19 +204,15 @@ function MFEvsMAE({ trades }: { trades: Trade[] }) {
       </div>
       <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
         <rect x={PL} y={PT} width={cW} height={cH} fill="#0a0e14" />
-        {/* Quadrant labels */}
         <text x={PL + 6} y={PT + 15} fill="#3fb950" fontSize="9" fillOpacity="0.5">Ideal (high MFE, low MAE)</text>
         <text x={W - PR - 6} y={PT + cH - 6} textAnchor="end" fill="#da3633" fontSize="9" fillOpacity="0.5">Poor</text>
-        {/* Diagonal */}
         <line x1={PL} y1={PT + cH} x2={PL + cW} y2={PT} stroke="#30363d" strokeWidth="1" strokeDasharray="4 3" />
-        {/* Grid */}
         {[0.5, 1].map(f => (
           <g key={f}>
             <line x1={PL + f * cW} y1={PT} x2={PL + f * cW} y2={PT + cH} stroke="#1e2329" strokeWidth="1" />
             <line x1={PL} y1={PT + f * cH} x2={PL + cW} y2={PT + f * cH} stroke="#1e2329" strokeWidth="1" />
           </g>
         ))}
-        {/* Points */}
         {trades.map(t => (
           <circle
             key={t.id}
@@ -235,7 +223,6 @@ function MFEvsMAE({ trades }: { trades: Trade[] }) {
             fillOpacity="0.7"
           />
         ))}
-        {/* Axis labels */}
         <text x={PL + cW / 2} y={H - 6} textAnchor="middle" fill="#6e7681" fontSize="9">MAE ($) →</text>
         <text x={6} y={PT + cH / 2} textAnchor="middle" fill="#6e7681" fontSize="9" transform={`rotate(-90 6 ${PT + cH / 2})`}>MFE ($)</text>
       </svg>
@@ -245,6 +232,9 @@ function MFEvsMAE({ trades }: { trades: Trade[] }) {
 
 // ── Exit Reason Donut ────────────────────────────────────────────────────────
 function ExitBreakdown({ trades }: { trades: Trade[] }) {
+  if (trades.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No trade data available</div>;
+  }
   const counts: Record<string, number> = {};
   const pnlSum: Record<string, number> = {};
   trades.forEach(t => {
@@ -300,7 +290,6 @@ function ExitBreakdown({ trades }: { trades: Trade[] }) {
         <text x={CX} y={CY + 10} textAnchor="middle" fill="#e6edf3" fontSize="16" fontWeight="700" fontFamily="'JetBrains Mono',monospace">{total}</text>
       </svg>
 
-      {/* Legend table */}
       <div className="flex-1">
         <table style={{ width: '100%', fontSize: 10, borderCollapse: 'collapse' }}>
           <thead>
@@ -345,6 +334,9 @@ function ExitBreakdown({ trades }: { trades: Trade[] }) {
 
 // ── Win/Loss Streak ───────────────────────────────────────────────────────────
 function StreakTimeline({ trades }: { trades: Trade[] }) {
+  if (trades.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No trade data available</div>;
+  }
   const sorted = [...trades].sort((a, b) => a.id - b.id);
   const W = 800, H = 100, PL = 40, PR = 10, PT = 10, PB = 15;
   const cW = W - PL - PR, cH = H - PT - PB;
@@ -386,6 +378,9 @@ function StreakTimeline({ trades }: { trades: Trade[] }) {
 
 // ── WFV Window Table ──────────────────────────────────────────────────────────
 function WFVTable({ wfv }: { wfv: WFVWindow[] }) {
+  if (wfv.length === 0) {
+    return <div style={{ fontSize: 11, color: '#484f58' }}>No WFV data available</div>;
+  }
   return (
     <div className="overflow-auto">
       <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 8 }}>
@@ -452,12 +447,11 @@ function WFVTable({ wfv }: { wfv: WFVWindow[] }) {
 }
 
 // ── Main Analytics Component ──────────────────────────────────────────────────
-export default function Analytics({ trades, wfv }: Props) {
+export default function Analytics({ trades, wfv, monthlyReturns }: Props) {
   const [tab, setTab] = useState('pnl_dist');
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0d1117' }}>
-      {/* Tab bar */}
       <div className="flex items-stretch flex-shrink-0 overflow-x-auto" style={{ height: 36, borderBottom: '1px solid #21262d', background: '#161b22' }}>
         {TABS.map(t => (
           <button
@@ -479,11 +473,10 @@ export default function Analytics({ trades, wfv }: Props) {
         ))}
       </div>
 
-      {/* Content */}
       <div className="flex-1 overflow-auto p-4">
         {tab === 'pnl_dist' && <PnlDistribution trades={trades} />}
         {tab === 'duration_scatter' && <DurationScatter trades={trades} />}
-        {tab === 'monthly_heat' && <MonthlyHeatmap />}
+        {tab === 'monthly_heat' && <MonthlyHeatmap monthlyReturns={monthlyReturns} />}
         {tab === 'mfe_mae' && <MFEvsMAE trades={trades} />}
         {tab === 'exit_breakdown' && <ExitBreakdown trades={trades} />}
         {tab === 'streak' && <StreakTimeline trades={trades} />}

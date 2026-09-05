@@ -12,7 +12,7 @@ interface Props {
   strategy: Strategy;
 }
 
-// Extract numeric array from indicator data (handles both mock and API formats)
+// Extract numeric array from indicator data
 function getArray(ind: Record<string, unknown>, key: string): number[] {
   if (!ind || typeof ind !== 'object') return [];
   const val = (ind as any)[key];
@@ -115,57 +115,6 @@ function GridLinesF({ min, max, ticks = 3 }: { min: number; max: number; ticks?:
   );
 }
 
-// Map mock indicator keys to API indicator keys
-function mapKey(ind: Record<string, unknown>, mockKey: string): number[] {
-  // Try mock key first, then API key variants
-  let data = getArray(ind, mockKey);
-  if (data.length === 0) {
-    // Try common API key patterns
-    const apiKeys: Record<string, string[]> = {
-      crsi: ["cyclic_rsi", "CRSI", "cyclic_rsi.CRSI", "cyclic_rsi.crsi"],
-      crsi_upper: ["upper_band", "Upper_Band", "cyclic_rsi.Upper_Band"],
-      crsi_lower: ["lower_band", "Lower_Band", "cyclic_rsi.Lower_Band"],
-      rsi1: ["RSI1", "multi_rsi.RSI1"],
-      rsi2: ["RSI2", "multi_rsi.RSI2"],
-      rsi3: ["RSI3", "multi_rsi.RSI3"],
-      r1mavw: ["R1MAVW", "multi_rsi.R1MAVW"],
-      r2mavw: ["R2MAVW", "multi_rsi.R2MAVW"],
-      r3mavw: ["R3MAVW", "multi_rsi.R3MAVW"],
-      stochFast: ["MACD_Histogram", "MACD", "Stoch_K", "Slow_Hist", "stoch_macd.Slow_Hist"],
-      stochSignalFast: ["MACD_Signal", "Stoch_D", "Slow_Signal", "stoch_macd.Slow_Signal"],
-      stochSlow: ["MACD", "Stoch_K", "Fast_MACD", "stoch_macd.Fast_MACD"],
-      stochSignalSlow: ["MACD_Signal", "Stoch_D", "Fast_Signal", "stoch_macd.Fast_Signal"],
-      tdiRsi: ["RSI_PL", "tdi.RSI_PL", "RSI"],
-      tdiSignal: ["Signal", "tdi.Signal", "MACD_Signal"],
-      tdi_bb_upper: ["BB_Upper", "tdi.BB_Upper", "upper_band"],
-      tdi_bb_lower: ["BB_Lower", "tdi.BB_Lower", "lower_band"],
-      tdi_bb_mid: ["BB_Mid", "tdi.BB_Mid"],
-      elRsi2: ["RSI2", "el_cross.RSI2"],
-      elRsi3: ["RSI3", "el_cross.RSI3", "RSI_Smooth"],
-      elRsiSmooth: ["RSI_Smooth", "el_cross.RSI_Smooth"],
-      elCross: ["Cross", "el_cross.Cross"],
-      rsi8: ["RSI", "rsi_8_21.RSI"],
-      rsi21: ["MA21_RSI", "rsi_8_21.MA21_RSI"],
-      ma8: ["MA8_RSI", "rsi_8_21.MA8_RSI"],
-      ma21: ["MA21_RSI", "rsi_8_21.MA21_RSI"],
-      efficiency: ["efficiency", "efficiency_ratio", "Kaufman_ER"],
-      tsmFast: ["tsmFast", "tsm_fast", "TSM"],
-      tsmMed: ["tsmMed", "tsm_med"],
-      tsmSlow: ["tsmSlow", "tsm_slow"],
-      tsmComposite: ["tsmComposite", "tsm_composite", "TSM_Signal"],
-      bbbo_upper: ["bbbo_upper", "BBBO_Upper"],
-      bbbo_lower: ["bbbo_lower", "BBBO_Lower"],
-      bbboOsc: ["bbboOsc", "BBBO_Osc"],
-    };
-    const candidates = apiKeys[mockKey] || [];
-    for (const ak of candidates) {
-      data = getArray(ind, ak);
-      if (data.length > 0) break;
-    }
-  }
-  return data;
-}
-
 const VM_PANELS: PanelDef[] = [
   {
     id: 'cyclic_rsi',
@@ -176,9 +125,9 @@ const VM_PANELS: PanelDef[] = [
         <GridLines min={0} max={100} />
         <HBand y={yscale(70, 0, 100)} label="70" color="#da3633" />
         <HBand y={yscale(30, 0, 100)} label="30" color="#2ea043" />
-        <Polyline data={mapKey(ind, "crsi")} min={0} max={100} color="#58a6ff" strokeW={1.2} />
-        <Polyline data={mapKey(ind, "crsi_upper")} min={0} max={100} color="#da3633" />
-        <Polyline data={mapKey(ind, "crsi_lower")} min={0} max={100} color="#2ea043" />
+        <Polyline data={getArray(ind, "cyclic_rsi")} min={0} max={100} color="#58a6ff" strokeW={1.2} />
+        <Polyline data={getArray(ind, "upper_band")} min={0} max={100} color="#da3633" />
+        <Polyline data={getArray(ind, "lower_band")} min={0} max={100} color="#2ea043" />
       </>
     ),
   },
@@ -191,10 +140,10 @@ const VM_PANELS: PanelDef[] = [
         <GridLines min={0} max={100} />
         <HBand y={yscale(60, 0, 100)} label="60" color="#da3633" />
         <HBand y={yscale(40, 0, 100)} label="40" color="#2ea043" />
-        <Polyline data={mapKey(ind, "rsi1")} min={0} max={100} color="#58a6ff" />
-        <Polyline data={mapKey(ind, "rsi2")} min={0} max={100} color="#a371f7" />
-        <Polyline data={mapKey(ind, "r1mavw")} min={0} max={100} color="#58a6ff" strokeW={1.5} />
-        <Polyline data={mapKey(ind, "r2mavw")} min={0} max={100} color="#a371f7" strokeW={1.5} />
+        <Polyline data={getArray(ind, "RSI1")} min={0} max={100} color="#58a6ff" />
+        <Polyline data={getArray(ind, "RSI2")} min={0} max={100} color="#a371f7" />
+        <Polyline data={getArray(ind, "R1MAVW")} min={0} max={100} color="#58a6ff" strokeW={1.5} />
+        <Polyline data={getArray(ind, "R2MAVW")} min={0} max={100} color="#a371f7" strokeW={1.5} />
       </>
     ),
   },
@@ -207,10 +156,10 @@ const VM_PANELS: PanelDef[] = [
         <>
           <GridLinesF min={min} max={max} ticks={4} />
           <line x1={PL} y1={yscale(0, min, max)} x2={IW - PR} y2={yscale(0, min, max)} stroke="#30363d" strokeWidth="1" />
-          <HistBars data={mapKey(ind, "stochFast")} min={min} max={max} />
-          <Polyline data={mapKey(ind, "stochSignalFast")} min={min} max={max} color="#f0883e" strokeW={1} />
-          <Polyline data={mapKey(ind, "stochSlow")} min={min} max={max} color="#58a6ff" strokeW={1} />
-          <Polyline data={mapKey(ind, "stochSignalSlow")} min={min} max={max} color="#a371f7" strokeW={1} />
+          <HistBars data={getArray(ind, "MACD_Histogram")} min={min} max={max} />
+          <Polyline data={getArray(ind, "MACD_Signal")} min={min} max={max} color="#f0883e" strokeW={1} />
+          <Polyline data={getArray(ind, "MACD")} min={min} max={max} color="#58a6ff" strokeW={1} />
+          <Polyline data={getArray(ind, "MACD_Signal")} min={min} max={max} color="#a371f7" strokeW={1} />
         </>
       );
     },
@@ -227,11 +176,11 @@ const TV_PANELS: PanelDef[] = [
         <HBand y={yscale(68, 0, 100)} label="68" color="#da3633" />
         <HBand y={yscale(32, 0, 100)} label="32" color="#2ea043" />
         <HBand y={yscale(50, 0, 100)} label="50" color="#6e7681" />
-        <Polyline data={mapKey(ind, "tdiRsi")} min={0} max={100} color="#3fb950" strokeW={1.2} />
-        <Polyline data={mapKey(ind, "tdiSignal")} min={-2} max={2} color="#f85149" strokeW={1} />
-        <Polyline data={mapKey(ind, "tdi_bb_upper")} min={0} max={100} color="#30363d" />
-        <Polyline data={mapKey(ind, "tdi_bb_lower")} min={0} max={100} color="#2ea043" />
-        <Polyline data={mapKey(ind, "tdi_bb_mid")} min={0} max={100} color="#6e7681" />
+        <Polyline data={getArray(ind, "RSI_PL")} min={0} max={100} color="#3fb950" strokeW={1.2} />
+        <Polyline data={getArray(ind, "Signal")} min={-2} max={2} color="#f85149" strokeW={1} />
+        <Polyline data={getArray(ind, "BB_Upper")} min={0} max={100} color="#30363d" />
+        <Polyline data={getArray(ind, "BB_Lower")} min={0} max={100} color="#2ea043" />
+        <Polyline data={getArray(ind, "BB_Mid")} min={0} max={100} color="#6e7681" />
       </>
     ),
   },
@@ -242,8 +191,8 @@ const TV_PANELS: PanelDef[] = [
       <>
         <GridLines min={-20} max={20} ticks={3} />
         <line x1={PL} y1={yscale(0, -20, 20)} x2={IW - PR} y2={yscale(0, -20, 20)} stroke="#30363d" strokeWidth="1" />
-        <Polyline data={mapKey(ind, "elRsiSmooth")} min={-20} max={20} color="#58a6ff" strokeW={1.2} />
-        <Polyline data={mapKey(ind, "elCross")} min={-20} max={20} color="#d29922" strokeW={1} />
+        <Polyline data={getArray(ind, "RSI2")} min={-20} max={20} color="#58a6ff" strokeW={1.2} />
+        <Polyline data={getArray(ind, "RSI3")} min={-20} max={20} color="#d29922" strokeW={1} />
       </>
     ),
   },
@@ -254,10 +203,10 @@ const TV_PANELS: PanelDef[] = [
       <>
         <GridLines min={0} max={100} />
         <HBand y={yscale(50, 0, 100)} label="50" color="#6e7681" />
-        <Polyline data={mapKey(ind, "tdiRsi")} min={0} max={100} color="#3fb950" strokeW={1.2} />
-        <Polyline data={mapKey(ind, "rsi21")} min={0} max={100} color="#f85149" strokeW={1} />
-        <Polyline data={mapKey(ind, "ma8")} min={0} max={100} color="#3fb950" strokeW={1.5} />
-        <Polyline data={mapKey(ind, "ma21")} min={0} max={100} color="#f85149" strokeW={1.5} />
+        <Polyline data={getArray(ind, "RSI")} min={0} max={100} color="#3fb950" strokeW={1.2} />
+        <Polyline data={getArray(ind, "MA21_RSI")} min={0} max={100} color="#f85149" strokeW={1} />
+        <Polyline data={getArray(ind, "MA8_RSI")} min={0} max={100} color="#3fb950" strokeW={1.5} />
+        <Polyline data={getArray(ind, "MA21_RSI")} min={0} max={100} color="#f85149" strokeW={1.5} />
       </>
     ),
   },
@@ -270,9 +219,9 @@ const TV_PANELS: PanelDef[] = [
         <>
           <GridLinesF min={min} max={max} ticks={4} />
           <line x1={PL} y1={yscale(0, min, max)} x2={IW - PR} y2={yscale(0, min, max)} stroke="#30363d" strokeWidth="1" />
-          <Polyline data={mapKey(ind, "bbbo_upper")} min={min} max={max} color="#30363d" />
-          <Polyline data={mapKey(ind, "bbbo_lower")} min={min} max={max} color="#30363d" />
-          <Polyline data={mapKey(ind, "bbboOsc")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
+          <Polyline data={getArray(ind, "bbbo_upper")} min={min} max={max} color="#30363d" />
+          <Polyline data={getArray(ind, "bbbo_lower")} min={min} max={max} color="#30363d" />
+          <Polyline data={getArray(ind, "bbboOsc")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
         </>
       );
     },
@@ -287,7 +236,7 @@ const TREND_PANELS: PanelDef[] = [
       <>
         <GridLinesF min={0} max={1} ticks={4} />
         <HBand y={yscale(0.3, 0, 1)} label="0.30" color="#d29922" />
-        <Polyline data={mapKey(ind, "efficiency")} min={0} max={1} color="#3fb950" strokeW={1.2} />
+        <Polyline data={getArray(ind, "efficiency")} min={0} max={1} color="#3fb950" strokeW={1.2} />
       </>
     ),
   },
@@ -300,8 +249,8 @@ const TREND_PANELS: PanelDef[] = [
         <>
           <GridLinesF min={min} max={max} ticks={4} />
           <line x1={PL} y1={yscale(0, min, max)} x2={IW - PR} y2={yscale(0, min, max)} stroke="#30363d" strokeWidth="1" />
-          <Polyline data={mapKey(ind, "tsmFast")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
-          <Polyline data={mapKey(ind, "tsmComposite")} min={min} max={max} color="#e6edf3" strokeW={1.5} />
+          <Polyline data={getArray(ind, "tsmFast")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
+          <Polyline data={getArray(ind, "tsmComposite")} min={min} max={max} color="#e6edf3" strokeW={1.5} />
         </>
       );
     },

@@ -1,7 +1,6 @@
 import { useState, useRef, useMemo } from "react";
 import type { Trade, TimeRange, ViewMode } from "../types";
 import type { OHLCVRow, EquityRow } from "../api/types";
-import { generateEquityCurve, type MockEquityPoint } from "../mockData";
 
 interface Props {
   bars: OHLCVRow[] | any[];
@@ -14,7 +13,6 @@ interface Props {
   equityCurve?: EquityRow[];
 }
 
-//兼容旧 OHLCV 类型
 function isApiOhlcv(b: any): b is OHLCVRow {
   return "open" in b && "high" in b && "low" in b && "close" in b && "timestamp" in b;
 }
@@ -26,23 +24,7 @@ function toOldOhlcv(b: OHLCVRow | any) {
   return b;
 }
 
-function toEquityPoints(equity: EquityRow[]): MockEquityPoint[] {
-  return equity.map((e, i) => ({
-    bar: i,
-    equity: e.equity_usd,
-    cash: e.cash_usd,
-    bnh: e.equity_usd, // placeholder
-  }));
-}
-
 const TIME_RANGES: TimeRange[] = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
-
-// Regime change markers at bar indices (annual=solid, monthly=dashed)
-const REGIME_MARKERS = [
-  { bar: 25, type: 'annual' }, { bar: 50, type: 'monthly' }, { bar: 80, type: 'annual' },
-  { bar: 110, type: 'monthly' }, { bar: 145, type: 'monthly' }, { bar: 180, type: 'annual' },
-  { bar: 220, type: 'monthly' }, { bar: 260, type: 'annual' },
-];
 
 const W = 1000, H = 300;
 const PAD = { l: 52, r: 8, t: 8, b: 22 };
@@ -78,7 +60,6 @@ export default function PriceChart({
   const [hoverTrade, setHoverTrade] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
-  // Normalize bars to old format for compatibility
   const normalizedBars = useMemo(
     () => (bars && Array.isArray(bars) ? bars.map(toOldOhlcv) : []),
     [bars]
@@ -97,13 +78,15 @@ export default function PriceChart({
 
   const equityPoints = useMemo(() => {
     if (view === "equity" && equityCurve && equityCurve.length > 0) {
-      return toEquityPoints(equityCurve);
-    }
-    if (view === "equity") {
-      return generateEquityCurve(trades);
+      return equityCurve.map((e, i) => ({
+        bar: i,
+        equity: e.equity_usd,
+        cash: e.cash_usd,
+        bnh: e.equity_usd,
+      }));
     }
     return [];
-  }, [view, equityCurve, trades]);
+  }, [view, equityCurve]);
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     if (!svgRef.current) return;
@@ -185,29 +168,6 @@ export default function PriceChart({
             );
           })}
 
-          {/* Regime change markers */}
-          {REGIME_MARKERS.map((m, i) => {
-            const x = xScale(m.bar, startBar, endBar);
-            return (
-              <line
-                key={i}
-                x1={x} y1={PAD.t} x2={x} y2={PAD.t + chartH}
-                stroke="#484f58"
-                strokeWidth="1"
-                strokeDasharray={m.type === 'monthly' ? '4 3' : undefined}
-              />
-            );
-          })}
-
-          {/* Buy-and-hold grey line */}
-          {view === 'price' && (() => {
-            const bnh0 = bars[startBar].close;
-            const points = visible.map((b, i) =>
-              `${xScale(i + startBar, startBar, endBar).toFixed(1)},${yScale(b.close * (bnh0 > 0 ? 1 : 1), minP, maxP).toFixed(1)}`
-            );
-            return null; // skipped for clarity
-          })()}
-
           {view === 'price' ? (
             <>
               {/* Trade connection lines */}
@@ -224,8 +184,8 @@ export default function PriceChart({
                     key={`conn-${t.id}`}
                     x1={x1} y1={y1} x2={x2} y2={y2}
                     stroke={color}
-                    strokeWidth={isSelected || isHovered ? 1.5 : 0.7}
-                    strokeOpacity={isSelected || isHovered ? 0.7 : 0.25}
+                    strokeWidth={isSelected || isHovered ? 1.5 : 0.9}
+                    strokeOpacity={isSelected || isHovered ? 0.7 : 0.35}
                     strokeDasharray="3 2"
                   />
                 );
@@ -257,7 +217,7 @@ export default function PriceChart({
                 const xx = xScale(t.exitBarIdx, startBar, endBar);
                 const xy = yScale(t.exitMidPrice, minP, maxP);
                 const isSelected = t.id === selectedTradeId;
-                const sz = isSelected ? 7 : 5.5;
+                const sz = isSelected ? 12 : 9;
                 const ec = exitColor(t.exitReason);
 
                 const entryPoints = t.side === 'LONG'
@@ -271,18 +231,17 @@ export default function PriceChart({
                     onMouseEnter={() => setHoverTrade(t.id)}
                     onMouseLeave={() => setHoverTrade(null)}
                   >
-                    {/* Entry arrow */}
                     <polygon
                       points={entryPoints}
                       fill={t.side === 'LONG' ? '#2ea043' : '#da3633'}
-                      stroke="white"
-                      strokeWidth="0.8"
-                      opacity={isSelected ? 1 : 0.85}
+                      stroke="#ffffff"
+                      strokeWidth="1.5"
+                      opacity={isSelected ? 1 : 0.9}
+                      filter="drop-shadow(0px 1px 2px rgba(0,0,0,0.5))"
                     />
-                    {/* Exit X */}
-                    <line x1={xx - 4} y1={xy - 4} x2={xx + 4} y2={xy + 4} stroke={ec} strokeWidth="1.8" />
-                    <line x1={xx - 4} y1={xy + 4} x2={xx + 4} y2={xy - 4} stroke={ec} strokeWidth="1.8" />
-                    <circle cx={xx} cy={xy} r="5" fill="transparent"
+                    <line x1={xx - 5} y1={xy - 5} x2={xx + 5} y2={xy + 5} stroke={ec} strokeWidth="2.5" strokeLinecap="round" />
+                    <line x1={xx - 5} y1={xy + 5} x2={xx + 5} y2={xy - 5} stroke={ec} strokeWidth="2.5" strokeLinecap="round" />
+                    <circle cx={xx} cy={xy} r="7" fill="transparent"
                       onClick={() => onSelectTrade(t.id)} style={{ cursor: 'pointer' }} />
                   </g>
                 );
@@ -297,15 +256,15 @@ export default function PriceChart({
                 const pnlColor = t.netPnl >= 0 ? '#3fb950' : '#f85149';
                 return (
                   <g>
-                    <rect x={x - 60} y={y - 4} width={120} height={48} rx="3"
-                      fill="#21262d" stroke="#30363d" strokeWidth="1" opacity="0.95" />
-                    <text x={x} y={y + 10} textAnchor="middle" fill="#8b949e" fontSize="9" fontFamily="Inter,sans-serif">
+                    <rect x={x - 70} y={y - 4} width={140} height={56} rx="4"
+                      fill="#21262d" stroke="#30363d" strokeWidth="1.5" opacity="0.97" />
+                    <text x={x} y={y + 12} textAnchor="middle" fill="#8b949e" fontSize="10" fontFamily="Inter,sans-serif" fontWeight="500">
                       #{t.id} {t.side}
                     </text>
-                    <text x={x} y={y + 22} textAnchor="middle" fill={pnlColor} fontSize="10" fontFamily="'JetBrains Mono',monospace" fontWeight="600">
+                    <text x={x} y={y + 28} textAnchor="middle" fill={pnlColor} fontSize="12" fontFamily="'JetBrains Mono',monospace" fontWeight="700">
                       {t.netPnl >= 0 ? '+' : ''}${t.netPnl.toFixed(2)}
                     </text>
-                    <text x={x} y={y + 33} textAnchor="middle" fill="#8b949e" fontSize="9" fontFamily="Inter,sans-serif">
+                    <text x={x} y={y + 42} textAnchor="middle" fill="#8b949e" fontSize="10" fontFamily="Inter,sans-serif">
                       {t.durationBars}b · {t.exitReason}
                     </text>
                   </g>
@@ -336,24 +295,15 @@ export default function PriceChart({
               const xscale = (bar: number) => PAD.l + (bar / (normalizedBars.length - 1)) * chartW;
               const eqPoints = curve.map((p) => `${xscale(p.bar).toFixed(1)},${yscale(p.equity).toFixed(1)}`).join(" ");
               const bnhPoints = curve.map((p) => `${xscale(p.bar).toFixed(1)},${yscale(p.bnh).toFixed(1)}`).join(" ");
-              const lastPeak = curve.reduce(
-                (acc, p) => ({ bar: p.bar, peak: Math.max(acc.peak, p.equity) }),
-                { bar: 0, peak: curve[0]?.equity ?? 100000 }
-              );
-              const baselineY = yscale(lastPeak.peak);
               return (
                 <>
-                  {/* Zero base */}
                   <line x1={PAD.l} y1={yscale(100000)} x2={W - PAD.r} y2={yscale(100000)} stroke="#30363d" strokeWidth="1" strokeDasharray="4 3" />
-                  {/* BnH line */}
                   <polyline points={bnhPoints} fill="none" stroke="#6e7681" strokeWidth="1.5" opacity="0.6" />
-                  {/* Equity fill area */}
                   <polygon
                     points={`${xscale(curve[0].bar)},${yscale(100000)} ${eqPoints} ${xscale(curve[curve.length - 1].bar)},${yscale(100000)}`}
                     fill="#58a6ff"
                     opacity="0.08"
                   />
-                  {/* Equity line */}
                   <polyline points={eqPoints} fill="none" stroke="#58a6ff" strokeWidth="2" />
                 </>
               );
