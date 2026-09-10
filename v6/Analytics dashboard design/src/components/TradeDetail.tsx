@@ -3,6 +3,7 @@ import type { Trade, ExitReason } from '../types';
 interface Props {
   trade: Trade | null;
   onClose: () => void;
+  onLocate?: () => void;
 }
 
 function Row({ label, value, valueColor, mono, sub }: { label: string; value: string; valueColor?: string; mono?: boolean; sub?: string }) {
@@ -61,7 +62,7 @@ function PnlLine({ label, value, bold }: { label: string; value: number; bold?: 
   );
 }
 
-export default function TradeDetail({ trade: t, onClose }: Props) {
+export default function TradeDetail({ trade: t, onClose, onLocate }: Props) {
   if (!t) {
     return (
       <div
@@ -94,13 +95,11 @@ export default function TradeDetail({ trade: t, onClose }: Props) {
           <span className={`badge badge-${t.side.toLowerCase()}`}>{t.side}</span>
           <span className={`badge ${statusClass}`}>{statusLabel}</span>
         </div>
-        <div className="flex items-center gap-3">
-          <span
-            className="font-mono"
-            style={{ fontSize: 16, fontWeight: 700, color: pnlColor }}
-          >
-            {t.netPnl >= 0 ? '+' : ''}${t.netPnl.toFixed(2)}
-          </span>
+        <div className="flex items-center gap-2">
+          {onLocate && (
+            <button onClick={onLocate} style={{ fontSize: 9, padding: "4px 8px", borderRadius: 4, background: "#238636", color: "white", border: "1px solid #2ea043", fontWeight: 700, cursor: "pointer" }}>↗ Locate</button>
+          )}
+          <span className="font-mono" style={{ fontSize: 16, fontWeight: 700, color: pnlColor }}>{t.netPnl >= 0 ? '+' : ''}${t.netPnl.toFixed(2)}</span>
           <button onClick={onClose} style={{ color: '#6e7681', background: 'transparent', fontSize: 14, lineHeight: 1 }}>✕</button>
         </div>
       </div>

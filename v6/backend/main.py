@@ -23,12 +23,7 @@ app = FastAPI(
 # CORS for Vite dev server and production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:8443",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:8443",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,9 +33,28 @@ app.add_middleware(
 app.include_router(api_router, prefix="")
 
 
+@app.on_event("startup")
+def _preload_on_startup():
+    """Eagerly load all non-indicator data into RAM so first chart paint is fast.
+    Indicator computation remains on-demand (and is fully cached once computed)."""
+    try:
+        from backend.api.data_loader import preload_all, get_data_bounds
+        stats = preload_all()
+        bounds = get_data_bounds()
+        print(f"[preload] bounds={bounds} stats={stats}")
+    except Exception as e:
+        print(f"[preload] failed: {e}")
+
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/api/bounds")
+def data_bounds():
+    from backend.api.data_loader import get_data_bounds
+    return get_data_bounds()
 
 
 # Mount static files for frontend (production)

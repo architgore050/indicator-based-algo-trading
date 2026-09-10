@@ -3,6 +3,7 @@
 import json
 import math
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.config import CONFIG_JSON, V6_DIR
+from backend.api.data_loader import _TOTAL_ROWS
 from backend.utils import (
     iso_timestamp,
     compute_breakeven,
@@ -45,6 +47,12 @@ from backend.api.wfv import (
 )
 
 router = APIRouter()
+
+# Response-level cache for expensive endpoints. Keyed by (strategy, range, chunk_size).
+# Populated on first request, served instantly on subsequent requests.
+_backtest_cache: dict[str, dict] = {}
+_equity_cache: dict[str, dict] = {}
+_indicators_cache: dict[str, dict] = {}
 
 
 def _strategy_valid(strategy: str) -> bool:
@@ -98,15 +106,18 @@ def _sanitize_summary(s: dict) -> dict:
 
 
 def _trades_to_list(df: pd.DataFrame | None) -> list[dict]:
-    """Convert trades DataFrame to list of dicts."""
+    """Convert trades DataFrame to list of dicts. Vectorized — no iterrows."""
     if df is None or df.empty:
         return []
+    # Vectorized conversion: much faster than df.iterrows()
+    records = df.to_dict('records')
     trades = []
-    for _, r in df.iterrows():
+    for r in records:
         entry_bar = int(r.get("entry_bar", 0))
         bars_held = int(r.get("bars_held", 0))
+        net_pnl = float(r.get("net_pnl_usd", 0))
         trades.append({
-            "trade_id": int(r.get("trade_id", r.get("index", 0))),
+            "trade_id": int(r.get("trade_id", 0)),
             "entry_time": str(r.get("entry_time", "")),
             "exit_time": str(r.get("exit_time", "")),
             "side": str(r.get("side", "LONG")),
@@ -124,14 +135,14 @@ def _trades_to_list(df: pd.DataFrame | None) -> list[dict]:
             "swap_usd": float(r.get("swap_usd", 0)),
             "commission_usd": float(r.get("commission_usd", 0)),
             "spread_slippage_cost_usd": float(r.get("spread_slippage_cost_usd", 0)),
-            "net_pnl_usd": float(r.get("net_pnl_usd", 0)),
+            "net_pnl_usd": net_pnl,
             "net_pnl_inr": float(r.get("net_pnl_inr", 0)),
             "return_on_margin_pct": float(r.get("return_on_margin_pct", 0)),
             "bars_held": bars_held,
             "hours_held": float(r.get("hours_held", 0)),
             "mfe_usd": float(r.get("mfe_usd", 0)),
             "mae_usd": float(r.get("mae_usd", 0)),
-            "win": bool(r.get("net_pnl_usd", 0) > 0),
+            "win": net_pnl > 0,
             "exit_reason_category": str(r.get("exit_reason", "")),
             "entry_bar": entry_bar,
             "exit_bar": entry_bar + bars_held,
@@ -140,47 +151,70 @@ def _trades_to_list(df: pd.DataFrame | None) -> list[dict]:
 
 
 def _equity_to_list(df: pd.DataFrame | None) -> list[dict]:
-    """Convert equity DataFrame to list of dicts."""
+    """Convert equity DataFrame to list of dicts. Vectorized — no iterrows."""
     if df is None or df.empty:
         return []
-    equity = []
-    for _, r in df.iterrows():
-        ts = r.get("timestamp", "")
-        if hasattr(ts, "isoformat"):
-            ts = ts.isoformat()
-        elif pd.isna(ts):
-            ts = ""
-        equity.append({
-            "timestamp": str(ts),
-            "cash_usd": float(r.get("cash_usd", r.get("equity_usd", 0))),
-            "unrealized_pnl_usd": float(r.get("unrealized_pnl_usd", 0)),
-            "equity_usd": float(r.get("equity_usd", 0)),
-            "equity_inr": float(r.get("equity_inr", 0)),
-            "used_margin_usd": float(r.get("used_margin_usd", 0)),
-            "free_margin_usd": float(r.get("free_margin_usd", 0)),
-            "position": int(r.get("position", 0)),
-            "close": float(r.get("close", 0)),
-        })
-    return equity
+    # Pre-extract columns to avoid repeated Series access
+    has_cash = "cash_usd" in df.columns
+    has_equity_inr = "equity_inr" in df.columns
+    has_used_margin = "used_margin_usd" in df.columns
+    has_free_margin = "free_margin_usd" in df.columns
+    has_position = "position" in df.columns
+    has_close = "close" in df.columns
+
+    ts_col = df["timestamp"].astype(str).tolist() if "timestamp" in df.columns else [""] * len(df)
+    equity_col = df["equity_usd"].astype(float).tolist() if "equity_usd" in df.columns else [0.0] * len(df)
+
+    cash_col = df["cash_usd"].astype(float).tolist() if has_cash else [0.0] * len(df)
+    unreal_col = df["unrealized_pnl_usd"].astype(float).tolist() if "unrealized_pnl_usd" in df.columns else [0.0] * len(df)
+    inr_col = df["equity_inr"].astype(float).tolist() if has_equity_inr else [0.0] * len(df)
+    margin_col = df["used_margin_usd"].astype(float).tolist() if has_used_margin else [0.0] * len(df)
+    free_col = df["free_margin_usd"].astype(float).tolist() if has_free_margin else [0.0] * len(df)
+    pos_col = df["position"].astype(int).tolist() if has_position else [0] * len(df)
+    close_col = df["close"].astype(float).tolist() if has_close else [0.0] * len(df)
+
+    return [
+        {
+            "timestamp": ts,
+            "cash_usd": cash,
+            "unrealized_pnl_usd": unreal,
+            "equity_usd": eq,
+            "equity_inr": inr,
+            "used_margin_usd": margin,
+            "free_margin_usd": free,
+            "position": pos,
+            "close": cl,
+        }
+        for ts, cash, unreal, eq, inr, margin, free, pos, cl in zip(
+            ts_col, cash_col, unreal_col, equity_col, inr_col, margin_col, free_col, pos_col, close_col
+        )
+    ]
 
 
 # ─── GET /api/config ───────────────────────────────────────────────
+_total_rows_cache: int | None = None
+
+
 @router.get("/api/config")
 def get_config():
+    global _total_rows_cache
     data = load_json_safe(CONFIG_JSON)
     if data is None:
         raise HTTPException(status_code=500, detail="config.json not found")
-    total_rows = 0
-    try:
-        with open(V6_DIR / "data.csv", "r") as f:
-            f.readline()
-            total_rows = sum(1 for _ in f)
-    except Exception:
-        pass
-    return {**data, "data_config": {"total_rows": total_rows}}
+    if _total_rows_cache is None:
+        try:
+            with open(V6_DIR / "data.csv", "r") as f:
+                f.readline()
+                _total_rows_cache = sum(1 for _ in f)
+        except Exception:
+            _total_rows_cache = 0
+    return {**data, "data_config": {"total_rows": _total_rows_cache}}
 
 
 # ─── GET /api/ohlcv/{strategy}/{range} ─────────────────────────────
+MAX_CANDLES = 5000  # hard cap on candles per response to keep JSON + SVG renderable
+
+
 @router.get("/api/ohlcv/{strategy}/{range}")
 def get_ohlcv(
     strategy: str,
@@ -193,28 +227,122 @@ def get_ohlcv(
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
 
     from backend.api.data_loader import load_ohlcv as _load_ohlcv
-    df = _load_ohlcv(start, end, chunk_size)
-    if df.empty:
-        return {"data": [], "total_count": 0, "returned_count": 0}
+    _RANGE_BARS: dict[str, int] = {"1D": 1440, "1W": 10080, "1M": 43200, "3M": 129600, "1Y": 525600}
+    # Explicit [start, end] window (chart scrolling) takes precedence over any
+    # named range like 1D/1W. This lets the frontend pan/zoom by datetime.
+    if start or end:
+        df = _load_ohlcv(start, end, chunk_size=chunk_size or 10000, range_str=range)
+        if df.empty:
+            return {"data": [], "total_count": 0, "returned_count": 0, "trades": []}
+        if len(df) > MAX_CANDLES:
+            step = math.ceil(len(df) / MAX_CANDLES)
+            df = df.iloc[::step]
+        total = len(df)
+    else:
+        range_upper = range.upper().strip()
+        is_all = range_upper == "ALL"
+        target_bars = _TOTAL_ROWS if is_all else _RANGE_BARS.get(range_upper, 1440)
 
-    total = len(df)
-    rows = []
-    for _, r in df.head(chunk_size).iterrows():
-        ts = r.get("timestamp", "")
-        if hasattr(ts, "isoformat"):
-            ts = ts.isoformat()
-        elif pd.isna(ts):
-            ts = ""
-        rows.append({
-            "timestamp": str(ts),
-            "open": float(r.get("open", 0)),
-            "high": float(r.get("high", 0)),
-            "low": float(r.get("low", 0)),
-            "close": float(r.get("close", 0)),
-            "volume": float(r.get("volume", 0)) if "volume" in r else None,
-        })
+        df = _load_ohlcv(start, end, chunk_size=target_bars, range_str=range)
+        if df.empty:
+            return {"data": [], "total_count": 0, "returned_count": 0, "trades": []}
 
-    return {"data": rows, "total_count": total, "returned_count": len(rows)}
+        # Stride-sample down to MAX_CANDLES so the JSON payload stays small and the
+        # SVG chart (one <g> per bar) doesn't try to render hundreds of thousands of nodes.
+        if len(df) > MAX_CANDLES:
+            step = math.ceil(len(df) / MAX_CANDLES)
+            df = df.iloc[::step]
+
+        total = len(df)
+
+    # Fast timestamp normalization using dt.strftime (avoids 4 str.replace passes).
+    ts_col = df["timestamp"]
+    if pd.api.types.is_datetime64_any_dtype(ts_col):
+        ts_list = ts_col.dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    else:
+        ts_series = ts_col.astype(str)
+        for tz in ("+00:00", "+0000", "Z"):
+            ts_series = ts_series.str.replace(tz, "", regex=False)
+        ts_series = ts_series.str.replace("T", " ", regex=False)
+        ts_list = ts_series.tolist()
+
+    has_volume = "volume" in df.columns
+    opens = df["open"].astype(float).tolist()
+    highs = df["high"].astype(float).tolist()
+    lows = df["low"].astype(float).tolist()
+    closes = df["close"].astype(float).tolist()
+
+    if has_volume:
+        volumes = df["volume"].astype(float).tolist()
+        rows = [
+            {"timestamp": t, "open": o, "high": h, "low": l, "close": c, "volume": v}
+            for t, o, h, l, c, v in zip(ts_list, opens, highs, lows, closes, volumes)
+        ]
+    else:
+        rows = [
+            {"timestamp": t, "open": o, "high": h, "low": l, "close": c, "volume": None}
+            for t, o, h, l, c in zip(ts_list, opens, highs, lows, closes)
+        ]
+
+    # Filter trades by time range (between the first and last sampled bar) so that
+    # trades still show up after the backend stride-samples the candle list.  The
+    # frontend maps each trade to the nearest bar via binary search.
+    collated_trades = []
+    if rows:
+        first_ts = rows[0]["timestamp"]
+        last_ts = rows[-1]["timestamp"]
+        try:
+            from backend.api.data_loader import load_collated_trades
+            trades_df = load_collated_trades(strategy)
+            if trades_df is not None and not trades_df.empty and "entry_time" in trades_df.columns:
+                entry_ts = trades_df["entry_time"].astype(str)
+                exit_ts = trades_df["exit_time"].astype(str)
+                for tz in ("+00:00", "+0000", "Z"):
+                    entry_ts = entry_ts.str.replace(tz, "", regex=False)
+                    exit_ts = exit_ts.str.replace(tz, "", regex=False)
+                entry_ts = entry_ts.str.replace("T", " ", regex=False)
+                exit_ts = exit_ts.str.replace("T", " ", regex=False)
+
+                # String-based time range filter (works because timestamps are zero-padded ISO)
+                mask = (entry_ts >= first_ts) & (entry_ts <= last_ts)
+                matched = trades_df[mask]
+                matched_entry = entry_ts[mask].tolist()
+                matched_exit = exit_ts[mask].tolist()
+
+                for i, (_, tr) in enumerate(matched.iterrows()):
+                    collated_trades.append({
+                        "trade_id": int(tr.get("trade_id", 0)),
+                        "entry_time": matched_entry[i],
+                        "exit_time": matched_exit[i],
+                        "side": str(tr.get("side", "LONG")),
+                        "entry_reason": str(tr.get("entry_reason", "")),
+                        "exit_reason": str(tr.get("exit_reason", "")),
+                        "lots": float(tr.get("lots", 0)),
+                        "units_oz": float(tr.get("units_oz", 10)),
+                        "entry_mid": float(tr.get("entry_mid", 0)),
+                        "entry_fill": float(tr.get("entry_fill", 0)),
+                        "exit_mid": float(tr.get("exit_mid", 0)),
+                        "exit_fill": float(tr.get("exit_fill", 0)),
+                        "gross_pnl_usd": float(tr.get("gross_pnl_usd", 0)),
+                        "swap_usd": float(tr.get("swap_usd", 0)),
+                        "commission_usd": float(tr.get("commission_usd", 0)),
+                        "spread_slippage_cost_usd": float(tr.get("spread_slippage_cost_usd", 0)),
+                        "net_pnl_usd": float(tr.get("net_pnl_usd", 0)),
+                        "return_on_margin_pct": float(tr.get("return_on_margin_pct", 0)),
+                        "bars_held": int(tr.get("bars_held", 0)),
+                        "hours_held": float(tr.get("hours_held", 0)),
+                        "mfe_usd": float(tr.get("mfe_usd", 0)),
+                        "mae_usd": float(tr.get("mae_usd", 0)),
+                    })
+        except Exception:
+            pass
+
+    return {
+        "data": rows,
+        "total_count": total,
+        "returned_count": len(rows),
+        "trades": collated_trades,
+    }
 
 
 # ─── GET /api/indicators/{strategy}/{range} ────────────────────────
@@ -230,31 +358,100 @@ def get_indicators(
         if not _strategy_valid(strategy):
             raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
 
-        from backend.api.data_loader import load_ohlcv as _load_ohlcv
-        # Load extra warmup rows so indicators have data to compute properly
-        # Max warmup across all indicators: ER=50, MACD=26, EMA chains=~20, rolling windows=~30
-        WARMUP = 100
-        warmup_df = _load_ohlcv(start, end, chunk_size=chunk_size + WARMUP)
-        if warmup_df.empty:
-            return {"strategy": strategy, "indicators": {}, "timestamps": []}
+        # Full caching: key includes explicit window so repeated scrolls are instant.
+        # Named-range keys stay as before (e.g. "vm:1D"); windowed keys are
+        # "vm:window:2025-09-11 08:00:00:2025-09-11 11:00:00".
+        is_windowed = bool(start or end)
+        cache_key = f"{strategy}:window:{start}:{end}" if is_windowed else f"{strategy}:{range}"
+        if cache_key in _indicators_cache:
+            return _indicators_cache[cache_key]
 
-        # Compute indicators on the full range (including warmup padding)
+        from backend.api.data_loader import load_ohlcv as _load_ohlcv, load_ohlcv_window_with_warmup
+        _RANGE_BARS: dict[str, int] = {"1D": 1440, "1W": 10080, "1M": 43200, "3M": 129600, "1Y": 525600}
+        WARMUP = 200
+
+        # Explicit [start, end] window (chart scrolling): load window with warmup
+        # so the left edge is converged, then trim the warmup prefix.
+        if is_windowed:
+            warmup_df = load_ohlcv_window_with_warmup(start, end, warmup_bars=WARMUP)
+            if warmup_df.empty:
+                result = {"strategy": strategy, "indicators": {}, "timestamps": []}
+                _indicators_cache[cache_key] = result
+                return result
+            # How many bars are in the requested window (without warmup)?
+            from backend.api.data_loader import load_ohlcv as _lw
+            win_df = _lw(start, end, chunk_size=100000, range_str="ALL")
+            target_bars = len(win_df) if not win_df.empty else len(warmup_df)
+            cal = get_latest_calibration(V6_DIR, strategy) or {}
+            result = compute_indicators(strategy, warmup_df, cal)
+            if not result.get("indicators"):
+                _indicators_cache[cache_key] = result
+                return result
+            # Remove warmup prefix so arrays line up with the displayed window.
+            warmup_len = len(warmup_df) - target_bars
+            if warmup_len > 0:
+                for k, v in list(result["indicators"].items()):
+                    if isinstance(v, list) and len(v) > target_bars:
+                        result["indicators"][k] = v[warmup_len:]
+                    elif isinstance(v, pd.Series) and len(v) > target_bars:
+                        result["indicators"][k] = v.iloc[warmup_len:].tolist() if hasattr(v, 'iloc') else list(v)[warmup_len:]
+                if "timestamps" in result and len(result["timestamps"]) > target_bars:
+                    result["timestamps"] = result["timestamps"][warmup_len:]
+            # Cap to MAX_CANDLES
+            if target_bars > MAX_CANDLES:
+                step = math.ceil(target_bars / MAX_CANDLES)
+                for k, v in result["indicators"].items():
+                    if isinstance(v, list) and len(v) > MAX_CANDLES:
+                        result["indicators"][k] = v[::step]
+                if len(result.get("timestamps", [])) > MAX_CANDLES:
+                    result["timestamps"] = result["timestamps"][::step]
+            _indicators_cache[cache_key] = result
+            return result
+
+        r = range.upper().strip()
+        is_all = r == "ALL"
+        target_bars = _TOTAL_ROWS if is_all else _RANGE_BARS.get(r, 1440)
+
+        # Load only the target range + warmup. The data loader returns
+        # the last N rows for named ranges; for ALL it returns the full df.
+        warmup_df = _load_ohlcv(start, end, chunk_size=target_bars + WARMUP, range_str=range)
+        if warmup_df.empty:
+            result = {"strategy": strategy, "indicators": {}, "timestamps": []}
+            _indicators_cache[cache_key] = result
+            return result
+
+        # Compute indicators on the range
         cal = get_latest_calibration(V6_DIR, strategy) or {}
         result = compute_indicators(strategy, warmup_df, cal)
         if not result.get("indicators"):
+            _indicators_cache[cache_key] = result
             return result
 
-        # Trim to the requested chunk_size from the end
         indicators = result["indicators"]
+        # Trim each indicator series to the last `target_bars` values to align
+        # with the displayed candles (the warmup prefix needs to be removed).
         trimmed = {}
         for k, v in indicators.items():
-            if isinstance(v, (list, pd.Series)) and len(v) > chunk_size:
-                trimmed[k] = v[-chunk_size:] if isinstance(v, pd.Series) else v[-chunk_size:]
+            if isinstance(v, (list, pd.Series)) and len(v) > target_bars:
+                trimmed[k] = v[-target_bars:] if isinstance(v, pd.Series) else v[-target_bars:]
             else:
                 trimmed[k] = v
         result["indicators"] = trimmed
-        if "timestamps" in result and len(result["timestamps"]) > chunk_size:
-            result["timestamps"] = result["timestamps"][-chunk_size:]
+        if "timestamps" in result and len(result["timestamps"]) > target_bars:
+            result["timestamps"] = result["timestamps"][-target_bars:]
+
+        # Stride-sample indicator arrays down to MAX_CANDLES so the polylines stay
+        # small. Use the same step formula as the OHLCV endpoint so the rendered
+        # points line up with the candle bar positions.
+        if target_bars > MAX_CANDLES:
+            step = math.ceil(target_bars / MAX_CANDLES)
+            for k, v in result["indicators"].items():
+                if isinstance(v, list) and len(v) > MAX_CANDLES:
+                    result["indicators"][k] = v[::step]
+            if len(result.get("timestamps", [])) > MAX_CANDLES:
+                result["timestamps"] = result["timestamps"][::step]
+
+        _indicators_cache[cache_key] = result
         return result
     except Exception as e:
         import traceback
@@ -294,7 +491,7 @@ def get_signals(
         }
 
     from backend.api.data_loader import load_ohlcv as _load_ohlcv
-    df = _load_ohlcv(start, end)
+    df = _load_ohlcv(start, end, range_str=range)
     if df.empty:
         return {"signals": [], "buy_checks": [], "sell_checks": []}
 
@@ -331,6 +528,11 @@ def get_backtest(
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
 
+    # Check response cache first — this endpoint takes 7s on first call
+    cache_key = strategy
+    if cache_key in _backtest_cache:
+        return _backtest_cache[cache_key]
+
     # Primary: load from collated WFV results
     collated = load_all_collated(strategy)
     if collated and collated.get("summary"):
@@ -338,7 +540,7 @@ def get_backtest(
         trades = _trades_to_list(collated.get("trades"))
         cal = get_latest_calibration(V6_DIR, strategy) or {}
 
-        return {
+        result = {
             "summary": summary,
             "trades": trades,
             "equity_curve": [],
@@ -346,6 +548,8 @@ def get_backtest(
             "skipped_signals": [],
             "executions": [],
         }
+        _backtest_cache[cache_key] = result
+        return result
 
     raise HTTPException(
         status_code=404,
@@ -447,7 +651,6 @@ def get_summary(strategy: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ─── GET /api/equity/{strategy}/{range} ────────────────────────────
 @router.get("/api/equity/{strategy}/{range}")
 def get_equity(
@@ -460,33 +663,51 @@ def get_equity(
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
 
-    collated = load_all_collated(strategy)
-    equity_df = collated.get("equity_curve") if collated else None
+    # Windowed requests (chart scrolling) use get_equity_range which slices by
+    # timestamp; named ranges use the tail-based get_equity_window. Cache key
+    # includes the window so repeated scrolls are instant.
+    is_windowed = bool(start or end)
+    cache_key = f"{strategy}:window:{start}:{end}:{chunk_size}" if is_windowed else f"{strategy}:{range}:{chunk_size}"
+    if cache_key in _equity_cache:
+        return _equity_cache[cache_key]
+
+    from backend.api.data_loader import get_equity_window, get_equity_range
+    _RANGE_BARS: dict[str, int] = {"1D": 1440, "1W": 10080, "1M": 43200, "3M": 129600, "1Y": 525600}
+    if is_windowed:
+        equity_df = get_equity_range(strategy, start, end, max_points=2048)
+    else:
+        r = range.upper().strip()
+        is_all = r == "ALL"
+        target_bars = _TOTAL_ROWS if is_all else _RANGE_BARS.get(r, chunk_size)
+        equity_df = get_equity_window(strategy, target_bars, max_points=2048)
+
+    if equity_df is None or equity_df.empty:
+        result = {"equity_curve": [], "baseline_equity": [], "asset_equity": [], "calibration_points": []}
+        _equity_cache[cache_key] = result
+        return result
+
+    # Build a JSON-friendly list of equity rows for the price overlay
     equity_out = _equity_to_list(equity_df)
 
-    # Limit to chunk_size for frontend rendering
-    equity_out = equity_out[:chunk_size]
-
-    # Add baseline and asset equity from collated data
+    # Baseline & buy-and-hold series from the same windowed slice
     baseline_equity = []
     asset_equity = []
-    if equity_df is not None and not equity_df.empty:
-        if "baseline_equity_usd" in equity_df.columns:
-            baseline_equity = equity_df["baseline_equity_usd"].tolist()[:chunk_size]
-        if "raw_asset_close" in equity_df.columns:
-            # Convert raw asset close to equity equivalent
-            initial_cap = 100000
-            if "close" in equity_df.columns and len(equity_df) > 0:
-                first_close = float(equity_df["close"].iloc[0])
-                if first_close > 0:
-                    asset_equity = [initial_cap * (c / first_close) for c in equity_df["close"].tolist()[:chunk_size]]
+    if "baseline_equity_usd" in equity_df.columns:
+        baseline_equity = equity_df["baseline_equity_usd"].tolist()
+    if "raw_asset_close" in equity_df.columns and "close" in equity_df.columns and len(equity_df) > 0:
+        initial_cap = 100000
+        first_close = float(equity_df["close"].iloc[0])
+        if first_close > 0:
+            asset_equity = [initial_cap * (c / first_close) for c in equity_df["close"].tolist()]
 
-    return {
+    result = {
         "equity_curve": equity_out,
         "baseline_equity": baseline_equity,
         "asset_equity": asset_equity,
         "calibration_points": [],
     }
+    _equity_cache[cache_key] = result
+    return result
 
 
 # ─── GET /api/wfv/{strategy} ───────────────────────────────────────

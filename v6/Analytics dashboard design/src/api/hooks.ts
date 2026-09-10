@@ -25,37 +25,87 @@ interface UseApiState<T> {
   error: string | null;
 }
 
+// In-memory response cache for surrounding-data prefetching.
+// Key is a stable JSON string of the request; value is the last successful data.
+const _responseCache = new Map<string, unknown>();
+// Pending fetches to deduplicate concurrent requests for the same key.
+const _pendingCache = new Map<string, Promise<unknown>>();
+
+function cacheKey(prefix: string, deps: unknown[]): string {
+  try { return `${prefix}:${JSON.stringify(deps)}`; } catch { return `${prefix}:${String(deps)}`; }
+}
+
 function useApi<T>(
   fetcher: () => Promise<T>,
-  deps: unknown[] = []
+  deps: unknown[] = [],
+  opts: { cachePrefix?: string; keepStale?: boolean } = {}
 ): UseApiState<T> {
+  const { cachePrefix, keepStale } = opts;
+  const key = cachePrefix ? cacheKey(cachePrefix, deps) : "";
+  const cached = (key && _responseCache.has(key) ? (_responseCache.get(key) as T) : null) as T | null;
+
   const [state, setState] = useState<UseApiState<T>>({
-    data: null,
-    loading: true,
+    data: cached,
+    loading: cached ? false : true,
     error: null,
   });
 
   useEffect(() => {
     let cancelled = false;
-    setState({ data: null, loading: true, error: null });
-    fetcher()
+    // If we have a cached value and keepStale is true, don't clear it; just mark loading.
+    if (cached && keepStale) {
+      setState((s) => ({ ...s, loading: true, error: null }));
+    } else if (!cached) {
+      setState({ data: null, loading: true, error: null });
+    }
+
+    const run = () => {
+      if (key && _pendingCache.has(key)) return _pendingCache.get(key) as Promise<T>;
+      const p = fetcher();
+      if (key) _pendingCache.set(key, p as Promise<unknown>);
+      return p;
+    };
+
+    run()
       .then((data) => {
+        if (key) {
+          _responseCache.set(key, data as unknown);
+          _pendingCache.delete(key);
+        }
         if (!cancelled) setState({ data, loading: false, error: null });
       })
       .catch((err) => {
-        if (!cancelled)
-          setState({
-            data: null,
+        if (key) _pendingCache.delete(key);
+        if (!cancelled) {
+          // Keep stale data on error if we have it
+          setState((s) => ({
+            data: s.data ?? cached ?? null,
             loading: false,
             error: err.message || "Failed to fetch",
-          });
+          }));
+        }
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, deps);
 
   return state;
+}
+
+// Prefetch helper: fire-and-forget fetch for surrounding windows (no state).
+export function prefetchWindow(strategy: string, start: string, end: string) {
+  if (!strategy || !start || !end) return;
+  const k1 = cacheKey("ohlcv", [strategy, start, end]);
+  if (!_responseCache.has(k1) && !_pendingCache.has(k1)) {
+    const p = api.getOhlcv(strategy, "ALL", { start, end }).then((r) => r.data);
+    _pendingCache.set(k1, p as Promise<unknown>);
+    p.then((d) => { _responseCache.set(k1, d as unknown); _pendingCache.delete(k1); }).catch(() => _pendingCache.delete(k1));
+  }
+  const k2 = cacheKey("equity", [strategy, start, end]);
+  if (!_responseCache.has(k2) && !_pendingCache.has(k2)) {
+    const p2 = api.getEquity(strategy, "ALL", { start, end }).then((r) => r.data);
+    _pendingCache.set(k2, p2 as Promise<unknown>);
+    p2.then((d) => { _responseCache.set(k2, d as unknown); _pendingCache.delete(k2); }).catch(() => _pendingCache.delete(k2));
+  }
 }
 
 export function useConfig() {
@@ -83,12 +133,14 @@ export function useOhlcv(
   end?: string,
   connected?: boolean | null
 ) {
+  const hasWindow = !!(start || end);
   return useApi(
     () =>
       strategy
-        ? api.getOhlcv(strategy, range, { start, end, chunk_size: 1440 }).then((r) => r.data)
+        ? api.getOhlcv(strategy, range, { start, end, chunk_size: hasWindow ? 10000 : 1440 }).then((r) => r.data)
         : Promise.resolve(null),
-    [strategy, range, start, end, connected]
+    [strategy, range, start, end, connected],
+    { cachePrefix: hasWindow ? "ohlcv" : undefined, keepStale: hasWindow }
   );
 }
 
@@ -99,12 +151,14 @@ export function useIndicators(
   end?: string,
   connected?: boolean | null
 ) {
+  const hasWindow = !!(start || end);
   return useApi(
     () =>
       strategy
         ? api.getIndicators(strategy, range, { start, end, chunk_size: 1440 }).then((r) => r.data)
         : Promise.resolve(null),
-    [strategy, range, start, end, connected]
+    [strategy, range, start, end, connected],
+    { cachePrefix: hasWindow ? "indicators" : undefined, keepStale: hasWindow }
   );
 }
 
@@ -115,12 +169,22 @@ export function useEquity(
   end?: string,
   connected?: boolean | null
 ) {
+  const hasWindow = !!(start || end);
   return useApi(
     () =>
       strategy
         ? api.getEquity(strategy, range, { start, end, chunk_size: 1440 }).then((r) => r.data)
         : Promise.resolve(null),
-    [strategy, range, start, end, connected]
+    [strategy, range, start, end, connected],
+    { cachePrefix: hasWindow ? "equity" : undefined, keepStale: hasWindow }
+  );
+}
+
+export function useBounds(connected: boolean | null) {
+  return useApi(
+    () => api.getBounds().then((r) => r.data),
+    [connected],
+    { cachePrefix: "bounds" }
   );
 }
 

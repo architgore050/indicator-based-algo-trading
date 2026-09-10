@@ -162,7 +162,9 @@ def _extract_window_info(window_dir):
     return window_idx, regime, recal_idx
 
 
-def collate_results(wfv_dir='wfv', output_dir='collated_wfv_results', strategy='vm'):
+def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
+    if output_dir is None:
+        output_dir = f'collated_wfv_results_{strategy}'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     # --- Run baseline (native behavior, always) ---
@@ -575,6 +577,6 @@ if __name__ == "__main__":
     parser.add_argument("--strategy", choices=["vm", "tv", "trend"], default="vm",
                         help="Strategy to use for baseline comparison (default: vm)")
     parser.add_argument("--wfv-dir", default="wfv", help="WFV output directory")
-    parser.add_argument("--output-dir", default="collated_wfv_results", help="Output directory for collated results")
+    parser.add_argument("--output-dir", default=None, help="Output directory for collated results (default: collated_wfv_results_<strategy>)")
     args = parser.parse_args()
     collate_results(wfv_dir=args.wfv_dir, output_dir=args.output_dir, strategy=args.strategy)

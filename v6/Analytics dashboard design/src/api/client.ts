@@ -19,9 +19,10 @@ import type {
   WFVResponse,
 } from "./types";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// Use relative URL so requests go through Vite proxy (/api -> http://localhost:8000)
+const API_BASE = "";
 
-console.log("[Dashboard] API_BASE:", API_BASE);
+console.log("[Dashboard] API_BASE (relative):", API_BASE);
 
 const client = axios.create({
   baseURL: API_BASE,
@@ -47,7 +48,7 @@ client.interceptors.response.use(
     return response;
   },
   (error) => {
-    console.error("[Dashboard] API error:", error.message, error.config?.url);
+    console.error("[Dashboard] API error:", error.message, error.config?.url, error.response?.status);
     return Promise.reject(error);
   }
 );
@@ -101,6 +102,7 @@ export const api = {
   getDrawdownTimeline: (strategy: string) =>
     client.get<DrawdownTimeline>(`/api/analysis/${strategy}/drawdown-timeline`),
   health: () => client.get("/api/health"),
+  getBounds: () => client.get<{ start: string; end: string; total_rows: number }>("/api/bounds"),
 };
 
 export { API_BASE };

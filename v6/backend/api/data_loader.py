@@ -2,13 +2,38 @@
 
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 
 from backend.config import V6_DIR
 from backend.utils import load_json_safe, parse_csv_safe, iso_timestamp
+
+# Cache the full OHLCV dataset to avoid re-reading 4M-row CSV on every request
+_ohlcv_cache: pd.DataFrame | None = None
+
+# Cache for collated data per strategy — loaded once, reused forever
+_collated_cache: dict[str, dict] = {}
+_summary_cache: dict[str, dict | None] = {}
+
+# Cache the full collated equity curve (4M rows) so the equity endpoint can
+# windowed-slice on demand without re-parsing the 300+ MB CSV.
+_equity_full_cache: dict[str, pd.DataFrame | None] = {}
+
+
+def _load_full_ohlcv() -> pd.DataFrame:
+    """Load the full data.csv once and cache it."""
+    global _ohlcv_cache
+    if _ohlcv_cache is None:
+        data_path = V6_DIR / "data.csv"
+        try:
+            _ohlcv_cache = pd.read_csv(data_path, parse_dates=["timestamp"])
+        except Exception:
+            _ohlcv_cache = pd.DataFrame()
+    return _ohlcv_cache
 
 
 def _parse_time(ts: str) -> str:
@@ -36,10 +61,12 @@ def find_collated_dir(strategy: str) -> Path | None:
 
 def load_collated_summary(strategy: str) -> dict | None:
     """Load aggregate summary stats from collated_diagnostics.json.
-    
+
     Returns aggregate stats computed across all WFV windows, not just
     the first window from collated_summary_stats.csv.
     """
+    if strategy in _summary_cache:
+        return _summary_cache[strategy]
     collated_dir = find_collated_dir(strategy)
     if collated_dir is None:
         return None
@@ -77,7 +104,7 @@ def load_collated_summary(strategy: str) -> dict | None:
     max_consec_wins = int(float(averages.get("trade_max_consecutive_wins", {}).get("max", 0)))
     max_consec_losses = int(float(averages.get("trade_max_consecutive_losses", {}).get("max", 0)))
 
-    # Compute CAGR and max DD from equity curve
+    # Compute CAGR and max DD from the (down-sampled) collated equity curve
     equity_df = load_collated_equity(strategy)
     cagr = 0.0
     max_dd = 0.0
@@ -113,7 +140,7 @@ def load_collated_summary(strategy: str) -> dict | None:
         sharpe = float(np.mean(sharpe_vals))
         calmar = float(np.mean(cagr_vals)) / float(np.mean(dd_vals)) if float(np.mean(dd_vals)) > 0 else 0
 
-    return {
+    result = {
         "signal_file": "collated",
         "initial_capital_usd": initial_capital,
         "final_equity_usd": round(float(equity_df["equity_usd"].iloc[-1]) if equity_df is not None and not equity_df.empty else initial_capital, 2),
@@ -159,6 +186,8 @@ def load_collated_summary(strategy: str) -> dict | None:
         "swap_usd": round(swap, 2),
         "total_costs_usd": round(total_costs, 2),
     }
+    _summary_cache[strategy] = result
+    return result
 
 
 def load_collated_trades(strategy: str) -> pd.DataFrame | None:
@@ -187,21 +216,28 @@ def load_collated_trades(strategy: str) -> pd.DataFrame | None:
 
 def load_collated_equity(strategy: str) -> pd.DataFrame | None:
     """Load collated equity curve and add missing columns.
-    
-    Limited to 5000 rows for API performance (charting only).
+
+    Returns a downsampled DataFrame (~5000 rows) for API performance.
     """
     collated_dir = find_collated_dir(strategy)
     if collated_dir is None:
         return None
 
     path = collated_dir / "collated_equity_curve.csv"
-    df = parse_csv_safe(path)
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+
     if df is None or df.empty:
         return None
 
-    # Limit to 5000 rows for API performance (enough for charting)
-    if len(df) > 5000:
-        df = df.iloc[::len(df) // 5000].head(5000).copy()
+    # Downsample to 5000 rows using uniform stride. The CSV has 4M rows
+    # (one per bar) which is way more than needed for charting.
+    target = 5000
+    if len(df) > target:
+        step = len(df) // target
+        df = df.iloc[::step].head(target).copy()
 
     # Add missing columns that the frontend expects
     for col in ("cash_usd", "unrealized_pnl_usd", "equity_inr",
@@ -214,6 +250,95 @@ def load_collated_equity(strategy: str) -> pd.DataFrame | None:
         df["timestamp"] = df["timestamp"].astype(str).replace("NaT", "")
 
     return df
+
+
+def load_collated_equity_full(strategy: str) -> pd.DataFrame | None:
+    """Load the full collated equity curve (one row per bar across all WFV windows).
+
+    Cached in memory; the underlying CSV is ~300 MB and is parsed once per strategy.
+    """
+    if strategy in _equity_full_cache:
+        return _equity_full_cache[strategy]
+    collated_dir = find_collated_dir(strategy)
+    if collated_dir is None:
+        _equity_full_cache[strategy] = None
+        return None
+    path = collated_dir / "collated_equity_curve.csv"
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        _equity_full_cache[strategy] = None
+        return None
+    if df is None or df.empty:
+        _equity_full_cache[strategy] = None
+        return None
+    for col in ("cash_usd", "unrealized_pnl_usd", "equity_inr",
+                "used_margin_usd", "free_margin_usd"):
+        if col not in df.columns:
+            df[col] = 0.0
+    _equity_full_cache[strategy] = df
+    return df
+
+
+def get_equity_window(strategy: str, target_bars: int, max_points: int = 2048) -> pd.DataFrame | None:
+    """Return the last ``target_bars`` rows of the equity curve, stride-sampled
+    to at most ``max_points`` rows. Suitable for overlaying on the price chart."""
+    full = load_collated_equity_full(strategy)
+    if full is None or full.empty:
+        return None
+    df = full.tail(target_bars) if target_bars < len(full) else full
+    if len(df) > max_points:
+        step = math.ceil(len(df) / max_points)
+        df = df.iloc[::step]
+    return df.reset_index(drop=True)
+
+
+def get_equity_range(strategy: str, start: str = "", end: str = "", max_points: int = 2048) -> pd.DataFrame | None:
+    """Slice the full equity curve to an explicit [start, end] timestamp range
+    (zero-padded ``YYYY-MM-DD HH:MM:SS`` strings compare lexicographically),
+    stride-sampled to at most ``max_points`` rows. Powers chart scrolling."""
+    full = load_collated_equity_full(strategy)
+    if full is None or full.empty or "timestamp" not in full.columns:
+        return None
+    ts = full["timestamp"].astype(str)
+    mask = pd.Series(True, index=full.index)
+    if start:
+        mask &= ts >= start
+    if end:
+        mask &= ts <= end
+    df = full.loc[mask]
+    if df.empty:
+        return None
+    if len(df) > max_points:
+        step = math.ceil(len(df) / max_points)
+        df = df.iloc[::step]
+    return df.reset_index(drop=True)
+
+
+def preload_all() -> dict:
+    """Eagerly load every non-indicator dataset into RAM (OHLCV + per-strategy
+    summaries, trades, full equity curves). Called once at server startup so
+    request latency afterwards is only indicator computation."""
+    import time
+    t0 = time.time()
+    stats: dict = {"strategies": {}}
+    _load_full_ohlcv()
+    for strategy in ("vm", "tv", "trend"):
+        s0 = time.time()
+        try:
+            summary = load_collated_summary(strategy)
+            trades = load_collated_trades(strategy)
+            equity = load_collated_equity_full(strategy)
+            stats["strategies"][strategy] = {
+                "summary": bool(summary),
+                "trades": int(len(trades)) if trades is not None else 0,
+                "equity_rows": int(len(equity)) if equity is not None else 0,
+                "seconds": round(time.time() - s0, 2),
+            }
+        except Exception as e:
+            stats["strategies"][strategy] = {"error": str(e)}
+    stats["seconds"] = round(time.time() - t0, 2)
+    return stats
 
 
 def load_collated_diagnostics(strategy: str) -> dict | None:
@@ -290,51 +415,139 @@ def load_collated_executions(strategy: str) -> pd.DataFrame | None:
     return parse_csv_safe(path)
 
 
+# Time range strings mapped to number of 1-minute bars
+_RANGE_BARS: dict[str, int] = {
+    "1D": 1440,
+    "1W": 10080,
+    "1M": 43200,
+    "3M": 129600,
+    "1Y": 525600,
+}
+
+_TOTAL_ROWS = 4044188
+
+
+def _resolve_chunk_size(range_str: str, chunk_size: int) -> int:
+    """Return the number of bars to load for the given range string.
+
+    When a named range (1D/1W/1M/3M/1Y) is supplied the function returns the
+    corresponding fixed bar count.  "ALL" loads the entire dataset.
+    If *chunk_size* exceeds the fixed range (e.g. range + warmup padding),
+    the larger value is used so callers can request extra rows.
+    """
+    r = range_str.upper().strip()
+    if r == "ALL":
+        return _TOTAL_ROWS
+    fixed = _RANGE_BARS.get(r, chunk_size)
+    return max(fixed, chunk_size)
+
+
 def load_ohlcv(
     start: str = "",
     end: str = "",
     chunk_size: int = 1440,
+    range_str: str = "1M",
 ) -> pd.DataFrame:
     """Load OHLCV data from data.csv with optional time range filter.
-    
-    Uses nrows to avoid reading the full 270MB file.
-    Returns most recent data by default.
+
+    Parameters
+    ----------
+    start / end :
+        Explicit timestamp strings (ISO or epoch).  Takes precedence over
+        *range_str* when either is provided.
+    chunk_size :
+        Maximum rows to return.  Overridden by named ranges.
+    range_str :
+        Short-hand time range (1D, 1W, 1M, 3M, 1Y, ALL).  When explicit
+        *start*/*end* are provided this is ignored.
+
+    Uses ``skiprows`` to avoid reading the full 270 MB file.
+    Returns the most recent bars by default.
     """
     data_path = V6_DIR / "data.csv"
     if not data_path.exists():
         return pd.DataFrame()
 
-    try:
-        if start or end:
-            # Time range specified - read full file then filter
-            df = pd.read_csv(data_path, parse_dates=["timestamp"])
-        else:
-            # No time range - read only the most recent chunk_size rows
-            # Hardcoded total rows (~4M) to skip older rows efficiently
-            df = pd.read_csv(
-                data_path,
-                parse_dates=["timestamp"],
-                skiprows=lambda x: x > 0 and x <= 4044188 - chunk_size
-            )
-    except Exception:
+    # Always use the cached full dataset (warmed at startup). Explicit
+    # start/end windows filter it; named ranges take the tail.
+    df = _load_full_ohlcv()
+
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    if df.empty:
-        return pd.DataFrame()
+    # Explicit timestamp window takes precedence over any named range.
+    # This powers chart scrolling: the frontend requests arbitrary [start, end]
+    # windows and the backend slices the in-RAM dataset (no disk I/O).
+    if start or end:
+        if start:
+            mask = df["timestamp"] >= _parse_time(start)
+            df = df.loc[mask]
+        if end:
+            mask = df["timestamp"] <= _parse_time(end)
+            df = df.loc[mask]
+        if df.empty:
+            return pd.DataFrame()
+        # Safety cap for unbounded windows (route applies its own sampling cap).
+        if len(df) > chunk_size and chunk_size > 0:
+            df = df.tail(chunk_size)
+        return df.reset_index(drop=True)
 
-    # Filter by time range if specified
-    if start:
-        mask = df["timestamp"] >= _parse_time(start)
-        df = df.loc[mask]
-    if end:
-        mask = df["timestamp"] <= _parse_time(end)
-        df = df.loc[mask]
-
+    # For named ranges, return only the last chunk_size rows (the most recent
+    # bars). The caller passes target_bars + warmup as chunk_size.
+    r = range_str.upper().strip()
+    if r in _RANGE_BARS or r == "ALL":
+        if r == "ALL":
+            return df.reset_index(drop=True)
+        return df.tail(chunk_size).reset_index(drop=True)
     return df.head(chunk_size).reset_index(drop=True)
 
 
+def load_ohlcv_window_with_warmup(start: str = "", end: str = "", warmup_bars: int = 200) -> pd.DataFrame:
+    """Load an explicit [start, end] window plus ``warmup_bars`` of history
+    prepended before ``start`` so indicator values are converged at the left
+    edge. Returns the combined frame with a reset index; callers trim the
+    warmup prefix after computing indicators."""
+    full = _load_full_ohlcv()
+    if full is None or full.empty:
+        return pd.DataFrame()
+    ts = full["timestamp"]
+    pos0 = 0
+    pos1 = len(full)
+    if start:
+        try:
+            pos0 = int(ts.searchsorted(pd.Timestamp(_parse_time(start))))
+        except Exception:
+            pos0 = 0
+    if end:
+        try:
+            pos1 = int(ts.searchsorted(pd.Timestamp(_parse_time(end)), side="right"))
+        except Exception:
+            pos1 = len(full)
+    pos0 = max(0, min(pos0, len(full)))
+    pos1 = max(pos0, min(pos1, len(full)))
+    w0 = max(0, pos0 - warmup_bars)
+    return full.iloc[w0:pos1].reset_index(drop=True)
+
+
+def get_data_bounds() -> dict:
+    """Return the full dataset time bounds (for chart scroll clamping)."""
+    full = _load_full_ohlcv()
+    if full is None or full.empty:
+        return {"start": "", "end": "", "total_rows": 0}
+    ts = full["timestamp"]
+    try:
+        s = pd.Timestamp(ts.iloc[0]).strftime("%Y-%m-%d %H:%M:%S")
+        e = pd.Timestamp(ts.iloc[-1]).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        s, e = str(ts.iloc[0]), str(ts.iloc[-1])
+    return {"start": s, "end": e, "total_rows": int(len(full))}
+
+
 def load_all_collated(strategy: str) -> dict | None:
-    """Load all collated data for a strategy in one call."""
+    """Load all collated data for a strategy in one call. Cached after first load."""
+    if strategy in _collated_cache:
+        return _collated_cache[strategy]
+
     summary = load_collated_summary(strategy)
     trades = load_collated_trades(strategy)
     equity = load_collated_equity(strategy)
@@ -346,7 +559,7 @@ def load_all_collated(strategy: str) -> dict | None:
     if summary is None and trades is None:
         return None
 
-    return {
+    result = {
         "summary": summary,
         "trades": trades,
         "equity_curve": equity,
@@ -355,3 +568,5 @@ def load_all_collated(strategy: str) -> dict | None:
         "skipped_signals": skipped,
         "executions": executions,
     }
+    _collated_cache[strategy] = result
+    return result

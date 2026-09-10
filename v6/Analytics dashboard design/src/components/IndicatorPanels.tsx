@@ -10,6 +10,8 @@ interface PanelDef {
 interface Props {
   indicators: Record<string, unknown>;
   strategy: Strategy;
+  timeWindow?: { start: string; end: string; startMs: number; endMs: number } | null;
+  barTimestamps?: string[];
 }
 
 // Extract numeric array from indicator data
@@ -19,7 +21,7 @@ function getArray(ind: Record<string, unknown>, key: string): number[] {
   if (Array.isArray(val)) {
     return val.map((v: unknown) => {
       if (typeof v === "number" && isFinite(v)) return v;
-      return 0;
+      return NaN;
     });
   }
   return [];
@@ -39,8 +41,23 @@ function xscale(i: number, n: number): number {
 
 function Polyline({ data, min, max, color, strokeW = 1 }: { data: number[]; min: number; max: number; color: string; strokeW?: number }) {
   if (!data || data.length === 0) return null;
-  const pts = data.map((v, i) => `${xscale(i, data.length).toFixed(1)},${yscale(v, min, max).toFixed(1)}`).join(' ');
-  return <polyline points={pts} fill="none" stroke={color} strokeWidth={strokeW} />;
+  // Build segments — skip NaN values so warmup periods don't draw through zero
+  const segments: string[] = [];
+  let currentSegment: string[] = [];
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (v == null || !isFinite(v)) {
+      if (currentSegment.length > 0) {
+        segments.push(currentSegment.join(' '));
+        currentSegment = [];
+      }
+    } else {
+      currentSegment.push(`${xscale(i, data.length).toFixed(1)},${yscale(v, min, max).toFixed(1)}`);
+    }
+  }
+  if (currentSegment.length > 0) segments.push(currentSegment.join(' '));
+  if (segments.length === 0) return null;
+  return <polyline points={segments.join(' ')} fill="none" stroke={color} strokeWidth={strokeW} />;
 }
 
 function HBand({ y, label, color }: { y: number; label: string; color: string }) {
@@ -59,11 +76,12 @@ function HistBars({ data, min, max }: { data: number[]; min: number; max: number
   return (
     <>
       {data.map((v, i) => {
+        if (v == null || !isFinite(v)) return null;
         const x = xscale(i, n);
         const bw = Math.max(1, cW / n - 0.5);
         const y = yscale(v, min, max);
         const isPos = v >= 0;
-        const rising = i > 0 ? Math.abs(v) > Math.abs(data[i - 1]) : true;
+        const rising = i > 0 ? Math.abs(v) > Math.abs(data[i - 1] ?? 0) : true;
         const color = isPos
           ? (rising ? '#2ea043' : '#388bfd')
           : (rising ? '#da3633' : '#8b1a1a');
@@ -176,52 +194,53 @@ const TV_PANELS: PanelDef[] = [
         <HBand y={yscale(68, 0, 100)} label="68" color="#da3633" />
         <HBand y={yscale(32, 0, 100)} label="32" color="#2ea043" />
         <HBand y={yscale(50, 0, 100)} label="50" color="#6e7681" />
-        <Polyline data={getArray(ind, "RSI_PL")} min={0} max={100} color="#3fb950" strokeW={1.2} />
-        <Polyline data={getArray(ind, "Signal")} min={-2} max={2} color="#f85149" strokeW={1} />
-        <Polyline data={getArray(ind, "BB_Upper")} min={0} max={100} color="#30363d" />
-        <Polyline data={getArray(ind, "BB_Lower")} min={0} max={100} color="#2ea043" />
-        <Polyline data={getArray(ind, "BB_Mid")} min={0} max={100} color="#6e7681" />
+        <Polyline data={getArray(ind, "RSI")} min={0} max={100} color="#3fb950" strokeW={1.2} />
+        <Polyline data={getArray(ind, "RSI_Signal")} min={0} max={100} color="#f85149" />
+        <Polyline data={getArray(ind, "RSI_Upper")} min={0} max={100} color="#30363d" />
+        <Polyline data={getArray(ind, "RSI_Lower")} min={0} max={100} color="#2ea043" />
       </>
     ),
+  },
+  {
+    id: 'donchian',
+    title: 'Donchian Bands (20)',
+    render: (ind) => {
+      const arr = getArray(ind, "Donchian_High");
+      if (arr.length === 0) {
+        return <GridLines min={0} max={100} />;
+      }
+      const prices = [
+        ...getArray(ind, "Donchian_High"),
+        ...getArray(ind, "Donchian_Low"),
+        ...getArray(ind, "Donchian_Mid"),
+      ];
+      const lo = Math.min(...prices);
+      const hi = Math.max(...prices);
+      const pad = (hi - lo) * 0.05 || 1;
+      return (
+        <>
+          <GridLinesF min={lo - pad} max={hi + pad} ticks={3} />
+          <Polyline data={getArray(ind, "Donchian_High")} min={lo - pad} max={hi + pad} color="#3fb950" strokeW={1.2} />
+          <Polyline data={getArray(ind, "Donchian_Mid")} min={lo - pad} max={hi + pad} color="#6e7681" strokeW={1} />
+          <Polyline data={getArray(ind, "Donchian_Low")} min={lo - pad} max={hi + pad} color="#f85149" strokeW={1.2} />
+        </>
+      );
+    },
   },
   {
     id: 'el_rsi',
     title: 'EL RSI Cross',
-    render: (ind) => (
-      <>
-        <GridLines min={-20} max={20} ticks={3} />
-        <line x1={PL} y1={yscale(0, -20, 20)} x2={IW - PR} y2={yscale(0, -20, 20)} stroke="#30363d" strokeWidth="1" />
-        <Polyline data={getArray(ind, "RSI2")} min={-20} max={20} color="#58a6ff" strokeW={1.2} />
-        <Polyline data={getArray(ind, "RSI3")} min={-20} max={20} color="#d29922" strokeW={1} />
-      </>
-    ),
-  },
-  {
-    id: 'rsi_821',
-    title: 'RSI 8-21',
-    render: (ind) => (
-      <>
-        <GridLines min={0} max={100} />
-        <HBand y={yscale(50, 0, 100)} label="50" color="#6e7681" />
-        <Polyline data={getArray(ind, "RSI")} min={0} max={100} color="#3fb950" strokeW={1.2} />
-        <Polyline data={getArray(ind, "MA21_RSI")} min={0} max={100} color="#f85149" strokeW={1} />
-        <Polyline data={getArray(ind, "MA8_RSI")} min={0} max={100} color="#3fb950" strokeW={1.5} />
-        <Polyline data={getArray(ind, "MA21_RSI")} min={0} max={100} color="#f85149" strokeW={1.5} />
-      </>
-    ),
-  },
-  {
-    id: 'bbbo',
-    title: 'BBBO Oscillator',
     render: (ind) => {
-      const min = -3, max = 3;
+      const cross = getArray(ind, "Cross");
+      if (cross.length === 0) return <GridLines min={-20} max={20} ticks={3} />;
+      const finite = cross.filter((v) => isFinite(v));
+      if (finite.length === 0) return <GridLines min={-20} max={20} ticks={3} />;
+      const m = Math.max(Math.abs(Math.min(...finite)), Math.abs(Math.max(...finite)), 1);
       return (
         <>
-          <GridLinesF min={min} max={max} ticks={4} />
-          <line x1={PL} y1={yscale(0, min, max)} x2={IW - PR} y2={yscale(0, min, max)} stroke="#30363d" strokeWidth="1" />
-          <Polyline data={getArray(ind, "bbbo_upper")} min={min} max={max} color="#30363d" />
-          <Polyline data={getArray(ind, "bbbo_lower")} min={min} max={max} color="#30363d" />
-          <Polyline data={getArray(ind, "bbboOsc")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
+          <GridLines min={-m} max={m} ticks={3} />
+          <line x1={PL} y1={yscale(0, -m, m)} x2={IW - PR} y2={yscale(0, -m, m)} stroke="#30363d" strokeWidth="1" />
+          <Polyline data={getArray(ind, "Cross")} min={-m} max={m} color="#58a6ff" strokeW={1.2} />
         </>
       );
     },
@@ -242,15 +261,20 @@ const TREND_PANELS: PanelDef[] = [
   },
   {
     id: 'tsm',
-    title: 'Time-Series Momentum',
+    title: 'Time-Series Momentum (20-bar slope)',
     render: (ind) => {
-      const min = -0.5, max = 0.5;
+      const tsm = getArray(ind, "TSM");
+      const sig = getArray(ind, "TSM_Signal");
+      if (tsm.length === 0) return <GridLinesF min={-0.5} max={0.5} ticks={4} />;
+      const all = [...tsm, ...sig].filter((v) => isFinite(v));
+      if (all.length === 0) return <GridLinesF min={-0.5} max={0.5} ticks={4} />;
+      const m = Math.max(Math.abs(Math.min(...all)), Math.abs(Math.max(...all)), 0.001) * 1.1;
       return (
         <>
-          <GridLinesF min={min} max={max} ticks={4} />
-          <line x1={PL} y1={yscale(0, min, max)} x2={IW - PR} y2={yscale(0, min, max)} stroke="#30363d" strokeWidth="1" />
-          <Polyline data={getArray(ind, "tsmFast")} min={min} max={max} color="#58a6ff" strokeW={1.2} />
-          <Polyline data={getArray(ind, "tsmComposite")} min={min} max={max} color="#e6edf3" strokeW={1.5} />
+          <GridLinesF min={-m} max={m} ticks={4} />
+          <line x1={PL} y1={yscale(0, -m, m)} x2={IW - PR} y2={yscale(0, -m, m)} stroke="#30363d" strokeWidth="1" />
+          <Polyline data={tsm} min={-m} max={m} color="#58a6ff" strokeW={1.2} />
+          <Polyline data={sig} min={-m} max={m} color="#e6edf3" strokeW={1.5} />
         </>
       );
     },
@@ -276,10 +300,9 @@ const LEGENDS: Record<string, React.ReactNode> = {
   cyclic_rsi: <><LegendDot color="#58a6ff" label="CRSI" /><LegendDot color="#da3633" label="Upper" /><LegendDot color="#2ea043" label="Lower" /></>,
   multi_rsi: <><LegendDot color="#58a6ff" label="RSI1" /><LegendDot color="#a371f7" label="RSI2" /></>,
   stoch_macd: <><LegendDot color="#e6edf3" label="Fast" /><LegendDot color="#f0883e" label="Sig Fast" /><LegendDot color="#58a6ff" label="Slow" /><LegendDot color="#a371f7" label="Sig Slow" /></>,
-  tdi: <><LegendDot color="#3fb950" label="RSI_PL" /><LegendDot color="#f85149" label="Signal" /></>,
-  el_rsi: <><LegendDot color="#58a6ff" label="RSI2" /><LegendDot color="#d29922" label="RSI3" /></>,
-  rsi_821: <><LegendDot color="#3fb950" label="RSI 8" /><LegendDot color="#f85149" label="RSI 21" /></>,
-  bbbo: <><LegendDot color="#58a6ff" label="Osc" /></>,
+  tdi: <><LegendDot color="#3fb950" label="RSI" /><LegendDot color="#f85149" label="RSI Sig" /><LegendDot color="#30363d" label="BB Hi" /><LegendDot color="#2ea043" label="BB Lo" /></>,
+  donchian: <><LegendDot color="#3fb950" label="High" /><LegendDot color="#6e7681" label="Mid" /><LegendDot color="#f85149" label="Low" /></>,
+  el_rsi: <><LegendDot color="#58a6ff" label="Cross" /></>,
   er: <><LegendDot color="#3fb950" label="ER" /></>,
   tsm: <><LegendDot color="#58a6ff" label="TSM" /><LegendDot color="#e6edf3" label="Signal" /></>,
 };

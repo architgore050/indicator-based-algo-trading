@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { Trade, TradeFilters, ExitReason } from '../types';
 
 interface Props {
@@ -7,6 +7,8 @@ interface Props {
   onSelectTrade: (id: number) => void;
   filters: TradeFilters;
   setFilters: (f: TradeFilters) => void;
+  visibleTradeIds?: Set<number>;
+  timeWindow?: { start: string; end: string; startMs: number; endMs: number } | null;
 }
 
 function ExitBadge({ reason }: { reason: ExitReason }) {
@@ -19,7 +21,7 @@ function ExitBadge({ reason }: { reason: ExitReason }) {
 
 const EXIT_REASONS: Array<'All' | ExitReason> = ['All', 'TP', 'SL', 'TSL', 'MaxHold', 'Strategy', 'MarginCall', 'Forced'];
 
-export default function TradeLog({ trades, selectedTradeId, onSelectTrade, filters, setFilters }: Props) {
+export default function TradeLog({ trades, selectedTradeId, onSelectTrade, filters, setFilters, visibleTradeIds, timeWindow }: Props) {
   const [sortBy, setSortBy] = useState<string>('id');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
@@ -49,6 +51,24 @@ export default function TradeLog({ trades, selectedTradeId, onSelectTrade, filte
     }
     return sortDir === 'asc' ? va - vb : vb - va;
   });
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const lastWindowKeyRef = useRef<string>("");
+  useEffect(() => {
+    if (!timeWindow || !visibleTradeIds || visibleTradeIds.size === 0) return;
+    const key = `${timeWindow.start}|${timeWindow.end}`;
+    if (lastWindowKeyRef.current === key) return;
+    lastWindowKeyRef.current = key;
+    const el = scrollRef.current;
+    if (!el) return;
+    const firstVisible = sorted.find((t) => visibleTradeIds.has(t.id));
+    if (!firstVisible) return;
+    const row = el.querySelector(`[data-trade-id="${firstVisible.id}"]`) as HTMLElement | null;
+    if (row) {
+      // Defer to after paint so the row exists.
+      requestAnimationFrame(() => row.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+    }
+  }, [timeWindow, visibleTradeIds, sorted]);
 
   const setSort = (key: string) => {
     if (sortBy === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -177,7 +197,7 @@ export default function TradeLog({ trades, selectedTradeId, onSelectTrade, filte
       </div>
 
       {/* Table */}
-      <div className="flex-1 overflow-y-auto overflow-x-auto">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-auto">
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
           <thead>
             <tr>
@@ -199,15 +219,17 @@ export default function TradeLog({ trades, selectedTradeId, onSelectTrade, filte
           <tbody>
             {sorted.map(t => {
               const isSelected = t.id === selectedTradeId;
+              const isVisible = visibleTradeIds?.has(t.id) ?? false;
               const pnlColor = t.netPnl > 0 ? '#3fb950' : t.netPnl < 0 ? '#f85149' : '#8b949e';
               return (
                 <tr
                   key={t.id}
+                  data-trade-id={t.id}
                   onClick={() => onSelectTrade(t.id)}
                   style={{
                     cursor: 'pointer',
-                    background: isSelected ? 'rgba(88, 166, 255, 0.08)' : 'transparent',
-                    borderLeft: isSelected ? '2px solid #58a6ff' : '2px solid transparent',
+                    background: isSelected ? 'rgba(88, 166, 255, 0.10)' : isVisible ? 'rgba(63, 185, 80, 0.07)' : 'transparent',
+                    borderLeft: isSelected ? '2px solid #58a6ff' : isVisible ? '2px solid rgba(63,185,80,0.5)' : '2px solid transparent',
                   }}
                   onMouseEnter={e => {
                     if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.02)';
