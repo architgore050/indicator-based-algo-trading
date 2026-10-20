@@ -17,9 +17,11 @@ joblib>=1.3
 # Data download utility
 dukascopy-python>=0.1
 
-# GPU acceleration — only available in rapids conda environment (WSL)
-# Install via: conda install -c rapidsai -c nvidia -c conda-forge cudf cupy=12.0
-# Do NOT pip install these outside the rapids env
+# GPU acceleration — RAPIDS pip wheels (native Linux venv)
+# Install via: pip install cupy-cuda12x cudf-cu12 --extra-index-url https://pypi.nvidia.com
+
+# Optuna PostgreSQL storage
+psycopg2-binary>=2.9
 
 # Analytics dashboard backend (FastAPI)
 fastapi>=0.104
