@@ -15,6 +15,10 @@ optuna_db/
 *.log
 *_smoke.csv
 v6/output.txt
+output_*.txt
+collated_wfv_results*/
+backtest_report_*/
+v6/v6/
 
 # IDE
 .vscode/
