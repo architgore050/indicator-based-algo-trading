@@ -27,16 +27,11 @@ suppress_pandas_warnings()
 def get_env_activation():
     """Return environment activation prefix for subprocesses.
 
-    When running inside WSL (already in rapids env): return "" — subprocesses inherit the environment.
+    When running on Linux (native or WSL, already in rapids env): return "" — subprocesses inherit the environment.
     When running on Windows: return the wsl bash -c wrapper.
     """
-    if os.path.exists("/proc/version"):
-        try:
-            with open("/proc/version", "r") as f:
-                if "microsoft" in f.read().lower():
-                    return ""  # Already in WSL + rapids, no activation needed
-        except Exception:
-            pass
+    if sys.platform.startswith("linux"):
+        return ""  # Native Linux or WSL + rapids, no activation needed
     return 'wsl bash -c "cd /mnt/c/Users/gorea/Desktop/indicator\\\\ based\\\\ algo\\\\ trading/indicator\\\\ based\\\\ algo\\\\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && '
 
 

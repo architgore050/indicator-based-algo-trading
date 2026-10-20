@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from dukascopy_python import fetch as get_price
 import dukascopy_python
 
-OUTPUT_FILE = r"C:\Users\Archit Gore\Desktop\indicator based algo trading\v2\data.csv"
+OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.csv")
 INSTRUMENT = "XAU/USD"
 CHUNK_DAYS = 7   # fetch 1 week at a time
 OFFER_SIDE = "mid"  # or "ask", "mid"
