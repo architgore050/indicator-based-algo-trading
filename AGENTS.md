@@ -12,7 +12,7 @@ This is an XAUUSD (Gold) high-performance algorithmic trading system (v6 — onl
 - **CAGR is king.** Sharpe (>1.0) and Calmar (>0.5) are hard constraint penalties, not primary objectives.
 
 ## Hardware Context
-The system runs on an RTX 5080 Laptop (MSI Anti-Thermal) with CUDA 12.9 via WSL Ubuntu. The CPU is an Intel Core Ultra 9 275HX (24 cores). 32 GB DDR5 RAM. NVMe SSD storage.
+The system runs natively on Ubuntu 24.04 (dual-boot — the old WSL setup is retired) on an MSI Vector 16 HX: RTX 5080 Laptop GPU (MSI Anti-Thermal), NVIDIA driver 580 (CUDA 13.0-capable; RAPIDS runs the CUDA 12.9 wheel stack), Intel Core Ultra 9 275HX (24 cores), 32 GB DDR5 RAM, NVMe SSD storage. The project lives on the mounted NTFS partition (`/media/archit-gore/Windows/...`); the Python venv lives on native ext4 (`~/venvs/rapids`).
 
 Key characteristics that influence design decisions:
 - **Sustained boost clocks** — the cooling system does not thermal throttle, so long WFV runs can push hardware continuously without degradation concerns.
@@ -33,6 +33,7 @@ The active codebase lives in `v6/`. It consists of:
 | **Signal Generation** | `generate_vm_automation_logic_signals.py`, `generate_tv_strategy1_signals.py`, `generate_trend_following_signals.py` | Produce window-specific signal CSVs from calibrated parameters. All GPU-native. |
 | **Backtesting** | `backtest_xauusd_signal_csv.py` | Simulate trades on generated signals. 305-820% speedup over pandas baseline. All GPU-native. |
 | **Collation** | `collate_wfv_results.py` | Aggregate WFV results across windows |
+| **Analytics Dashboard** | `backend/`, `Analytics dashboard design/` | FastAPI backend + React frontend for WFV/backtest result visualization (WIP) |
 | **Utilities** | `logging_utils.py`, `data_download.py` | Structured logging, 1-minute XAUUSD data ingestion |
 | **Validation** | `parity_maintenance/` | All parity tests and `.bak` backups. Contains: `parity_test_definitions.py`, `parity_test_gpu_io.py`, `parity_test_backtesting.py`, `parity_test_optuna_calibrate.py`, and 8 `.bak` files. |
 | **Configuration** | `config.json`, `best_manual_params_vm.json`, `calibration_results_vm.json` | Baseline parameters (DO NOT MODIFY), manual tuning reference, calibration overrides |
@@ -71,7 +72,7 @@ All legacy version directories (v2–v5) have been removed. Only `v6/` remains a
 
 All subagents MUST read AGENTS.md before starting work. It contains essential project context including:
 - Project vision and design philosophy
-- Hardware context (RTX 5080, CUDA 12.9, WSL)
+- Hardware context (RTX 5080, CUDA 12.9, native Ubuntu 24.04)
 - Architecture overview (v6/ structure)
 - Critical operational rules (headless execution, cudf inspection, vectorization)
 - Developer commands (smoke test commands)
@@ -100,59 +101,73 @@ When running any script:
 5. Check tail of output for completion messages
 6. Clean up temp files after testing
 
-## MANDATORY: WSL + RAPIDS Execution
+## MANDATORY: Native Linux + RAPIDS Execution
 
-**Every Python script that uses GPU/cudf/cupy MUST be run through WSL with the rapids conda environment activated. None of the scripts will work without this.** This is NOT optional. This is NOT a suggestion. This is a hard requirement for ALL GPU-related scripts.
+**The project runs natively on Ubuntu 24.04 — WSL and conda are retired. Every Python script that uses GPU/cudf/cupy MUST be run inside the `~/venvs/rapids` virtualenv.** This is NOT optional. This is NOT a suggestion. This is a hard requirement for ALL GPU-related scripts.
 
 ### Correct Execution Format
 
-**Use SINGLE quotes `'...'` around the entire WSL command. Double quotes `"` cause PowerShell quoting issues.**
-
-```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
+```bash
+cd "/media/archit-gore/Windows/Users/gorea/Desktop/indicator based algo trading/indicator based algo trading/v6"
+source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+python your_script.py
 ```
 
 ### Component Breakdown
 
 | Component | Purpose |
 |---|---|
-| `wsl bash -c "..."` | Runs the entire command inside WSL Ubuntu, not Windows PowerShell |
-| `cd /mnt/c/...` | Mounts the Windows filesystem path into WSL's `/mnt/c/` namespace |
-| `source ...conda.sh && conda activate rapids` | Activates the RAPIDS conda environment containing cudf, cupy, and all CUDA dependencies |
+| `source ~/venvs/rapids/bin/activate` | Activates the venv containing cudf 25.12, cupy, optuna, pandas 2.3.3, and all CUDA deps (RAPIDS pip wheels from pypi.nvidia.com, venv lives on native ext4) |
+| `unset PYTHONPATH` | The shell exports a ROS jazzy `PYTHONPATH` that leaks into every Python process and can shadow venv packages — always clear it before pipeline runs |
 | `python your_script.py` | Runs the target script with GPU support enabled |
 
-### What Does NOT Need WSL Wrapping
+### PostgreSQL Dependency
 
-**All other tool calls run natively in PowerShell. Do NOT wrap them in `wsl bash -c`.**
+The Optuna calibrators (`optuna_calibrate_*.py`) connect to `postgresql://gorea@localhost/optuna_db` (hardcoded, trust auth on localhost). PostgreSQL must be installed via apt and running, with role `gorea` and database `optuna_db`, before any calibration or orchestrator run.
 
-File operations (`read`, `edit`, `write`, `glob`, `grep`), syntax checks (`py_compile`), git operations, and any non-GPU Python script should execute directly without WSL. WSL/conda/rapids is ONLY needed when running Python scripts that import `cudf`, `cupy`, or other GPU libraries. Wrapping file operations in WSL adds unnecessary overhead and is a common mistake.
+### What Does NOT Need the Venv
+
+File operations (`read`, `edit`, `write`, `glob`, `grep`), syntax checks (`py_compile`), and git operations run natively without activating anything. Do not wrap them in venv activation.
 
 ### Consequences of NOT Using This Format
 
-- **Scripts crash with CUDA/context errors** — `cupy` and `cudf` cannot initialize without the rapids environment's CUDA libraries. The script will fail with a hard error.
-- **No silent fallback** — the dual-path pandas/cudf dispatch was removed during migration. There is no CPU fallback. If the rapids env isn't activated, the script simply won't run.
+- **Scripts crash with CUDA/context errors** — `cupy` and `cudf` cannot initialize without the venv's CUDA libraries. The script will fail with a hard error.
+- **No silent fallback** — the dual-path pandas/cudf dispatch was removed during migration. There is no CPU fallback. If the venv isn't activated, the script simply won't run.
+- **ROS PYTHONPATH pollution** — skipping `unset PYTHONPATH` risks importing ROS jazzy site-packages instead of venv packages.
 
 ### Test Output Convention
 
-When orchestrator smoke tests are run, capture and save their output to `docs/test.txt` for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal.
+When orchestrator smoke tests are run, capture and save their output to `docs/test.txt` (repo root) for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal.
 
-Example:
-```powershell
-wsl bash -c "cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python orchestrate_calibration.py --strategy vm --smoke" > docs/test.txt 2>&1
+Example (from `v6/`):
+```bash
+python orchestrate_calibration.py --strategy vm --smoke > ../docs/test.txt 2>&1
 ```
 
 ## Critical Operational Rules
-- **Headless execution:** Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless WSL.
-- **cudf inspection:** Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
+- **Headless execution:** Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless Linux.
+- **cudf inspection:** Never print or inspect cudf DataFrames directly in the terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
 - **Vectorization:** Use pandas/numpy/cudf vectorized operations exclusively; NEVER use loops over data rows for indicator calculations.
 - **Protected files:** Do NOT delete testing scripts (`*test*.py`, `*_signals_test.csv`), backups (`.bak`/`.backup` files). `.bak` files are specifically required for parity testing scripts at runtime. These are critical for validation.
+
+## Commit Protocol
+NEVER commit or push without an explicit user request. When a commit is requested, follow this sequence:
+
+1. **`git status`** — review every modified, staged, and untracked file before touching anything.
+2. **Cyber & leaks check (when required)** — scan the content being committed for secrets: tokens (`ghp_`, `github_pat_`, API keys), passwords, `.env` files, personal data. Credential files (e.g., `~/.git-credentials`) live outside the repo and must never be staged. If a secret is found, stop and report — do not commit.
+3. **`.gitignore` edits if required** — generated run outputs, large data files, junk directories, and internal AI docs must not enter the repo. Update `.gitignore` before staging when new artifact types appear.
+4. **`git add`** — stage only the intended files. Never stage secrets, generated outputs, or untracked junk.
+5. **`git commit`** — concise lowercase message matching the existing repo style, describing what changed and why.
+6. **`git push`** — only when the user requests it.
+
+GitHub auth is pre-configured globally (`credential.helper=store`, `~/.git-credentials`, identity `architgore050`) — `git pull`/`git push` work without further authentication setup.
 
 ## Orchestrator Behavior — Subagent Delegation
 When given a multi-part task, delegate subtasks to parallel subagents rather than doing them yourself:
 
 - Break complex tasks into independent subtasks and launch multiple subagents in parallel via the `task` tool.
 - Each subagent should have a clear, self-contained scope (e.g., "GPU dispatch in definitions.py", "Remove skip-stable regime logic from orchestrate_calibration.py").
-- Subagents must follow all WSL/cudf/protected-files rules documented here — include them in each subagent's prompt.
+- Subagents must follow all Linux/venv/cudf/protected-files rules documented here — include them in each subagent's prompt.
 - Review subagent results after completion; only then proceed with integration or verification.
 
 ## MANDATORY: Single Subagent Execution
@@ -171,37 +186,37 @@ When given a multi-part task, delegate subtasks to parallel subagents rather tha
 *Run these from the `v6/` directory.*
 
 ### WFV Pipeline (Orchestrator)
-```powershell
+```bash
 python orchestrate_calibration.py --strategy vm --smoke
 ```
 
 ### SOTA Calibration (Optuna & Parallelization)
-```powershell
+```bash
 python optuna_calibrate_vm.py --smoke --start-row 2999000 --end-row 3000000
 ```
 
 ### Signal Generation
-```powershell
+```bash
 python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 --end-row 3043200
 ```
 
 ### Backtesting
-```powershell
+```bash
 python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results
 ```
 
 ### Trend Strategy — Calibration
-```powershell
+```bash
 python optuna_calibrate_trend.py --smoke --start-row 2999000 --end-row 3000000
 ```
 
 ### Trend Strategy — Signal Generation
-```powershell
+```bash
 python generate_trend_following_signals.py --mode test --start-row 3000000 --end-row 3043200
 ```
 
 ### Trend Strategy — WFV Pipeline
-```powershell
+```bash
 python orchestrate_calibration.py --strategy trend --smoke
 ```
 
@@ -224,9 +239,9 @@ Function signatures are preserved for consumer scripts.
 
 ### Algorithmic Soundness by Component
 - **Indicator Engine (`definitions.py`):** Fully vectorized. All 20 indicator functions use numpy/pandas/cudf vectorized operations. No row-by-row loops. GPU dispatch via `_use_gpu()` auto-selects cupy path.
-- **Signal Generation (`generate_*_signals.py`):** State machine loop replaced with sparse event iteration — `np.where(has_event)[0]` reduces iterations from O(n) to O(events) where events are typically 0.1-1% of bars. Reasons pre-computed via numpy column_stack. Remaining loop is fundamentally sequential (position at t depends on position at t-1) but over sparse events only. GPU data loading available via `--gpu` flag.
+- **Signal Generation (`generate_*_signals.py`):** State machine loop replaced with sparse event iteration — `np.where(has_event)[0]` reduces iterations from O(n) to O(events) where events are typically 0.1-1% of bars. Reasons pre-computed via numpy column_stack. Remaining loop is fundamentally sequential (position at t depends on position at t-1) but over sparse events only.
 - **Backtesting (`backtest_xauusd_signal_csv.py`):** Per-bar state machine loop with sequential equity compounding. Numeric data (OHLCV) pre-extracted to cupy arrays before the loop. Timestamps remain as numpy (cupy doesn't support datetime64). The sequential loop remains — trade-level vectorization is the next optimization target. See `docs/gpu_migration/M09_backtest_migration.md`.
-- **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with RAM-based worker limits. Optuna studies run fully in-memory (SQLite RDBStorage disabled 2026-08-24 — caused `database is locked` crashes; per-process DB files were write-only). One study object is shared across phases to preserve cross-phase TPE history and enqueued warm-starts. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
+- **Calibration (`orchestrate_calibration.py`, `optuna_calibrate_*.py`):** Parallel WFV with RAM-based worker limits. Optuna studies use PostgreSQL RDBStorage (`postgresql://gorea@localhost/optuna_db`, Unix socket, trust auth) with PID/UUID-based study names and `load_if_exists=True`. History: SQLite RDBStorage on 9p-mounted NTFS caused `database is locked` crashes (removed 2026-08-24); SQLite on native ext4 worked (2026-08-26); consolidated onto a single PostgreSQL server after the move to native Linux. One study object is shared across phases to preserve cross-phase TPE history and enqueued warm-starts. Sequential Optuna Bayesian optimization remains — search space reduction (Task 4.4) is the next optimization target.
 
 ### Configuration Management
 - `config.json` holds baseline parameters consumed by all scripts. **DO NOT MODIFY without explicit developer approval.** Contains delicately tuned values from months of manual experimentation. If a subagent determines that a task is best solved through config changes, it should do nothing and report back rather than making changes.
@@ -242,6 +257,7 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
 - **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
 - **Phase 4 (Algorithmic Optimization):** COMPLETE — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. Backtester numeric arrays converted to cupy (M09), 305-820% speedup. All dual-path code removed (~560 lines). GPU migration complete (M14). Backtesting loop-breaking and Optuna search space reduction remain as next targets.
+- **Environment (2026-10):** Migrated from WSL+conda to native Ubuntu 24.04 dual-boot — RAPIDS via pip wheels in `~/venvs/rapids` (ext4), project on mounted NTFS, Optuna storage on PostgreSQL (`optuna_db`), ROS `PYTHONPATH` must be unset before runs.
 
 ## Active Issues from External Review
 
@@ -329,6 +345,9 @@ AGENTS.md and skills are living documents. They must stay current — stale docu
 | Skill | File | Purpose |
 |---|---|---|
 | Code Context Diagnosis | `diagnose_code_context.md` | Structured approach for understanding code changes before implementing — trace references, map dependencies, identify hidden patterns, report findings, wait for approval. |
+| Orchestration | `orchestration_skill.md` | Orchestrating multi-step tasks — subagent delegation, orchestrator-as-delegator principles, context engineering, common bugs, self-organization. |
+| Testing | `testing_skill.md` | Mandatory smoke/parity test procedures, error-pattern search, output verification, recursive bug fixing, cleanup. |
+| Diagnosis | `diagnosis_skill.md` | Diagnostic thinking methodology — root cause investigation and design critique when pipeline behavior is unexpected. |
 
 ### File structure tracking:
 - The Project Architecture table must always reflect the actual file layout.
@@ -348,11 +367,12 @@ AGENTS.md and skills are living documents. They must stay current — stale docu
 This section captures lessons learned from actual implementation experience. It simulates agentic learning — like how humans learn from mistakes and successes — so future decisions are informed by past reality rather than theoretical assumptions.
 
 ### Tool Usage & Environment
-- **cudf DataFrames cannot be printed directly in WSL.** Attempting to do so hangs or crashes the terminal. Always convert via `pdf = df.to_pandas()` first, then inspect the pandas variable. This is a hard constraint, not a suggestion.
-- **WSL bash commands must activate conda explicitly.** Every GPU-invoking command needs `source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids` before any Python call. Skipping this causes "module not found" errors for cudf/cupy.
+- **cudf DataFrames cannot be printed directly in the terminal.** Attempting to do so hangs or crashes the terminal. Always convert via `pdf = df.to_pandas()` first, then inspect the pandas variable. This is a hard constraint, not a suggestion.
+- **GPU commands must activate the venv explicitly.** Every GPU-invoking command needs `source ~/venvs/rapids/bin/activate && unset PYTHONPATH` before any Python call. Skipping this causes "module not found" errors for cudf/cupy. (The old WSL + miniconda activation is retired.)
 - **Parallel WFV workers writing to shared files cause JSONDecodeError.** Non-atomic writes (direct `shutil.copy` or `json.dump`) race between processes. Use atomic writes: write to a temp file first, then `os.replace()` to the target path. This pattern was applied in `orchestrate_calibration.py`.
 - **SQLite/Alembic race condition in parallel Optuna workers.** When multiple WFV workers start within the same second, they get identical DB filenames from `datetime.now()`, causing UNIQUE constraint failures. Fix: use PID + UUID for per-process uniqueness.
 - **Optuna SQLite storage removed entirely (2026-08-24).** Even with unique per-process DB filenames, RDBStorage on the 9p-mounted `/mnt/c` NTFS caused `database is locked` crashes (2 annual windows lost in one full run; 38 absorbed retries). DB audit proved the files were write-only — nothing ever loaded them. Fix: `storage=None` (in-memory) with ONE study object created in `main()` and passed to all phases; creating a fresh study per phase would silently discard cross-phase TPE history and enqueued warm-starts. The old `v6/optuna_db/` directory is dead weight pending cleanup decision.
+- **Optuna storage is now PostgreSQL (native Linux, post-migration).** All three calibrators connect to `postgresql://gorea@localhost/optuna_db` via Unix socket with trust auth (role `gorea`, db `optuna_db`, installed via apt). Study names are PID/UUID-based with `load_if_exists=True` to avoid `DuplicatedStudyError`. `psycopg2-binary` is in requirements.txt. PostgreSQL must be running before any calibration or orchestrator run.
 
 ### Design Philosophy & Architecture Decisions
 - **"Recalibrate only on degradation" is a trap.** It was implemented as a speed optimization but creates fragile state dependencies (shared files, race conditions, conditional logic that breaks when windows finish out of order). The correct approach: always recalibrate every window. The computational cost is real; the shortcut costs more in bugs and maintenance.
@@ -377,18 +397,18 @@ This section captures lessons learned from actual implementation experience. It 
 - **Converting cudf→pandas requires an active CUDA context.** If the CUDA context is unavailable (e.g., in certain test environments), `cudf.DataFrame.to_pandas()` will fail. Prefer extracting data directly from pandas when the input is already a pandas DataFrame.
 
 ### Subagent Execution & Testing
-- **Subagents cannot run long pipelines (orchestrator) reliably.** The orchestrator spawns subprocesses that inherit the parent environment. When running inside WSL with rapids already activated, subprocesses do NOT need `wsl bash -c` wrapping — they inherit the environment. Wrapping in `bash -c` creates nested WSL calls that fail with exit code 2. Fix: `get_env_activation()` returns `""` when inside WSL, full `wsl bash -c "..."` wrapper only when on Windows.
+- **Subagents cannot run long pipelines (orchestrator) reliably.** The orchestrator spawns subprocesses that inherit the parent environment. On native Linux with the venv activated, subprocesses need NO wrapping — they inherit the environment. `get_env_activation()` returns `""` on Linux; the old `wsl bash -c "..."` wrapper (retired) created nested WSL calls that failed with exit code 2.
 - **Shell quoting bugs in subprocess commands cause silent failures.** An unclosed `bash -c "..."` string or trailing space in `env_activation` causes subprocesses to drop into a REPL (`>>>`) or exit with status 2. Always verify the constructed command string before declaring tests pass.
-- **`/bin/sh` (dash) does not support `source`.** When wrapping conda activation in `bash -c`, always use `bash -c "source ..."` not just `source ...` — the default shell on many systems is dash, not bash.
+- **`/bin/sh` (dash) does not support `source`.** When wrapping shell activation in `bash -c`, always use `bash -c "source ..."` not just `source ...` — the default shell on many systems is dash, not bash.
 - **Subagents must NOT return work as "done" based on syntax checks alone.** Syntax OK is not sufficient. Every subagent must run smoke tests, save output to `docs/test.txt`, search it for errors, read the top AND bottom of the output file, and verify the file has content. A subagent that only runs `py_compile` has not done its job.
 - **Smoke tests must use ≥1 year of data.** Tiny smoke windows (e.g., 50K rows) can produce 0 trades, which means parity tests pass trivially without verifying any trading logic. Use at least 1 year of data (525,600+ bars for 1-minute data) to ensure meaningful test coverage.
-- **WSL output capture must use `2>&1`.** When redirecting output to a file, use `> docs/test.txt 2>&1` to capture both stdout and stderr. Without `2>&1`, errors go to stderr and the captured file appears clean while the script actually failed.
-- **cudf.to_pandas() segfaults in some WSL environments.** Use `cudf.to_arrow().to_pandas()` as a bridge when `to_pandas()` fails. This is a known workaround for cudf/numba CUDA context incompatibility in certain WSL setups.
+- **Output capture must use `2>&1`.** When redirecting output to a file, use `> docs/test.txt 2>&1` to capture both stdout and stderr. Without `2>&1`, errors go to stderr and the captured file appears clean while the script actually failed.
+- **cudf.to_pandas() segfaulted in some WSL environments (historical).** The `cudf.to_arrow().to_pandas()` bridge is still used defensively in `definitions.py` and `gpu_io.py`.
 - **`.view("int64")` does not work on cudf Series.** Use `.astype("int64")` instead. This is a cudf API difference from pandas.
-- **Subagents cannot access the bash tool correctly on Windows.** The `bash` tool runs PowerShell, not bash. For WSL commands, always use `wsl bash -c '...'` format with single quotes around the entire command. Double quotes cause PowerShell quoting issues.
+- **Subagents cannot access the bash tool correctly on Windows.** The `bash` tool runs PowerShell, not bash. For WSL commands, always use `wsl bash -c '...'` format with single quotes around the entire command. Double quotes cause PowerShell quoting issues. (Retired with the move to native Linux — the `bash` tool now runs real bash.)
 - **Test files from parity testing must be organized.** All parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`. Stray `*test*.py` and `*_bak.py` files in the v6 root are stale and should be cleaned up.
-- **The orchestrator runs inside WSL but spawns subprocesses.** These subprocesses inherit the parent's environment (including cudf/cupy availability). Do NOT wrap them in `wsl bash -c` when the orchestrator is already running inside WSL — the nested WSL call fails.
-- **Every subagent must read AGENTS.md.** It contains essential project context including file structure, WSL execution format, parity testing requirements, and design philosophy. Not reading it leads to broken assumptions and wasted effort.
+- **The orchestrator runs natively on Linux but spawns subprocesses.** These subprocesses inherit the parent's environment (including cudf/cupy availability). Do NOT wrap them in nested shell activation commands.
+- **Every subagent must read AGENTS.md.** It contains essential project context including file structure, Linux/venv execution format, parity testing requirements, and design philosophy. Not reading it leads to broken assumptions and wasted effort.
 
 ### WFV Restructuring (2026-08-26)
 - **Optuna SQLite `DuplicatedStudyError` on repeated runs.** When reusing the same study name with `storage=sqlite://...`, Optuna raises `DuplicatedStudyError`. Fix: use PID+UUID for unique study names + `load_if_exists=True`. This was the first SQLite re-introduction attempt after the 2026-08-24 removal.
@@ -407,4 +427,4 @@ This section captures lessons learned from actual implementation experience. It 
 - **Record new lessons in Experience Learning.** Every bug fix, design decision, or tool usage lesson should be recorded for future reference.
 
 ---
-*Last updated: 2026-08-30 — Trend-following / time-series momentum strategy added (3 new indicators, signal generator, calibrator, orchestrator integration). All parity tests pass. See docs/trend_strategy_implementation.md.*
+*Last updated: 2026-10-20 — Linux environment migration docs completed (WSL/conda references retired, venv + PostgreSQL execution documented, skills index refreshed, analytics dashboard added to architecture table).*

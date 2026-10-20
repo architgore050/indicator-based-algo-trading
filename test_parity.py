@@ -1,5 +1,6 @@
 import sys
-sys.path.insert(0, "/mnt/c/Users/gorea/Desktop/indicator based algo trading/indicator based algo trading/v6")
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'v6'))
 import numpy as np
 import pandas as pd
 

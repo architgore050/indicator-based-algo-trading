@@ -25,9 +25,9 @@ Two bottlenecks:
 
 ## Hardware
 This is the hardware this project was built on
-- NVIDIA RTX 5080 (via WSL Ubuntu, CUDA 12.9)
-- Intel Ultra 9 CPU
-- Conda `rapids` environment for GPU libraries
+- NVIDIA RTX 5080 Laptop (native Ubuntu 24.04, CUDA 12.9 wheel stack)
+- Intel Core Ultra 9 275HX CPU
+- RAPIDS venv (`~/venvs/rapids`) for GPU libraries
 
 ## Tech stack
 
@@ -38,10 +38,11 @@ This is the hardware this project was built on
 
 ## Strategies
 
-Two strategies are being tested:
+Three strategies are being tested:
 
 - **VM** — Confluence-based logic using Multi-RSI, Cyclic RSI, and Stochastic MACD
-- **TV** — Inspired by TradingView community indicators (TDI, Loxx, Donutian Bands)
+- **TV** — Inspired by TradingView community indicators (TDI, Loxx, Donchian Bands)
+- **Trend** — Time-series momentum with Donchian breakout channel, Kaufman efficiency ratio, and multi-horizon return composite
 
 Both use Walk-Forward Validation with two calibration layers:
 
@@ -50,23 +51,26 @@ Both use Walk-Forward Validation with two calibration layers:
 
 ## Setup
 
-Requires WSL Ubuntu with the `rapids` conda environment:
+Requires native Ubuntu 24.04 with the RAPIDS venv (`~/venvs/rapids`):
 
-```powershell
-# Activate GPU environment in WSL
-wsl bash -c "source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py"
+```bash
+# Activate GPU environment
+source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+python your_script.py
 ```
 
 Test cudf is working:
-```powershell
-wsl bash -c "source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python -c \"import cudf; print('OK')\""
+```bash
+python -c "import cudf; print('OK')"
 ```
+
+The Optuna calibrators require PostgreSQL (`postgresql://gorea@localhost/optuna_db`, role `gorea`, db `optuna_db`, trust auth on localhost).
 
 ## Running the pipeline
 
 All commands run from `v6/` directory. Use `--smoke` for quick test runs on small data slices.
 
-```powershell
+```bash
 # Walk-Forward Validation pipeline (full optimization cycle)
 python orchestrate_calibration.py --strategy vm --smoke
 
@@ -86,25 +90,25 @@ A FastAPI backend + React frontend for visualizing backtest results and strategy
 
 ### Prerequisites
 
-Backend dependencies (install on Windows, no WSL needed):
+Backend dependencies (plain Python env — the backend reads pre-computed CSVs and needs no GPU libraries):
 
-```powershell
+```bash
 pip install fastapi uvicorn pandas numpy pydantic
 ```
 
 Frontend dependencies (inside `v6/Analytics dashboard design/`):
 
-```powershell
+```bash
 cd "Analytics dashboard design"
 pnpm install
 ```
 
 ### Starting the servers
 
-**1. Start the backend** (runs on Windows, reads pre-computed CSV results):
+**1. Start the backend** (reads pre-computed CSV results):
 
-```powershell
-cd v6\backend
+```bash
+cd v6/backend
 python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
@@ -112,8 +116,8 @@ The backend serves on `http://localhost:8001` and supports CORS for the frontend
 
 **2. Start the frontend** (Vite dev server):
 
-```powershell
-cd v6\Analytics dashboard design
+```bash
+cd "v6/Analytics dashboard design"
 pnpm dev
 ```
 
@@ -132,20 +136,24 @@ The frontend serves on `http://localhost:8443` and reads `VITE_API_URL` from `.e
 
 ```
 v6/
-  definitions.py              # Indicator math (GPU-ready with pandas fallback)
-  gpu_io.py                   # GPU I/O helpers (CSV <-> cudf)
+  definitions.py              # Indicator math (GPU-native, cudf/cupy only)
+  gpu_io.py                   # CSV I/O helpers (pandas at boundary, cudf in memory)
   logging_utils.py            # Structured logging
   orchestrate_calibration.py  # WFV orchestrator — runs calibration windows in parallel
   optuna_calibrate_vm.py      # Bayesian optimization for VM strategy
   optuna_calibrate_tv.py      # Bayesian optimization for TV strategy
-  generate_vm_automation_logic_signals.py   # Signal generation (VM) — sparse event loop, `--gpu` flag
-  generate_tv_strategy1_signals.py          # Signal generation (TV) — sparse event loop, `--gpu` flag
+  optuna_calibrate_trend.py   # Bayesian optimization for Trend strategy
+  generate_vm_automation_logic_signals.py   # Signal generation (VM) — sparse event loop
+  generate_tv_strategy1_signals.py          # Signal generation (TV) — sparse event loop
+  generate_trend_following_signals.py       # Signal generation (Trend) — sparse event loop
   backtest_xauusd_signal_csv.py             # Backtesting engine
   config.json                         # Baseline parameters
   calibration_results_vm.json         # Runtime calibration overrides
   data.csv                            # 1-minute XAUUSD market data (not in repo)
   wfv/                                # WFV output — per-window results, plots, stats
-  PLAN.md                             # Roadmap and task tracker
+  backend/                            # FastAPI analytics backend
+  Analytics dashboard design/         # React analytics frontend
+docs/PLAN.md                  # Roadmap and task tracker
 ```
 
 ## Current status: Phase 4
@@ -153,7 +161,8 @@ v6/
 - [x] Phase 1 — GPU shift (cudf/cupy dispatch paths in all indicators + helpers)
 - [x] Phase 2 — Orchestration & parallelism (VRAM-based worker limits, pre-sliced data per window)
 - [x] Phase 3 — Validation & cleanup (parity tests passed, logging integrated, dead state removed)
-- [ ] Phase 4 — Algorithmic optimization (sparse event loops in signal generators, GPU data loading via `--gpu` flag, backtesting loop-breaking pending)
+- [x] Phase 4 — Algorithmic optimization (sparse event loops in signal generators, cupy arrays in backtester, all dual-path code removed)
+- [ ] Next targets — backtesting loop-breaking, Optuna search space reduction
 
 ## Key files to read first
 
@@ -170,11 +179,12 @@ This repo includes `AGENTS.md` at the root — an unconventional addition for a 
 optuna
 pandas
 numpy
-cudf (via rapids conda env, WSL)
-cupy (via rapids conda env, WSL)
+cudf (RAPIDS pip wheels, native Linux venv)
+cupy (RAPIDS pip wheels, native Linux venv)
 matplotlib
 tqdm
 scipy
+psycopg2-binary (Optuna PostgreSQL storage)
 ```
 
-Install via conda in the `rapids` environment. See requirements.txt for full dependency list.
+GPU packages install via RAPIDS pip wheels: `pip install cupy-cuda12x cudf-cu12 --extra-index-url https://pypi.nvidia.com`. See requirements.txt for full dependency list.
