@@ -219,10 +219,13 @@ def generate_tv_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataFram
 # ---------------------------------------------------------------------------
 
 def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
-    # Apply SL/TP overrides from sampled params to BP (backtest reads from BP)
+    # Per-trial immutable backtest config: copy module BP and apply sampled exit
+    # overrides to the COPY. Module BP is never mutated (trial-reachable code must
+    # not touch module globals — concurrent trials share this module).
+    cfg = {**BP}
     for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars"):
         if key in params:
-            BP[key] = params[key]
+            cfg[key] = params[key]
     
     # 1. Generate Signals
     signals = generate_tv_signals_local(data, params)
@@ -230,7 +233,7 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
         return -9999.0
     
     # 2. Run Backtest ONCE (checkpoint logic merged here)
-    trades, equity, _, _ = run_backtest(data, signals)
+    trades, equity, _, _ = run_backtest(data, signals, config=cfg)
     if trades.empty:
         return -8888.0
     
@@ -245,7 +248,7 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
         equity_ts = equity_ts.dt.tz_localize(None)
     early_equity = equity[equity_ts <= limit_ts]
     if not early_equity.empty:
-        if early_equity["equity_usd"].iloc[-1] < (BP["initial_capital_usd"] * 0.5):
+        if early_equity["equity_usd"].iloc[-1] < (cfg["initial_capital_usd"] * 0.5):
             raise optuna.exceptions.TrialPruned("Margin call in first 25%.")
         peak = early_equity["equity_usd"].cummax()
         dd = (peak - early_equity["equity_usd"]) / peak
@@ -253,7 +256,7 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
             raise optuna.exceptions.TrialPruned("Drawdown >50% in first 25%.")
     
     # 4. Score Results (unchanged)
-    summary = compute_summary(trades, equity, signals, Path("dummy.csv"), data)
+    summary = compute_summary(trades, equity, signals, Path("dummy.csv"), data, config=cfg)
     
     sharpe = summary.get("sharpe_ratio", 0)
     calmar = summary.get("calmar_ratio", 0)

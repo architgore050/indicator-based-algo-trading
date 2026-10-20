@@ -68,7 +68,7 @@ class OpenPosition:
 
 @dataclass
 class BacktestState:
-    cash: float = BP["initial_capital_usd"]
+    cash: float  # Required: passed explicitly from the resolved cfg (no import-time global default)
     position: OpenPosition | None = None
     trades: list[dict[str, object]] = field(default_factory=list)
     skipped_signals: list[dict[str, object]] = field(default_factory=list)
@@ -142,13 +142,13 @@ def load_signals(path: Path) -> pd.DataFrame:
 # Execution math (kept for parity test module loading)
 # ---------------------------------------------------------------------------
 
-def slippage(rng: np.random.Generator) -> float:
-    return max(0.0, float(rng.normal(BP["slippage_mean_usd_per_oz"], BP["slippage_std_usd_per_oz"])))
+def slippage(rng: np.random.Generator, cfg: dict) -> float:
+    return max(0.0, float(rng.normal(cfg["slippage_mean_usd_per_oz"], cfg["slippage_std_usd_per_oz"])))
 
 
-def fill_price(mid_price: float, side: int, is_entry: bool, rng: np.random.Generator) -> tuple[float, float]:
-    slip = slippage(rng)
-    half_spread = BP["spread_usd_per_oz"] / 2.0
+def fill_price(mid_price: float, side: int, is_entry: bool, rng: np.random.Generator, cfg: dict) -> tuple[float, float]:
+    slip = slippage(rng, cfg)
+    half_spread = cfg["spread_usd_per_oz"] / 2.0
 
     if side == 1:
         signed_cost = half_spread + slip if is_entry else -(half_spread + slip)
@@ -158,12 +158,12 @@ def fill_price(mid_price: float, side: int, is_entry: bool, rng: np.random.Gener
     return mid_price + signed_cost, abs(signed_cost)
 
 
-def commission(lots: float) -> float:
-    return BP["commission_usd_per_standard_lot_per_side"] * lots
+def commission(lots: float, cfg: dict) -> float:
+    return cfg["commission_usd_per_standard_lot_per_side"] * lots
 
 
-def margin_required(price: float, units_oz: float) -> float:
-    return (price * units_oz) / BP["leverage"]
+def margin_required(price: float, units_oz: float, cfg: dict) -> float:
+    return (price * units_oz) / cfg["leverage"]
 
 
 def mark_to_market(position: OpenPosition | None, close_mid: float) -> float:
@@ -172,18 +172,18 @@ def mark_to_market(position: OpenPosition | None, close_mid: float) -> float:
     return (close_mid - position.entry_fill) * position.units_oz * position.side
 
 
-def update_excursions(position: OpenPosition, high_mid: float, low_mid: float) -> None:
+def update_excursions(position: OpenPosition, high_mid: float, low_mid: float, cfg: dict) -> None:
     if position.side == 1:
         favorable = (high_mid - position.entry_mid) * position.units_oz
         adverse = (low_mid - position.entry_mid) * position.units_oz
-        if BP["trailing_stop_usd_per_oz"] > 0:
-            stop = high_mid - BP["trailing_stop_usd_per_oz"]
+        if cfg["trailing_stop_usd_per_oz"] > 0:
+            stop = high_mid - cfg["trailing_stop_usd_per_oz"]
             position.trailing_stop_mid = stop if position.trailing_stop_mid is None else max(position.trailing_stop_mid, stop)
     else:
         favorable = (position.entry_mid - low_mid) * position.units_oz
         adverse = (position.entry_mid - high_mid) * position.units_oz
-        if BP["trailing_stop_usd_per_oz"] > 0:
-            stop = low_mid + BP["trailing_stop_usd_per_oz"]
+        if cfg["trailing_stop_usd_per_oz"] > 0:
+            stop = low_mid + cfg["trailing_stop_usd_per_oz"]
             position.trailing_stop_mid = stop if position.trailing_stop_mid is None else min(position.trailing_stop_mid, stop)
 
     position.mfe_usd = max(position.mfe_usd, favorable)
@@ -192,7 +192,7 @@ def update_excursions(position: OpenPosition, high_mid: float, low_mid: float) -
     position.worst_price = min(position.worst_price, low_mid) if position.worst_price else low_mid
 
 
-def accrue_swap(position: OpenPosition, timestamp: pd.Timestamp) -> float:
+def accrue_swap(position: OpenPosition, timestamp: pd.Timestamp, cfg: dict) -> float:
     current_date = timestamp.date()
     if position.last_swap_date is None:
         position.last_swap_date = current_date
@@ -202,7 +202,7 @@ def accrue_swap(position: OpenPosition, timestamp: pd.Timestamp) -> float:
     if elapsed_days == 0:
         return 0.0
 
-    rate = BP["long_swap_usd_per_lot_per_day"] if position.side == 1 else BP["short_swap_usd_per_lot_per_day"]
+    rate = cfg["long_swap_usd_per_lot_per_day"] if position.side == 1 else cfg["short_swap_usd_per_lot_per_day"]
     swap_cashflow = rate * position.lots * elapsed_days
     position.accrued_swap_usd += swap_cashflow
     position.last_swap_date = current_date
@@ -218,11 +218,12 @@ def open_position(
     reason: str,
     signal: str,
     rng: np.random.Generator,
+    cfg: dict,
 ) -> None:
     # Convert cupy scalars to Python float to prevent dtype object in trade DataFrame
     mid_price = float(mid_price)
-    units_oz = BP["trade_size_lots"] * BP["standard_lot_oz"]
-    needed_margin = margin_required(mid_price, units_oz)
+    units_oz = cfg["trade_size_lots"] * cfg["standard_lot_oz"]
+    needed_margin = margin_required(mid_price, units_oz, cfg)
     if state.cash < needed_margin:
         state.skipped_signals.append(
             {
@@ -235,8 +236,8 @@ def open_position(
         )
         return
 
-    entry_fill, entry_cost_per_oz = fill_price(mid_price, side=side, is_entry=True, rng=rng)
-    entry_commission = commission(BP["trade_size_lots"])
+    entry_fill, entry_cost_per_oz = fill_price(mid_price, side=side, is_entry=True, rng=rng, cfg=cfg)
+    entry_commission = commission(cfg["trade_size_lots"], cfg)
     entry_friction = entry_cost_per_oz * units_oz
     state.cash -= entry_commission
     state.total_commission += entry_commission
@@ -247,7 +248,7 @@ def open_position(
         entry_mid=mid_price,
         entry_fill=entry_fill,
         entry_bar=bar_idx,
-        lots=BP["trade_size_lots"],
+        lots=cfg["trade_size_lots"],
         units_oz=units_oz,
         entry_commission=entry_commission,
         entry_friction=entry_friction,
@@ -267,6 +268,7 @@ def close_position(
     reason: str,
     exit_signal: str,
     rng: np.random.Generator,
+    cfg: dict,
 ) -> None:
     position = state.position
     if position is None:
@@ -274,8 +276,8 @@ def close_position(
 
     # Convert cupy scalars to Python float to prevent dtype object in DataFrame columns
     mid_price = float(mid_price)
-    exit_fill, exit_cost_per_oz = fill_price(mid_price, side=position.side, is_entry=False, rng=rng)
-    exit_commission = commission(position.lots)
+    exit_fill, exit_cost_per_oz = fill_price(mid_price, side=position.side, is_entry=False, rng=rng, cfg=cfg)
+    exit_commission = commission(position.lots, cfg)
     exit_friction = exit_cost_per_oz * position.units_oz
     gross_pnl = float((exit_fill - position.entry_fill) * position.units_oz * position.side)
     total_commission = position.entry_commission + exit_commission
@@ -287,7 +289,7 @@ def close_position(
     state.total_commission += exit_commission
     state.total_friction += exit_friction
 
-    margin_at_entry = margin_required(position.entry_mid, position.units_oz)
+    margin_at_entry = margin_required(position.entry_mid, position.units_oz, cfg)
     bars_held = bar_idx - position.entry_bar
     hours_held = bars_held / 60.0
     side_name = "LONG" if position.side == 1 else "SHORT"
@@ -312,7 +314,7 @@ def close_position(
             "commission_usd": total_commission,
             "spread_slippage_cost_usd": total_friction,
             "net_pnl_usd": net_pnl,
-            "net_pnl_inr": net_pnl * BP["usdinr_rate"],
+            "net_pnl_inr": net_pnl * cfg["usdinr_rate"],
             "return_on_margin_pct": (net_pnl / margin_at_entry) * 100 if margin_at_entry else np.nan,
             "entry_bar": position.entry_bar,
             "bars_held": bars_held,
@@ -336,9 +338,12 @@ def action_to_side(action: str, signal: str) -> int | None:
 # Backtest (OPTIMIZED)
 # ---------------------------------------------------------------------------
 
-def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    rng = np.random.default_rng(seed if seed is not None else BP["random_seed"])
-    state = BacktestState()
+def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, config: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # Immutable per-evaluation config: callers pass an explicit dict; module BP is only
+    # the default for standalone CLI use. Neither dict is ever mutated here.
+    cfg = BP if config is None else config
+    rng = np.random.default_rng(seed if seed is not None else cfg["random_seed"])
+    state = BacktestState(cash=cfg["initial_capital_usd"])
 
     # Pre-extract data to numpy arrays for fast CPU loop access.
     # Timestamps stay as numpy (cupy doesn't support datetime64).
@@ -370,27 +375,29 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
     equity_rows: list[dict[str, object]] = []
     execution_log: list[dict[str, object]] = []
 
-    # === B. Cache BP config values into locals ===
-    warmup_bars = BP["warmup_bars"]
-    trade_size_lots = BP["trade_size_lots"]
-    standard_lot_oz = BP["standard_lot_oz"]
+    # === B. Cache cfg config values into locals ===
+    warmup_bars = cfg["warmup_bars"]
+    trade_size_lots = cfg["trade_size_lots"]
+    standard_lot_oz = cfg["standard_lot_oz"]
     units_oz = trade_size_lots * standard_lot_oz
-    commission_per_lot = BP["commission_usd_per_standard_lot_per_side"]
-    leverage = BP["leverage"]
-    slippage_mean = BP["slippage_mean_usd_per_oz"]
-    slippage_std = BP["slippage_std_usd_per_oz"]
-    spread_usd = BP["spread_usd_per_oz"]
+    commission_per_lot = cfg["commission_usd_per_standard_lot_per_side"]
+    leverage = cfg["leverage"]
+    slippage_mean = cfg["slippage_mean_usd_per_oz"]
+    slippage_std = cfg["slippage_std_usd_per_oz"]
+    spread_usd = cfg["spread_usd_per_oz"]
     half_spread = spread_usd / 2.0
-    usdinr = BP["usdinr_rate"]
-    execute_on_next = BP["execute_on_next_bar_open"]
-    allow_reversals = BP["allow_reversals"]
-    enable_risk = BP["enable_risk_exits"]
-    max_hold = BP["max_hold_bars"]
-    sl_usd = BP["stop_loss_usd_per_oz"]
-    tp_usd = BP["take_profit_usd_per_oz"]
-    tsl_usd = BP["trailing_stop_usd_per_oz"]
-    cons_fill = BP["conservative_intrabar_fill"]
-    maint_margin = BP["maintenance_margin_ratio"]
+    usdinr = cfg["usdinr_rate"]
+    execute_on_next = cfg["execute_on_next_bar_open"]
+    allow_reversals = cfg["allow_reversals"]
+    enable_risk = cfg["enable_risk_exits"]
+    max_hold = cfg["max_hold_bars"]
+    sl_usd = cfg["stop_loss_usd_per_oz"]
+    tp_usd = cfg["take_profit_usd_per_oz"]
+    tsl_usd = cfg["trailing_stop_usd_per_oz"]
+    cons_fill = cfg["conservative_intrabar_fill"]
+    maint_margin = cfg["maintenance_margin_ratio"]
+    long_swap_rate = cfg["long_swap_usd_per_lot_per_day"]
+    short_swap_rate = cfg["short_swap_usd_per_lot_per_day"]
 
     n = len(data)
 
@@ -405,7 +412,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
             if pos.last_swap_date is not None:
                 elapsed_days = max(0, (current_date - pos.last_swap_date).days)
                 if elapsed_days > 0:
-                    rate = BP["long_swap_usd_per_lot_per_day"] if pos.side == 1 else BP["short_swap_usd_per_lot_per_day"]
+                    rate = long_swap_rate if pos.side == 1 else short_swap_rate
                     swap_cf = rate * pos.lots * elapsed_days
                     pos.accrued_swap_usd += swap_cf
                     pos.last_swap_date = current_date
@@ -452,10 +459,10 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                 continue
 
             if action == "EXIT_LONG" and state.position is not None and state.position.side == 1:
-                close_position(state, ts, execution_mid, i, reason, signal, rng)
+                close_position(state, ts, execution_mid, i, reason, signal, rng, cfg)
                 actions_taken.add("EXIT")
             elif action == "EXIT_SHORT" and state.position is not None and state.position.side == -1:
-                close_position(state, ts, execution_mid, i, reason, signal, rng)
+                close_position(state, ts, execution_mid, i, reason, signal, rng, cfg)
                 actions_taken.add("EXIT")
             elif action in {"ENTER_LONG", "ENTER_SHORT"}:
                 new_side = action_to_side(action, signal)
@@ -517,7 +524,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                         pos.best_price = max(pos.best_price, h) if pos.best_price else h
                         pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
                 elif state.position.side != new_side and allow_reversals:
-                    close_position(state, ts, execution_mid, i, f"reverse: {reason}", signal, rng)
+                    close_position(state, ts, execution_mid, i, f"reverse: {reason}", signal, rng, cfg)
                     # Inline open_position for reversal
                     needed_margin = (execution_mid * units_oz) / leverage
                     if state.cash >= needed_margin:
@@ -594,7 +601,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                 if enable_risk:
                     hit_max_hold = max_hold > 0 and i - pos.entry_bar >= max_hold
                     if hit_max_hold:
-                        close_position(state, ts, closes[i], i, "max_hold_bars", "MAX_HOLD_BARS", rng)
+                        close_position(state, ts, closes[i], i, "max_hold_bars", "MAX_HOLD_BARS", rng, cfg)
                     elif pos.trailing_stop_mid is not None or sl_usd > 0 or tp_usd > 0:
                         hit_sl = False
                         hit_tp = False
@@ -612,11 +619,11 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                             hit_tsl = lows[i] <= pos.trailing_stop_mid
 
                             if hit_sl and (cons_fill or not hit_tp):
-                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng)
+                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
                             elif hit_tsl and (cons_fill or not hit_tp):
-                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng)
+                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
                             elif hit_tp:
-                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng)
+                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
                         else:
                             if sl_usd > 0:
                                 stop_mid = pos.entry_mid + sl_usd
@@ -627,11 +634,11 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                             hit_tsl = highs[i] >= pos.trailing_stop_mid
 
                             if hit_sl and (cons_fill or not hit_tp):
-                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng)
+                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
                             elif hit_tsl and (cons_fill or not hit_tp):
-                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng)
+                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
                             elif hit_tp:
-                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng)
+                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
 
             # === E2. Margin call check (uses numpy arrays) ===
             if state.position is not None:
@@ -639,7 +646,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
                 unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
                 equity_now = state.cash + unrealized
                 if equity_now < used_margin * maint_margin:
-                    close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng)
+                    close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng, cfg)
 
         # === F. Record equity (always) ===
         close_i = float(closes[i])
@@ -664,7 +671,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None) ->
 
     # Force exit remaining position
     if state.position is not None:
-        close_position(state, timestamps_np[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng)
+        close_position(state, timestamps_np[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng, cfg)
         equity_rows[-1]["cash_usd"] = state.cash
         equity_rows[-1]["unrealized_pnl_usd"] = 0.0
         equity_rows[-1]["equity_usd"] = state.cash
@@ -758,9 +765,12 @@ def compute_summary(
     signals: pd.DataFrame,
     signal_path: Path,
     data: pd.DataFrame,
+    config: dict | None = None,
 ) -> dict[str, float | int | str]:
-    final_equity = float(equity["equity_usd"].iloc[-1]) if len(equity) else BP["initial_capital_usd"]
-    total_return_pct = (final_equity / BP["initial_capital_usd"] - 1.0) * 100
+    # Immutable per-evaluation config: same resolution rule as run_backtest.
+    cfg = BP if config is None else config
+    final_equity = float(equity["equity_usd"].iloc[-1]) if len(equity) else cfg["initial_capital_usd"]
+    total_return_pct = (final_equity / cfg["initial_capital_usd"] - 1.0) * 100
     # Convert to float64 to prevent cupy/pandas dtype incompatibility in nanops
     eq_series = equity["equity_usd"].astype("float64")
     returns = eq_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
@@ -768,7 +778,7 @@ def compute_summary(
     # Handle degenerate case: all returns identical (pandas nanops can't convert near-zero arrays)
     if not np.isfinite(ret_std):
         ret_std = 0.0
-    sharpe = float((returns.mean() / ret_std) * np.sqrt(BP["bars_per_year"])) if len(returns) and ret_std > 0 else 0.0
+    sharpe = float((returns.mean() / ret_std) * np.sqrt(cfg["bars_per_year"])) if len(returns) and ret_std > 0 else 0.0
     max_dd, max_dd_pct, max_dd_bars = max_drawdown(equity["equity_usd"]) if len(equity) else (0.0, 0.0, 0)
 
     # --- Pre-extract numpy arrays for vectorized diagnostics ---
@@ -807,7 +817,7 @@ def compute_summary(
 
         if sl_total > 0:
             # Vectorized: pre-extract close array, use numpy indexing
-            max_hold = BP["max_hold_bars"]
+            max_hold = cfg["max_hold_bars"]
             entry_bars_arr = (sl_hits["entry_bar"].astype(int)).values
             check_idx = np.minimum(entry_bars_arr + max_hold, len(data) - 1)
             end_prices = data_closes[check_idx]
@@ -825,7 +835,7 @@ def compute_summary(
         tsl_total = len(tsl_hits)
 
         if tsl_total > 0:
-            max_hold_val = BP["max_hold_bars"] if BP["max_hold_bars"] > 0 else (len(data) - 1)
+            max_hold_val = cfg["max_hold_bars"] if cfg["max_hold_bars"] > 0 else (len(data) - 1)
 
             # Vectorized retention calculation
             mfe_vals = np.abs(tsl_hits["mfe_usd"].values)
@@ -856,7 +866,7 @@ def compute_summary(
             fwd_min = np.minimum.accumulate(data_lows[::-1])[::-1]
             max_lookahead_highs = np.array([fwd_max[exit_bars[j]] if exit_bars[j] <= lookahead_end[j] else data_highs[exit_bars[j]] for j in range(len(tsl_hits))])
             min_lookahead_lows = np.array([fwd_min[exit_bars[j]] if exit_bars[j] <= lookahead_end[j] else data_lows[exit_bars[j]] for j in range(len(tsl_hits))])
-            threshold = max(0.50, BP["trailing_stop_usd_per_oz"] * 0.2)
+            threshold = max(0.50, cfg["trailing_stop_usd_per_oz"] * 0.2)
             exit_mids = tsl_hits["exit_mid"].values
             long_mask = sides == "LONG"
             short_mask = ~long_mask
@@ -891,12 +901,12 @@ def compute_summary(
 
     end = pd.to_datetime(equity["timestamp"].iloc[-1]) if len(equity) else None
     years = max((end - start).total_seconds() / (365.25 * 24 * 3600), 1 / 365.25) if start is not None else 1.0
-    cagr_pct = ((final_equity / BP["initial_capital_usd"]) ** (1 / years) - 1) * 100 if final_equity > 0 else -100.0
+    cagr_pct = ((final_equity / cfg["initial_capital_usd"]) ** (1 / years) - 1) * 100 if final_equity > 0 else -100.0
     calmar = cagr_pct / abs(max_dd_pct) if max_dd_pct else 0.0
 
     downside = returns[returns < 0]
     downside_std = downside.std()
-    sortino = float((returns.mean() / downside_std) * np.sqrt(BP["bars_per_year"])) if len(downside) and np.isfinite(downside_std) and downside_std > 0 else 0.0
+    sortino = float((returns.mean() / downside_std) * np.sqrt(cfg["bars_per_year"])) if len(downside) and np.isfinite(downside_std) and downside_std > 0 else 0.0
 
     if trades.empty:
         trade_stats = {
@@ -957,11 +967,11 @@ def compute_summary(
     exposure_pct = float((equity["position"] != 0).mean() * 100) if len(equity) else 0.0
     return {
         "signal_file": str(signal_path.name),
-        "initial_capital_usd": BP["initial_capital_usd"],
+        "initial_capital_usd": cfg["initial_capital_usd"],
         "final_equity_usd": final_equity,
-        "final_equity_inr": final_equity * BP["usdinr_rate"],
-        "net_profit_usd": final_equity - BP["initial_capital_usd"],
-        "net_profit_inr": (final_equity - BP["initial_capital_usd"]) * BP["usdinr_rate"],
+        "final_equity_inr": final_equity * cfg["usdinr_rate"],
+        "net_profit_usd": final_equity - cfg["initial_capital_usd"],
+        "net_profit_inr": (final_equity - cfg["initial_capital_usd"]) * cfg["usdinr_rate"],
         "total_return_pct": total_return_pct,
         "cagr_pct": cagr_pct,
         "max_drawdown_usd": max_dd,
@@ -972,12 +982,12 @@ def compute_summary(
         "calmar_ratio": calmar,
         "exposure_pct": exposure_pct,
         "signals_read": int(len(signals)),
-        "spread_usd_per_oz": BP["spread_usd_per_oz"],
-        "slippage_mean_usd_per_oz": BP["slippage_mean_usd_per_oz"],
-        "commission_per_lot_side_usd": BP["commission_usd_per_standard_lot_per_side"],
-        "trade_size_lots": BP["trade_size_lots"],
-        "leverage": BP["leverage"],
-        "usdinr_rate": BP["usdinr_rate"],
+        "spread_usd_per_oz": cfg["spread_usd_per_oz"],
+        "slippage_mean_usd_per_oz": cfg["slippage_mean_usd_per_oz"],
+        "commission_per_lot_side_usd": cfg["commission_usd_per_standard_lot_per_side"],
+        "trade_size_lots": cfg["trade_size_lots"],
+        "leverage": cfg["leverage"],
+        "usdinr_rate": cfg["usdinr_rate"],
         "sl_diagnostics": {
             "total_sl_hits": sl_total,
             "good_idea_hits": sl_good,
@@ -1230,17 +1240,20 @@ def main() -> None:
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (provides SL/TP overrides).")
     args = parser.parse_args()
 
-    # Override SL/TP from calibration results if provided
+    # Override SL/TP from calibration results if provided.
+    # Build a per-run override dict; NEVER mutate module BP (it is shared by any
+    # concurrent calibration that imports this module).
+    cfg = None
     if args.calibration:
         cal_path = Path(args.calibration)
         if cal_path.exists():
             with open(cal_path, "r") as f:
                 cal_data = json.load(f)
             cal_params = cal_data.get("best_parameters", {})
-            for key in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars"):
-                if key in cal_params:
-                    BP[key] = cal_params[key]
-                    logger.info(f"SL/TP override from calibration: {key} = {BP[key]}")
+            overrides = {k: cal_params[k] for k in ("stop_loss_usd_per_oz", "take_profit_usd_per_oz", "trailing_stop_usd_per_oz", "max_hold_bars") if k in cal_params}
+            cfg = {**BP, **overrides}
+            for key in overrides:
+                logger.info(f"SL/TP override from calibration: {key} = {cfg[key]}")
         else:
             logger.warning(f"Calibration file not found: {cal_path}. Using config defaults.")
 
@@ -1281,8 +1294,8 @@ def main() -> None:
     start, end = data["timestamp"].min(), data["timestamp"].max()
     signals = signals[(signals["timestamp"] >= start) & (signals["timestamp"] <= end)].reset_index(drop=True)
 
-    trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed)
-    summary = compute_summary(trades, equity, signals, signal_path, data)
+    trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed, config=cfg)
+    summary = compute_summary(trades, equity, signals, signal_path, data, config=cfg)
     
     # Save all outputs
     with tqdm(total=7, desc="Writing report", unit="file") as pbar:
