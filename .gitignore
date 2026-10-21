@@ -21,6 +21,13 @@ backtest_report_*/
 v6/v6/
 v6/tmp/
 
+# P1-4: per-window calibration diagnostic copies published at v6 root by the
+# orchestrator (calibration_results_<strategy>_<window_label>.json). Explicit
+# label patterns only — must NOT match the tracked calibration_results_{vm,tv,
+# trend}.json or the *_cpu.json reference files.
+v6/calibration_results_*_annual_recal_*.json
+v6/calibration_results_*_monthly_refine_*.json
+
 # IDE
 .vscode/
 .idea/

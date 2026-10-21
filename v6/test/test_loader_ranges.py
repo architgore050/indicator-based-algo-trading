@@ -14,10 +14,18 @@ For a known slice of the real data.csv it asserts:
   3. the row at index end_row is NOT present (half-open, not inclusive)
   4. the --data-csv chunk path (orchestrator WFV path) loads the chunk whole
 
-It also PROVES the pre-fix VM/TV behaviour was wrong: the HEAD copies of the
-two generators are extracted with `git show HEAD:...` into v6/tmp/pre_fix/ and
-shown to ignore skiprows/nrows (they load the whole source file), while the
-fixed loaders return exactly the requested slice.
+It also PROVES the pre-P1-2 VM/TV behaviour was wrong: pre-fix copies of the
+two generators are COMMITTED FIXTURES in v6/test/fixtures/pre_p1_2/ (extracted
+via `git show 10fac29^:v6/...` from 79f534d, the last commit before the P1-2
+loader fix; see fixtures/pre_p1_2/README.md for provenance and md5sums). They
+are installed into v6/tmp/pre_fix/ and shown to ignore skiprows/nrows (they
+load the whole source file), while the fixed loaders return exactly the
+requested slice. Fixtures replace the original `git show HEAD:` anchoring:
+HEAD advances, so after P1-2 committed the fix, a HEAD-anchored baseline
+silently became the FIXED code and the proof layer self-destructed (6
+spurious failures). The fixture source-audit checks below double as a
+provenance guard: if a fixture is ever replaced with fixed code, they fail
+loudly instead of silently proving nothing.
 
 Run from v6/ inside the rapids venv:
     CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB \
@@ -32,7 +40,6 @@ import argparse
 import importlib
 import importlib.util
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,6 +49,8 @@ TEST_DIR = Path(__file__).resolve().parent
 V6_DIR = TEST_DIR.parent
 DATA_CSV = V6_DIR / "data.csv"
 TMP_DIR = V6_DIR / "tmp" / "loader_ranges"
+# Committed pre-P1-2 generator copies (extracted from 10fac29^ = 79f534d).
+FIXTURES_DIR = TEST_DIR / "fixtures" / "pre_p1_2"
 
 # The slice under test: half-open [START, END) -> exactly 1000 data rows.
 START = 2_999_000
@@ -178,15 +187,17 @@ def test_backtester() -> None:
 
 
 def install_scratch_copy(mod_name: str, scratch_dir: Path, source: str) -> Path:
-    """Copy a generator (HEAD version or current working-tree version) into a
-    scratch dir together with the config.json it loads at import time."""
+    """Copy a generator (pre-P1-2 fixture or current working-tree version) into
+    a scratch dir together with the config.json it loads at import time."""
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    if source == "HEAD":
-        out = subprocess.run(
-            ["git", "-C", str(V6_DIR.parent), "show", f"HEAD:v6/{mod_name}.py"],
-            capture_output=True, text=True, check=True,
-        )
-        text = out.stdout
+    if source == "FIXTURE":
+        fixture = FIXTURES_DIR / f"{mod_name}.py"
+        if not fixture.exists():
+            raise FileNotFoundError(
+                f"pre-P1-2 fixture missing: {fixture} "
+                "(must be restored from fixtures/pre_p1_2/README.md provenance)"
+            )
+        text = fixture.read_text()
     else:
         text = (V6_DIR / f"{mod_name}.py").read_text()
     dest = scratch_dir / f"{mod_name}.py"
@@ -216,15 +227,16 @@ def place_fixture(scratch_dir: Path, start: int, rows: int) -> Path:
 
 
 def test_pre_fix_proof(skip_smoke_proof: bool) -> None:
-    """Apples-to-apples proof that the HEAD (pre-fix) VM/TV loaders were buggy.
+    """Apples-to-apples proof that the pre-P1-2 (fixture) VM/TV loaders were buggy.
 
-    The HEAD copy and the fixed copy of each generator are installed in separate
-    scratch dirs, each with an IDENTICAL fixture data.csv, and called with the
-    same arguments (no --data-csv, so each uses its own fixture). HEAD ignores
-    skiprows/nrows and reads the whole fixture; the fixed loader returns exactly
-    the requested half-open slice.
+    The pre-fix fixture copy and the fixed working-tree copy of each generator
+    are installed in separate scratch dirs, each with an IDENTICAL fixture
+    data.csv, and called with the same arguments (no --data-csv, so each uses
+    its own fixture). The pre-fix copy ignores skiprows/nrows and reads the
+    whole fixture; the fixed loader returns exactly the requested half-open
+    slice.
     """
-    print("\n--- PRE-FIX (HEAD) vs POST-FIX proof (fixture data.csv) ---")
+    print("\n--- PRE-FIX (fixtures/pre_p1_2, from 10fac29^) vs POST-FIX proof (fixture data.csv) ---")
     fixture_rows = 5_000
     fixture_start = END - fixture_rows
     sub_start, sub_end = 1_000, 2_000          # inside the fixture -> 1000 rows
@@ -232,23 +244,23 @@ def test_pre_fix_proof(skip_smoke_proof: bool) -> None:
 
     for name, mod_name in (("vm", "generate_vm_automation_logic_signals"),
                            ("tv", "generate_tv_strategy1_signals")):
-        head_dir = V6_DIR / "tmp" / "pre_fix" / name
+        prefix_dir = V6_DIR / "tmp" / "pre_fix" / name
         fixed_dir = V6_DIR / "tmp" / "fixed" / name
-        head_mod = import_scratch(install_scratch_copy(mod_name, head_dir, "HEAD"),
-                                  f"prefix_head_{name}")
+        prefix_mod = import_scratch(install_scratch_copy(mod_name, prefix_dir, "FIXTURE"),
+                                    f"prefix_{name}")
         fixed_mod = import_scratch(install_scratch_copy(mod_name, fixed_dir, "WORKING"),
                                    f"prefix_fixed_{name}")
-        place_fixture(head_dir, fixture_start, fixture_rows)
+        place_fixture(prefix_dir, fixture_start, fixture_rows)
         place_fixture(fixed_dir, fixture_start, fixture_rows)
 
-        head_df = cudf_to_pandas(head_mod.load_data("test", sub_start, sub_end))
+        prefix_df = cudf_to_pandas(prefix_mod.load_data("test", sub_start, sub_end))
         fixed_df = cudf_to_pandas(fixed_mod.load_data("test", sub_start, sub_end))
-        print(f"  HEAD  {name}: [{sub_start},{sub_end}) of a {fixture_rows}-row fixture "
-              f"-> {len(head_df)} rows")
-        print(f"  FIXED {name}: same call -> {len(fixed_df)} rows")
-        check(len(head_df) == fixture_rows,
-              f"HEAD {name} loader was BUGGY: read the whole {fixture_rows}-row file "
-              f"instead of {sub_end - sub_start} rows (got {len(head_df)})")
+        print(f"  PRE-FIX {name}: [{sub_start},{sub_end}) of a {fixture_rows}-row fixture "
+              f"-> {len(prefix_df)} rows")
+        print(f"  FIXED   {name}: same call -> {len(fixed_df)} rows")
+        check(len(prefix_df) == fixture_rows,
+              f"PRE-FIX {name} loader was BUGGY: read the whole {fixture_rows}-row file "
+              f"instead of {sub_end - sub_start} rows (got {len(prefix_df)})")
         check(len(fixed_df) == sub_end - sub_start,
               f"FIXED {name} loader returns exactly {sub_end - sub_start} rows "
               f"(got {len(fixed_df)})")
@@ -259,38 +271,39 @@ def test_pre_fix_proof(skip_smoke_proof: bool) -> None:
                   f"FIXED {name} loader: first/last timestamps match data.csv rows "
                   f"[{fixture_start + sub_start}, {fixture_start + sub_end})")
 
-        head_src = (head_dir / f"{mod_name}.py").read_text()
+        prefix_src = (prefix_dir / f"{mod_name}.py").read_text()
         fixed_src = (fixed_dir / f"{mod_name}.py").read_text()
-        check('read_kwargs["skiprows"]' in head_src and "gpu_df = load_csv(str(source))" in head_src,
-              f"HEAD {name} source audit: builds read_kwargs[skiprows/nrows] then calls "
-              f"load_csv(str(source)) with no kwargs (the discarded-kwargs bug)")
+        check('read_kwargs["skiprows"]' in prefix_src and "gpu_df = load_csv(str(source))" in prefix_src,
+              f"PRE-FIX {name} source audit (fixture provenance guard): builds "
+              f"read_kwargs[skiprows/nrows] then calls load_csv(str(source)) with no "
+              f"kwargs (the discarded-kwargs bug)")
         check("skiprows=start_row, nrows=end_row - start_row" in fixed_src,
               f"FIXED {name} source audit: forwards skiprows/nrows to load_csv")
 
         if not skip_smoke_proof:
             # --mode smoke over-read proof (fixture above the 50k smoke budget).
             smoke_rows = 200_000
-            head_smoke_dir = V6_DIR / "tmp" / "pre_fix" / f"{name}_smoke"
+            prefix_smoke_dir = V6_DIR / "tmp" / "pre_fix" / f"{name}_smoke"
             fixed_smoke_dir = V6_DIR / "tmp" / "fixed" / f"{name}_smoke"
-            head_smoke_mod = import_scratch(
-                install_scratch_copy(mod_name, head_smoke_dir, "HEAD"), f"prefix_head_smoke_{name}")
+            prefix_smoke_mod = import_scratch(
+                install_scratch_copy(mod_name, prefix_smoke_dir, "FIXTURE"), f"prefix_smoke_{name}")
             fixed_smoke_mod = import_scratch(
                 install_scratch_copy(mod_name, fixed_smoke_dir, "WORKING"), f"prefix_fixed_smoke_{name}")
-            place_fixture(head_smoke_dir, END - smoke_rows, smoke_rows)
+            place_fixture(prefix_smoke_dir, END - smoke_rows, smoke_rows)
             place_fixture(fixed_smoke_dir, END - smoke_rows, smoke_rows)
-            head_smoke = cudf_to_pandas(head_smoke_mod.load_data("smoke"))
+            prefix_smoke = cudf_to_pandas(prefix_smoke_mod.load_data("smoke"))
             fixed_smoke = cudf_to_pandas(fixed_smoke_mod.load_data("smoke"))
-            print(f"  HEAD  {name} --mode smoke on a {smoke_rows:,}-row fixture "
-                  f"-> {len(head_smoke):,} rows")
-            print(f"  FIXED {name} --mode smoke on the same fixture -> {len(fixed_smoke):,} rows")
-            check(len(head_smoke) == smoke_rows,
-                  f"HEAD {name} --mode smoke over-read the whole fixture "
-                  f"({len(head_smoke):,} rows instead of 50,000) — the OOM mechanism")
+            print(f"  PRE-FIX {name} --mode smoke on a {smoke_rows:,}-row fixture "
+                  f"-> {len(prefix_smoke):,} rows")
+            print(f"  FIXED   {name} --mode smoke on the same fixture -> {len(fixed_smoke):,} rows")
+            check(len(prefix_smoke) == smoke_rows,
+                  f"PRE-FIX {name} --mode smoke over-read the whole fixture "
+                  f"({len(prefix_smoke):,} rows instead of 50,000) — the OOM mechanism")
             check(len(fixed_smoke) == 50_000,
                   f"FIXED {name} --mode smoke reads 50,000 rows (got {len(fixed_smoke):,})")
 
     total = count_data_rows()
-    note(f"real data.csv has {total:,} data rows: HEAD's over-read scales to {total:,} rows "
+    note(f"real data.csv has {total:,} data rows: the pre-fix over-read scales to {total:,} rows "
          f"for --mode test/smoke against the real file (the OOMs seen in earlier task runs). "
          f"A direct 4M-row cudf load is not attempted here: the inference server holds "
          f"~15.5/16.3 GiB VRAM, so the proof uses fixtures.")

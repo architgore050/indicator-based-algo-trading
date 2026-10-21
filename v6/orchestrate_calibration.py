@@ -484,10 +484,10 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         worker_logger.error(f"Calibration failed after {MAX_WINDOW_RETRIES} attempts for window {i}")
         raise RuntimeError(f"ABORT: Window {i} calibration failed after {MAX_WINDOW_RETRIES} retries")
 
-    # Update shared results file (atomic copy from per-window output after write completes)
+    # Save per-window results with unique names to avoid race conditions while preserving diagnostic capability.
     res_file = current_dir / f"calibration_results_{strategy}.json"
     if res_file.exists():
-        atomic_write(res_file, PROJECT_DIR / f"calibration_results_{strategy}.json")
+        atomic_write(res_file, PROJECT_DIR / f"calibration_results_{strategy}_{window_label}.json")
 
     # 5. Signal Generation (OOS + pre-roll) — use per-window calibration results
     # to avoid race conditions. P0-6: the slice is extended backwards by

@@ -21,6 +21,19 @@ Deviation note: the spec named v6/parity_maintenance/ for this file; the
 orchestrator's current convention for NEW tests is v6/test/, so the file
 lives here (recorded in docs/P0-8_signal_parity_refactor.md).
 
+P1-4 reviewer change (2026-10-21): params are PINNED per strategy from
+v6/test/fixtures/params_p0_8.json instead of load_params(), which merges the
+mutable root calibration_results_<strategy>.json — the exact nondeterministic
+artifact class P1-4 removed from WFV (the test's outcome previously drifted
+with calibration state: dirty smoke params passed, HEAD-calibrated params
+crashed the trend section). vm/tv pinned params snapshot config+HEAD
+calibration; trend pinned params are TEST-ONLY loose-corner values inside
+calibration_params/trend_ranges, because HEAD-calibrated trend params produce
+0 events on every VRAM-feasible fixture slice on the low-VRAM smoke host
+(see the fixture's _meta). The CLI-path CSV read also now tolerates
+header-only (0-signal) files (AGENTS.md Debugging Pattern) so the 0-signal
+guard fires gracefully instead of crashing with EmptyDataError.
+
 Run from v6/ inside the rapids venv (low-memory smoke convention):
     cd v6 && source ~/venvs/rapids/bin/activate && unset PYTHONPATH
     CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB \
@@ -32,6 +45,7 @@ Fixtures and CLI-path CSV outputs live in v6/tmp/p0_8_parity/ (gitignored).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -48,6 +62,11 @@ from gpu_io import load_csv
 
 TMP_DIR = _PROJECT_DIR / "tmp" / "p0_8_parity"
 DATA_CSV = _PROJECT_DIR / "data.csv"
+
+# Pinned per-strategy params (P1-4 reviewer): deterministic across calibration
+# state. Provenance in the fixture's _meta block.
+PARAMS_FIXTURE = _PROJECT_DIR / "test" / "fixtures" / "params_p0_8.json"
+PINNED_PARAMS = json.loads(PARAMS_FIXTURE.read_text())
 
 FORBIDDEN = {"SELLBACK", "BUYBACK"}
 
@@ -94,7 +113,18 @@ def _run_cli_path(gen_mod, strategy: str, params: dict, slice_csv: Path, n_rows:
             params, "test", start_row=0, end_row=n_rows,
             data_csv_path=str(slice_csv), output_dir=str(out_dir),
         )
-    return pd.read_csv(out_csv, parse_dates=["timestamp"])
+    # AGENTS.md Debugging Pattern: a 0-signal run writes a header-only CSV and
+    # pd.read_csv raises EmptyDataError on it. Return an empty frame with the
+    # required columns so the 0-signal guard in test_strategy fires gracefully.
+    try:
+        return pd.read_csv(out_csv, parse_dates=["timestamp"])
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame({
+            "timestamp": pd.to_datetime(pd.Series(dtype="datetime64[ns]")),
+            "signal": pd.Series(dtype="object"),
+            "action": pd.Series(dtype="object"),
+            "reason": pd.Series(dtype="object"),
+        })
 
 
 def test_strategy(strategy: str, slice_csv: Path, n_rows: int) -> bool:
@@ -112,8 +142,9 @@ def test_strategy(strategy: str, slice_csv: Path, n_rows: int) -> bool:
         return False
     print(f"PASS: {calib_mod_name} imports {gen_mod.__name__}.compute_signals_df (same object)")
 
-    # Fixed params for BOTH paths: config.json defaults + calibration override.
-    params = gen_mod.load_params()
+    # Fixed params for BOTH paths: pinned per-strategy fixture (P1-4 reviewer:
+    # no dependency on the mutable root calibration_results_<strategy>.json).
+    params = PINNED_PARAMS[strategy]
 
     # Calibrator path: cudf data with datetime64 timestamps (load_csv contract).
     data = load_csv(str(slice_csv))
