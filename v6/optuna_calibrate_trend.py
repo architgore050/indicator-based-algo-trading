@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
+from optuna.samplers import QMCSampler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
@@ -111,7 +112,7 @@ def _get_storage_url(study) -> str:
     return None
 
 
-def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20):
+def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20, sampler=None):
     """Run study.optimize() with randomized backoff on PostgreSQL lock errors.
 
     Catches StorageInternalError (wraps psycopg2.errors.DeadlockDetected /
@@ -124,6 +125,12 @@ def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20):
     Note: Optuna's internal state machine converts StorageInternalError to
     AssertionError("Should not reach.") when the trial state becomes
     inconsistent. Both are caught.
+
+    Sampler wiring (P0-2): the phase's sampler is applied to the shared study
+    before every optimize call. Optuna 5.0.0 removed the `sampler` keyword from
+    Study.optimize(), so assigning `study.sampler` is the supported wiring. It is
+    re-applied on each retry attempt, including after a study is re-created from
+    storage, so the phase sampler is never silently dropped.
     """
     from optuna.exceptions import StorageInternalError
     import optuna
@@ -131,6 +138,8 @@ def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20):
 
     for attempt in range(max_retries):
         try:
+            if sampler is not None:
+                study.sampler = sampler
             study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
             return study
         except (StorageInternalError, AssertionError) as e:
@@ -479,6 +488,7 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
         study.enqueue_trial({k: v for k, v in current_best.items() if k in ranges})
 
     def objective(trial):
+        trial.set_user_attr("phase", phase)
         trial_params = {}
         for k, v in ranges.items():
             if isinstance(v[0], int) and isinstance(v[1], int):
@@ -515,7 +525,7 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
         return objective_wrapper(trial_params, data, trial_id=str(trial.number))
 
     n_jobs = get_optimal_n_jobs()
-    study = sqlite_retry_optimize(study, objective, n_trials, n_jobs)
+    study = sqlite_retry_optimize(study, objective, n_trials, n_jobs, sampler=sampler)
     return study
 
 
@@ -612,9 +622,12 @@ def main():
                 logger.info("PHASE 3 ONLY: Skipping Phases 1 & 2. Using existing results as baseline.")
     else:
         # PHASE 1
-        logger.info("PHASE 1: Sobol Quasi-random Exploration...")
+        logger.info("PHASE 1: Sobol Quasi-random Exploration (QMCSampler)...")
         p1_trials = 5 if args.smoke else OPTUNA_CONF["phase1_trials"]
-        study = run_study(1, p1_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study)
+        p1_seed = int(uuid.uuid5(uuid.NAMESPACE_URL, f"{args.window_index}:1").hex[:8], 16)
+        sampler = QMCSampler(seed=p1_seed)
+        logger.info(f"Phase 1 sampler: {sampler.__class__.__name__} seed={p1_seed}")
+        study = run_study(1, p1_trials, sampler, data, shared_study)
 
         if args.smoke:
             logger.info("Smoke Phase 1 complete.")
@@ -638,7 +651,10 @@ def main():
             # PHASE 2
             logger.info("PHASE 2: Bayesian (TPE) Refinement...")
             p2_trials = OPTUNA_CONF["phase2_trials"]
-            study = run_study(2, p2_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best)
+            p2_seed = int(uuid.uuid5(uuid.NAMESPACE_URL, f"{args.window_index}:2").hex[:8], 16)
+            sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"], seed=p2_seed)
+            logger.info(f"Phase 2 sampler: {sampler.__class__.__name__} seed={p2_seed}")
+            study = run_study(2, p2_trials, sampler, data, shared_study, current_best=current_best)
 
             current_best = study.best_params
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
@@ -652,7 +668,10 @@ def main():
     # PHASE 3: Surgical Fine-tuning
     logger.info("PHASE 3: High-Precision Fine-tuning...")
     p3_trials = 2 if args.smoke and args.phase3_only else OPTUNA_CONF["phase3_trials"]
-    study = run_study(3, p3_trials, TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"]), data, shared_study, current_best=current_best, distribution_prior=distribution_prior)
+    p3_seed = int(uuid.uuid5(uuid.NAMESPACE_URL, f"{args.window_index}:3").hex[:8], 16)
+    sampler = TPESampler(n_startup_trials=OPTUNA_CONF["n_startup_trials"], seed=p3_seed)
+    logger.info(f"Phase 3 sampler: {sampler.__class__.__name__} seed={p3_seed}")
+    study = run_study(3, p3_trials, sampler, data, shared_study, current_best=current_best, distribution_prior=distribution_prior)
 
     # Save Phase 3 trials to disk (for child monthly windows to inherit)
     if not args.smoke:

@@ -4,6 +4,9 @@ pandas>=2.0
 
 # Bayesian optimization
 optuna>=3.4
+# QMCSampler (Phase 1 quasi-random exploration in optuna_calibrate_*.py) resolves
+# scipy.stats.qmc lazily at trial time; without scipy every Phase 1 trial fails.
+scipy>=1.11
 
 # Visualization
 matplotlib>=3.7
