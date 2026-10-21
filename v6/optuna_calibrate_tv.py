@@ -290,17 +290,23 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
 # Distribution-Based Prior Inheritance
 # ---------------------------------------------------------------------------
 
-def save_phase_trials(study, output_dir, phase, n_trials_phase):
-    """Save Phase 1 or Phase 2 trial data to JSON for child windows to inherit."""
+def save_phase_trials(study, output_dir: str, phase: int):
+    """Save Phase 1 or Phase 2 trial data to JSON for child windows to inherit.
+
+    P0-3: filters on the explicit ``phase`` user attribute set by the objective
+    (trial.set_user_attr("phase", phase)) instead of the invalid cumulative
+    trial-number slice of the shared study.
+    """
     trials = study.trials
     phase_trials = []
     for t in trials:
-        if t.number < n_trials_phase:
+        if t.user_attrs.get("phase") == phase:
             phase_trials.append({
                 "number": t.number,
                 "value": t.value,
                 "params": t.params,
-                "state": t.state.name
+                "state": t.state.name,
+                "phase": phase
             })
     path = Path(output_dir) / f"phase{phase}_trials.json"
     with open(path, "w") as f:
@@ -663,7 +669,7 @@ def main():
             
             # Save Phase 1 trials for distribution-based inheritance by child monthly windows
             output_dir = str(RESULTS_PATH.parent)
-            save_phase_trials(study, output_dir, 1, p1_trials)
+            save_phase_trials(study, output_dir, 1)
             
             # Enqueue top-N trials from Phase 1 as warm-start for Phase 2
             enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
@@ -680,7 +686,7 @@ def main():
             logger.info(f"Phase 2 Best Score: {study.best_value:.4f}")
             
             # Save Phase 2 trials for distribution-based inheritance by child monthly windows
-            save_phase_trials(study, output_dir, 2, p2_trials)
+            save_phase_trials(study, output_dir, 2)
             
             # Enqueue top-N trials from Phase 2 as warm-start for Phase 3
             enqueue_top_trials(study, CALIB_PARAMS["tv_ranges"], n=OPTUNA_CONF["top_n_to_enqueue"])
