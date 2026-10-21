@@ -586,20 +586,7 @@ def main():
 
     logger.info(f"SOTA TV Calibration Starting. Data Window: {trial_rows:,} rows ending at {end_row:,}.")
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
-    
-    # PostgreSQL for persistent trial logging with native concurrent write support.
-    storage_url = get_postgres_url()
 
-    # Unique study name per process to avoid DuplicatedStudyError across WFV runs
-    run_id = uuid.uuid4().hex[:8]
-    shared_study = optuna.create_study(
-        study_name=f"tv_discovery_{run_id}",
-        storage=storage_url,
-        direction="maximize",
-        pruner=optuna.pruners.MedianPruner(),
-        load_if_exists=True
-    )
-    
     current_best = None
     baseline_annual_params = None
     baseline_annual_score = -np.inf
@@ -633,19 +620,46 @@ def main():
         else:
             logger.warning(f"Distribution prior file not found: {prior_path}. Falling back to config defaults.")
     
+    # PHASE 3 ONLY baseline selection (P0-4): RESULTS_PATH is this window's TARGET
+    # OUTPUT and does not exist on the first run, so it must never be the primary
+    # baseline source. Priority: parent annual baseline (--annual-baseline) >
+    # existing local results (standalone rerun) > hard error. Silent fallback to
+    # config defaults is removed.
     if args.phase3_only:
-        if not RESULTS_PATH.exists():
-            # Parallel WFV race: shared file not written yet, fall back to config defaults
-            logger.warning(f"Phase3-only requested but {RESULTS_PATH} not found. Using config defaults.")
-            current_best = None
-            logger.info("PHASE 3 ONLY (fallback): Using default parameters from config.json.")
-        else:
+        if baseline_annual_params:
+            # Already filtered to CALIB_PARAMS["tv_ranges"] at load time above.
+            current_best = baseline_annual_params
+            logger.info("PHASE 3 ONLY: Using parent annual baseline parameters as starting point.")
+        elif RESULTS_PATH.exists():
             with open(RESULTS_PATH, "r") as f:
                 prev_results = json.load(f)
+                # Filter to only include parameters relevant to this specific strategy's calibration ranges
                 current_best = {k: v for k, v in prev_results["best_parameters"].items() if k in CALIB_PARAMS["tv_ranges"]}
-        if not distribution_prior:
-            logger.info("PHASE 3 ONLY: Skipping Phases 1 & 2. Using existing results as baseline.")
-    else:
+            logger.info("PHASE 3 ONLY: Using existing local results as baseline.")
+        else:
+            raise ValueError(
+                f"PHASE 3 ONLY requires either a valid --annual-baseline or an existing local results file. "
+                f"Neither was found. (Checked: {args.annual_baseline} and {RESULTS_PATH})"
+            )
+
+    # PostgreSQL for persistent trial logging with native concurrent write support.
+    # Study creation is deferred until after the --phase3-only baseline selection
+    # above (P0-4 review): a phase3-only run with no valid baseline must raise
+    # before any study row exists, so failed runs leave no 0-trial stub studies
+    # in optuna_db.
+    storage_url = get_postgres_url()
+
+    # Unique study name per process to avoid DuplicatedStudyError across WFV runs
+    run_id = uuid.uuid4().hex[:8]
+    shared_study = optuna.create_study(
+        study_name=f"tv_discovery_{run_id}",
+        storage=storage_url,
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner(),
+        load_if_exists=True
+    )
+
+    if not args.phase3_only:
         # PHASE 1
         logger.info("PHASE 1: Sobol Quasi-random Exploration (QMCSampler)...")
         p1_trials = 5 if args.smoke else OPTUNA_CONF["phase1_trials"]
