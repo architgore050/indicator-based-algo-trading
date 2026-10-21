@@ -226,7 +226,7 @@
   },
   "data_config": {
     "total_rows": 4000000,
-    "wfv_start_row": 0,
+    "data_start_row": 0,
     "wfv_total_rows": 4000000
   }
 }

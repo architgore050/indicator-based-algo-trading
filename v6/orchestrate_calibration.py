@@ -111,16 +111,54 @@ def compute_max_rows_per_window(args, full_cal_rows: int, rows_per_window: int, 
 
 
 # ---------------------------------------------------------------------------
+# Window Range Ledger (strict half-open [start, end) — P0-5)
+# ---------------------------------------------------------------------------
+
+def compute_window_ranges(i: int, oos_start_base: int, rows_per_window: int,
+                          full_recal_interval: int, recal_windows_count: int,
+                          full_cal_rows: int, smoke: bool) -> tuple:
+    """Half-open row ranges for WFV window i (1-based).
+
+    Returns (oos_start, oos_end, is_start, is_end). All intervals are
+    [start, end): OOS window i spans exactly rows_per_window bars, the IS
+    window ends exactly where the OOS window starts (is_end == oos_start), so
+    the first bar of a window's OOS is never part of its calibration data.
+
+    - Annual IS spans full_cal_rows bars (1000 in smoke). is_start is
+      guaranteed >= data_start_row >= 0 by main()'s derived oos_start_base and
+      its fail-fast validation, so no clamp is needed here.
+    - Monthly IS spans recal_windows_count windows. The fail-fast validation
+      does not guarantee a non-negative monthly start for every config, so the
+      max(0, ...) clamp is kept for monthly windows.
+    """
+    is_annual = ((i - 1) % full_recal_interval == 0)
+    oos_start = oos_start_base + (i - 1) * rows_per_window
+    oos_end = oos_start_base + i * rows_per_window
+    is_end = oos_start
+    if is_annual:
+        is_start = is_end - (1000 if smoke else full_cal_rows)
+    else:
+        is_start = max(0, is_end - (1000 if smoke else rows_per_window * recal_windows_count))
+    return oos_start, oos_end, is_start, is_end
+
+
+# ---------------------------------------------------------------------------
 # Data Slicing (prevents OOM from parallel pd.read_csv on data.csv)
 # ---------------------------------------------------------------------------
 
 def slice_data_csv(data_csv_path: str, start_row: int, end_row: int, out_path: Path) -> None:
-    """Extract rows [start_row:end_row] from data.csv into a small CSV."""
+    """Extract rows [start_row, end_row) from data.csv into a small CSV.
+
+    P0-5: strict half-open interval. The chunk contains exactly
+    (end_row - start_row) data rows, starting at 0-based data row `start_row`.
+    Adjacent ranges tile the timeline with zero duplicated bars.
+    """
     import pandas as pd
     header = pd.read_csv(data_csv_path, nrows=0).columns.tolist()
-    skip = max(0, start_row - 1)
-    nrows = end_row - start_row + 1
-    read_kwargs = {"skiprows": range(1, skip + 1), "nrows": nrows} if skip > 0 else {}
+    nrows = end_row - start_row
+    read_kwargs = {"nrows": nrows}
+    if start_row > 0:
+        read_kwargs["skiprows"] = range(1, start_row + 1)
     df = pd.read_csv(data_csv_path, **read_kwargs)
     df.columns = [c.strip().lower() for c in header]
     df.to_csv(out_path, index=False)
@@ -322,14 +360,10 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     current_dir = wfv_dir / f"window_{i}_{window_label}"
     current_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Temporal Partitioning
-    oos_start = oos_start_base + (i - 1) * rows_per_window
-    oos_end = oos_start_base + i * rows_per_window
-    is_end = oos_start
-    if is_annual:
-        is_start = max(0, is_end - (1000 if args.smoke else full_cal_rows))
-    else:
-        is_start = max(0, is_end - (1000 if args.smoke else rows_per_window * recal_windows_count))
+    # 2. Temporal Partitioning (strict half-open [start, end) — P0-5)
+    oos_start, oos_end, is_start, is_end = compute_window_ranges(
+        i, oos_start_base, rows_per_window, full_recal_interval,
+        recal_windows_count, full_cal_rows, args.smoke)
 
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
@@ -346,7 +380,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             PYTHON, str(PROJECT_DIR / get_calibration_script(strategy)),
             "--data-csv", row_to_chunk[(is_start, is_end)],
             "--start-row", "0",
-            "--end-row", str(is_end - is_start + 1),
+            "--end-row", str(is_end - is_start),
             "--output", window_cal_output,
             "--window-index", str(i)
         ]
@@ -383,7 +417,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
 
     # 5. Signal Generation (OOS) — use per-window calibration results to avoid race conditions
     window_cal = current_dir / f"calibration_results_{strategy}.json"
-    oos_window_size = oos_end - oos_start + 1
+    oos_window_size = oos_end - oos_start
     signal_cmd = [
         PYTHON, str(PROJECT_DIR / get_signal_script(strategy)),
         "--mode", "smoke" if args.smoke else "test",
@@ -452,14 +486,34 @@ def main():
     args = parser.parse_args()
 
     # Logic Parameters (needed before VRAM estimation)
-    oos_start_base = DATA_CONF["wfv_start_row"]
+    # P0-5: oos_start_base is derived, not configured. The first OOS window can
+    # only start after a full calibration window of IS history exists in the CSV.
+    data_start_row = DATA_CONF.get("data_start_row", 0)
+    full_cal_rows = CALIB_PARAMS["calibration_rows_per_trial"]
+    oos_start_base = data_start_row + full_cal_rows
     rows_per_window = WFV_CONF["rows_per_window"]
     total_wfv_rows = DATA_CONF["wfv_total_rows"]
     recal_windows_count = WFV_CONF["recalibration_windows"]
     full_recal_interval = WFV_CONF["windows_per_full_recalibration"]
-    full_cal_rows = CALIB_PARAMS["calibration_rows_per_trial"]
 
     total_windows = total_wfv_rows // rows_per_window
+
+    # In smoke mode, cap the number of windows for fast feedback
+    if args.smoke:
+        total_windows = min(total_windows, 5)
+        logger.info(f"[SMOKE] Capped to {total_windows} windows for fast feedback")
+
+    # Fail-fast validation (P0-5): the whole WFV schedule — the initial IS
+    # reservation plus every OOS window — must fit inside the CSV. Runs after
+    # the smoke cap (so smoke validates the windows it actually uses) and
+    # before setup_wfv_dirs() (so a rejected config never wipes a previous run).
+    required_total_rows = oos_start_base + (total_windows * rows_per_window)
+    if DATA_CONF["total_rows"] < required_total_rows:
+        raise ValueError(
+            f"CSV has {DATA_CONF['total_rows']} rows, but WFV config requires {required_total_rows} "
+            f"(data_start_row={data_start_row} + full_cal_rows={full_cal_rows} + WFV rows={total_windows * rows_per_window}). "
+            f"Please update config.json 'total_rows' or reduce WFV windows."
+        )
 
     # VRAM-aware worker limiting — compute from actual data sizes, not hardcoded defaults
     max_is_rows, oos_rows = compute_max_rows_per_window(args, full_cal_rows, rows_per_window, recal_windows_count)
@@ -491,11 +545,6 @@ def main():
 
     setup_wfv_dirs()
 
-    # In smoke mode, cap the number of windows for fast feedback
-    if args.smoke:
-        total_windows = min(total_windows, 5)
-        logger.info(f"[SMOKE] Capped to {total_windows} windows for fast feedback")
-
     logger.info(f"Starting Parallel WFV for {args.strategy.upper()}. Total Windows: {total_windows}")
     logger.info(f"Using {args.workers} workers.")
 
@@ -508,16 +557,11 @@ def main():
 
     row_ranges = []
     for i in range(1, total_windows + 1):
-        is_annual = ((i - 1) % full_recal_interval == 0)
-        oos_start = oos_start_base + (i - 1) * rows_per_window
-        oos_end = oos_start_base + i * rows_per_window
-        is_end = oos_start
-        if is_annual:
-            is_start = is_end - (1000 if args.smoke else full_cal_rows)
-        else:
-            is_start = is_end - (1000 if args.smoke else rows_per_window * recal_windows_count)
-        row_ranges.append((max(0, is_start), is_end))      # calibration IS range
-        row_ranges.append((oos_start, oos_end))             # signal/backtest OOS range
+        oos_start, oos_end, is_start, is_end = compute_window_ranges(
+            i, oos_start_base, rows_per_window, full_recal_interval,
+            recal_windows_count, full_cal_rows, args.smoke)
+        row_ranges.append((is_start, is_end))      # calibration IS range [is_start, is_end)
+        row_ranges.append((oos_start, oos_end))    # signal/backtest OOS range [oos_start, oos_end)
 
     # Deduplicate ranges
     unique_ranges = sorted(set(row_ranges))
