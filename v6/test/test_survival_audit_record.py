@@ -58,6 +58,7 @@ os.chdir(V6_DIR)
 sys.path.insert(0, str(V6_DIR))
 
 import collate_wfv_results  # noqa: E402  (needs cwd=V6_DIR for its config.json load)
+import moo_selection as moo  # noqa: E402
 import optuna_calibrate_trend as mod_trend  # noqa: E402
 import optuna_calibrate_tv as mod_tv  # noqa: E402
 import optuna_calibrate_vm as mod_vm  # noqa: E402
@@ -76,8 +77,14 @@ MANDATED_FIELDS = [
     "refined_components", "baseline_components_available",
     "refined_components_available",
 ]
-COMPONENT_KEYS = ["cagr_pct", "sharpe_ratio", "calmar_ratio", "max_drawdown_pct",
-                  "penalty_total", "objective_score"]
+COMPONENT_KEYS = ["median_psr", "median_max_dd", "median_profit_factor",
+                  "median_sharpe", "median_calmar", "fold_count", "paths_count",
+                  "mean_fold_sharpe", "std_fold_sharpe", "admissible",
+                  "inadmissible_reason", "objective_score"]
+# P1-6: the survival decision is a vector comparison, so the audit record must
+# carry the objective vectors themselves (not only scalar scores).
+MANDATED_FIELDS += ["baseline_objectives", "refined_objectives", "objective_keys"]
+OBJECTIVE_KEYS_EXPECTED = list(moo.OBJECTIVE_KEYS)
 
 FAILURES: list[str] = []
 
@@ -102,20 +109,29 @@ def canonical_digest(params: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def layer_a_enum_classification() -> None:
-    print("Layer A: three-value enum classification (vm/tv/trend)")
+    print("Layer A: three-value enum classification (vm/tv/trend, P1-6 vector dominance)")
+    # Objectives are (PSR maximize, MaxDD% minimize, PF maximize).
     cases = [
-        # (baseline, refined, final_params, baseline_params, expected_decision, expected_incumbent)
-        (10.0, 12.0, {"a": 1}, {"a": 2}, "REFINED_WINS", False,
-         "refined strictly beats baseline -> refined params written"),
-        (10.0, 10.0, {"a": 2}, {"a": 2}, "TIE_KEEP_PARENT", True,
-         "exact tie: strict > keeps parent (enqueued baseline trial is best trial)"),
-        (10.0, 8.0, {"a": 2}, {"a": 2}, "BASELINE_WINS", True,
-         "revert branch fired (post-P0-4 unreachable in single-objective WFV, "
-         "reachable via TV/Trend empty-study fallback or stale-baseline key mismatch)"),
-        (10.0, 10.0, {"a": 1}, {"a": 2}, "TIE_KEEP_PARENT", False,
-         "tie with a non-parent best trial (stale-baseline edge): tie enum, incumbent False"),
-        (-5.0, -5.0, {"a": 2}, {"a": 2}, "TIE_KEEP_PARENT", True,
-         "negative-score tie behaves identically"),
+        # (baseline_objectives, refined_objectives, final_params, baseline_params,
+        #  expected_decision, expected_incumbent, note)
+        ([0.50, 10.0, 1.50], [0.60, 8.0, 1.80], {"a": 1}, {"a": 2}, "REFINED_WINS", False,
+         "refined strictly dominates baseline -> refined params written"),
+        ([0.50, 10.0, 1.50], [0.50, 10.0, 1.50], {"a": 2}, {"a": 2}, "TIE_KEEP_PARENT", True,
+         "exact vector tie: dominance keeps parent (enqueued baseline trial is the winner)"),
+        ([0.60, 8.0, 1.80], [0.50, 10.0, 1.50], {"a": 2}, {"a": 2}, "BASELINE_WINS", True,
+         "baseline dominates refined -> revert branch writes parent params back"),
+        ([0.50, 10.0, 2.00], [0.60, 11.0, 1.50], {"a": 2}, {"a": 2}, "TIE_KEEP_PARENT", True,
+         "non-dominated vectors (PSR up, MaxDD/PF worse): no strict dominance -> keep parent"),
+        ([0.50, 10.0, 2.00], [0.60, 11.0, 1.50], {"a": 1}, {"a": 2}, "TIE_KEEP_PARENT", False,
+         "non-dominated vectors with a different refined winner -> tie enum, incumbent False"),
+        (None, [0.60, 8.0, 1.80], {"a": 1}, {"a": 2}, "TIE_KEEP_PARENT", False,
+         "no baseline metrics recorded: honest tie, incumbent decided by params"),
+        ([0.60, 8.0, 1.80], None, {"a": 1}, {"a": 2}, "BASELINE_WINS", True,
+         "refined winner carries no metrics (inadmissible): baseline is the incumbent"),
+        (None, None, {"a": 2}, {"a": 2}, "TIE_KEEP_PARENT", True,
+         "both sides metric-less: tie enum, incumbent from params equality"),
+        ([-0.40, 25.0, 0.80], [-0.30, 24.0, 0.90], {"a": 1}, {"a": 2}, "REFINED_WINS", False,
+         "negative-objective domain behaves identically (all three improved)"),
     ]
     for strategy, mod in (("vm", mod_vm), ("tv", mod_tv), ("trend", mod_trend)):
         fn = getattr(mod, "classify_survival_decision", None)
@@ -128,12 +144,12 @@ def layer_a_enum_classification() -> None:
                 fail(f"{strategy}: classify({baseline},{refined}) -> ({dec},{inc}), "
                      f"expected ({exp_dec},{exp_inc}) [{note}]")
         # cross-module consistency on identical inputs
-        results = [fn(10.0, 10.0, {"a": 2}, {"a": 2}) for fn in
+        results = [fn([0.5, 10.0, 1.5], [0.5, 10.0, 1.5], {"a": 2}, {"a": 2}) for fn in
                    (mod_vm.classify_survival_decision, mod_tv.classify_survival_decision,
                     mod_trend.classify_survival_decision)]
         if len(set(results)) != 1:
             fail(f"{strategy}: the three calibrators' classifiers disagree: {results}")
-        ok(f"{strategy}: {len(cases)} synthetic combos classified correctly; classifiers agree across modules")
+        ok(f"{strategy}: {len(cases)} synthetic dominance combos classified correctly; classifiers agree across modules")
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +252,8 @@ def build_annual_baseline_fixture(path: Path) -> dict:
             params[k] = (lo + hi) / 2.0
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"best_parameters": params, "best_score": 0.0,
+               "best_objectives": [0.0, 0.0, 0.0],
+               "objective_keys": list(moo.OBJECTIVE_KEYS),
                "dataset_info": {"rows_used": 0, "strategy": "vm"},
                "optimization_type": "test_fixture"}
     path.write_text(json.dumps(payload, indent=2))
@@ -371,29 +389,54 @@ def layer_c_real_calibration() -> None:
         if absent or nonfinite:
             fail(f"baseline_components invalid: missing={absent} non-finite={nonfinite}")
         else:
-            ok(f"baseline_components available & finite (cagr={bc['cagr_pct']:.4f}, score={bc['objective_score']:.4f})")
+            ok(f"baseline_components available & finite (median_psr={bc['median_psr']:.4f}, "
+               f"median_max_dd={bc['median_max_dd']:.4f}, median_pf={bc['median_profit_factor']:.4f})")
     if not ra:
         if rc is not None:
             fail("refined_components_available=False but payload is not null")
-        # honest flagging: refined components are only missing when the best
-        # trial returned a sentinel before scoring; explicit null is the flag.
-        print("  [note] refined_components explicitly null (best trial returned a sentinel score path)")
+        # honest flagging: refined components are only missing when the winner
+        # carried no metrics; explicit null is the flag.
+        print("  [note] refined_components explicitly null (winner carried no CPCV metrics)")
     else:
         absent = [k for k in COMPONENT_KEYS if k not in rc]
         nonfinite = [k for k, v in rc.items() if isinstance(v, float) and not math.isfinite(v)]
         if absent or nonfinite:
             fail(f"refined_components invalid: missing={absent} non-finite={nonfinite}")
         else:
-            ok(f"refined_components available & finite (cagr={rc['cagr_pct']:.4f}, score={rc['objective_score']:.4f})")
+            ok(f"refined_components available & finite (median_psr={rc['median_psr']:.4f}, "
+               f"median_max_dd={rc['median_max_dd']:.4f}, median_pf={rc['median_profit_factor']:.4f})")
 
-    # score/decision arithmetic sanity
-    if rec["decision"] == "TIE_KEEP_PARENT" and rec["baseline_score"] != rec["refined_score"]:
-        fail("TIE_KEEP_PARENT recorded but scores differ")
-    if rec["decision"] == "REFINED_WINS" and not rec["refined_score"] > rec["baseline_score"]:
-        fail("REFINED_WINS recorded but refined_score !> baseline_score")
-    if rec["decision"] == "BASELINE_WINS" and not rec["baseline_score"] > rec["refined_score"]:
-        fail("BASELINE_WINS recorded but baseline_score !> refined_score")
-    ok("decision enum agrees with the recorded score comparison")
+    # P1-6: objective vectors are recorded, keyed, and the decision agrees with
+    # an independently recomputed dominance test.
+    bo, ro = rec["baseline_objectives"], rec["refined_objectives"]
+    if rec["objective_keys"] != OBJECTIVE_KEYS_EXPECTED:
+        fail(f"objective_keys {rec['objective_keys']} != contract {OBJECTIVE_KEYS_EXPECTED}")
+    else:
+        ok(f"objective_keys recorded in contract order: {rec['objective_keys']}")
+    for label, vec in (("baseline_objectives", bo), ("refined_objectives", ro)):
+        if vec is None:
+            continue
+        if len(vec) != len(OBJECTIVE_KEYS_EXPECTED):
+            fail(f"{label} has {len(vec)} entries, expected {len(OBJECTIVE_KEYS_EXPECTED)}")
+        elif any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in vec):
+            fail(f"{label} contains non-numeric/non-finite entries: {vec}")
+    if bo is not None and rec["baseline_score"] != bo[0]:
+        fail(f"baseline_score {rec['baseline_score']} is not the primary objective (PSR) of baseline_objectives")
+    if ro is not None and rec["refined_score"] != ro[0]:
+        fail(f"refined_score {rec['refined_score']} is not the primary objective (PSR) of refined_objectives")
+    if bo is not None and ro is not None:
+        ok("objective vectors are finite triples and scalar scores equal the primary objective (median PSR)")
+
+    # decision/dominance arithmetic sanity (P1-6 semantics)
+    base_dom_refined = moo.dominates(bo, ro) if (bo is not None and ro is not None) else None
+    refined_dom_base = moo.dominates(ro, bo) if (bo is not None and ro is not None) else None
+    if rec["decision"] == "REFINED_WINS" and not refined_dom_base:
+        fail("REFINED_WINS recorded but refined objectives do not strictly dominate baseline")
+    if rec["decision"] == "BASELINE_WINS" and not base_dom_refined:
+        fail("BASELINE_WINS recorded but baseline objectives do not strictly dominate refined")
+    if rec["decision"] == "TIE_KEEP_PARENT" and (refined_dom_base or base_dom_refined):
+        fail("TIE_KEEP_PARENT recorded but one side strictly dominates the other")
+    ok("decision enum agrees with the recorded objective-vector dominance comparison")
 
 
 def main() -> int:

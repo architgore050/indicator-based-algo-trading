@@ -3,6 +3,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import argparse
+import json
 import sys
 import time
 import tempfile
@@ -46,7 +47,10 @@ def _load_module_from_bak(bak_path: Path, module_name: str):
     code = bak_path.read_text(encoding="utf-8")
     ns = {
         "__name__": module_name,
-        "__file__": str(bak_path),
+        # The .bak sources resolve PROJECT_DIR from __file__; pointing it at the
+        # LIVE module path keeps their config.json / data.csv lookups in v6/
+        # instead of the parity_maintenance/ directory.
+        "__file__": str(Path(live_mod.__file__).resolve()),
         # Reuse the same imports as the live module
         "warnings": live_mod.warnings,
         "json": live_mod.json,
@@ -60,8 +64,12 @@ def _load_module_from_bak(bak_path: Path, module_name: str):
         "np": live_mod.np,
         "pd": live_mod.pd,
         "optuna": live_mod.optuna,
-        "QMCSampler": live_mod.QMCSampler,
-        "TPESampler": live_mod.TPESampler,
+        # P1-6: the live calibrators use NSGA-II; the .bak sources import their
+        # own (retired) QMC/TPE samplers when exec()'d, so these lookups are
+        # tolerant and only provide the live sampler class.
+        "NSGAIISampler": getattr(live_mod, "NSGAIISampler", None),
+        "QMCSampler": getattr(live_mod, "QMCSampler", None),
+        "TPESampler": getattr(live_mod, "TPESampler", None),
         "tqdm": live_mod.tqdm,
         "Parallel": live_mod.Parallel,
         "delayed": live_mod.delayed,
@@ -422,10 +430,11 @@ def test_tv_strategy_compare_backup(data: pd.DataFrame, tv_signals_current: pd.D
 
 
 def test_vm_objective_wrapper(data: pd.DataFrame):
-    """Smoke test the objective wrapper — verify scoring and pruning work."""
+    """Smoke test the P1-6 objective wrapper — verify the MOO metrics contract."""
     import cudf
-    from optuna_calibrate_vm import objective_wrapper
+    from optuna_calibrate_vm import objective_wrapper, SMOKE_CPCV_CONFIG
     import optuna
+    import math
 
     vm_params = {
         "multi_rsi_p1": 14,
@@ -448,26 +457,194 @@ def test_vm_objective_wrapper(data: pd.DataFrame):
         "use_slow_stoch_exit": False,
     }
 
-    print(f"\n=== VM Objective Wrapper Smoke Test ===")
+    print("\n=== VM Objective Wrapper Smoke Test (P1-6 MOO contract) ===")
 
     # Convert to cudf for the cudf-native functions
     gdf = cudf.from_pandas(data)
 
     try:
-        score = objective_wrapper(vm_params, gdf, trial_id="objective_smoke")
-        if isinstance(score, (int, float)) and not np.isnan(score):
-            print(f"PASS: objective_wrapper returned valid score: {score:.4f}")
-            return True
-        else:
-            print(f"FAIL: objective_wrapper returned invalid score: {score}")
-            return False
+        first = objective_wrapper(vm_params, gdf, trial_id="objective_smoke",
+                                  cpcv_config=SMOKE_CPCV_CONFIG)
+        second = objective_wrapper(vm_params, gdf, trial_id="objective_smoke_repeat",
+                                   cpcv_config=SMOKE_CPCV_CONFIG)
     except optuna.exceptions.TrialPruned as e:
-        # Pruning is a valid outcome — means checkpoint logic works
-        print(f"PASS: Trial correctly pruned (checkpoint logic active): {e}")
+        # Pruning is a valid outcome — means the per-fold checkpoint logic works
+        print(f"PASS: Trial correctly pruned (per-fold checkpoint logic active): {e}")
         return True
     except Exception as e:
-        print(f"FAIL: Unexpected error in objective_wrapper: {e}")
+        print(f"FAIL: Unexpected error in objective_wrapper: {type(e).__name__}: {e}")
         return False
+
+    ok = True
+    if not isinstance(first, dict) or "objectives" not in first:
+        print(f"FAIL: objective_wrapper did not return the P1-6 metrics dict: {type(first)}")
+        return False
+
+    objs = first["objectives"]
+    if len(objs) != 3 or any(not isinstance(v, float) or not math.isfinite(v) for v in objs):
+        print(f"FAIL: objectives must be 3 finite floats, got {objs}")
+        ok = False
+    cpcv = first.get("cpcv") or {}
+    need = ["median_psr", "median_max_dd", "median_profit_factor", "median_sharpe",
+            "median_calmar", "fold_count", "paths_count", "usable_folds",
+            "degenerate_folds", "admissible", "cpcv_config"]
+    missing = [k for k in need if k not in cpcv]
+    if missing:
+        print(f"FAIL: cpcv dict missing keys: {missing}")
+        ok = False
+    comps = first.get("score_components") or {}
+    if "penalty_total" in comps or "cagr_pct" in comps:
+        print(f"FAIL: score_components still carries retired penalty terms: {sorted(comps)}")
+        ok = False
+    if first.get("admissible") is not cpcv.get("admissible"):
+        print("FAIL: top-level admissible flag disagrees with the cpcv dict")
+        ok = False
+    if first != second:
+        print("FAIL: objective_wrapper is not deterministic across identical calls")
+        ok = False
+
+    if ok:
+        print(f"PASS: objective_wrapper returned the MOO metrics dict: "
+              f"PSR={objs[0]:.4f} MaxDD={objs[1]:.4f}% PF={objs[2]:.4f} "
+              f"folds={cpcv['fold_count']} paths={cpcv['paths_count']} "
+              f"admissible={first['admissible']} (deterministic across repeat call)")
+    return ok
+
+
+def test_objective_score_rebaseline(data: pd.DataFrame, out_path: Path):
+    """P1-6 score-level RE-BASELINE (two-stage, fail-closed).
+
+    Stage 1 (baseline preservation): the pre-P1-6 `.bak` calibrator source must
+    still exist and still carry the retired single-objective contract - a scalar
+    return, the CAGR + linear-penalty math, and the -9999/-8888 sentinels. The
+    .bak files are NOT rewritten. The .bak objective path cannot be *executed*
+    against today's cudf-only definitions.py (its pandas dual-path signal code
+    fails inside the cudf-native indicator helpers - the same documented reason
+    the signal compare-backup tests skip), so its preservation is verified at
+    source level. Numeric engine parity is proven separately and exactly by
+    parity_test_backtesting.py --compare-backup.
+
+    Stage 2 (new contract): the live P1-6 objective_wrapper must return the MOO
+    metrics dict, deterministically, with no retired penalty keys. The recorded
+    pair (retired contract vs new objective triple) is written to an evidence
+    JSON. The score CHANGE is the intentional P1-6 mandate; what is proven is
+    that the old path is gone from the live calibrators and the new contract is
+    complete and deterministic.
+    """
+    project_dir = Path(__file__).resolve().parent
+    v6_dir = project_dir.parent
+    bak_path = project_dir / "optuna_calibrate_vm.py.bak"
+    if not bak_path.exists():
+        print("\nFAIL: no backup file at optuna_calibrate_vm.py.bak for score re-baseline")
+        return False
+
+    from optuna_calibrate_vm import objective_wrapper, SMOKE_CPCV_CONFIG
+
+    vm_params = {
+        "multi_rsi_p1": 14, "multi_rsi_p2": 28, "multi_rsi_p3": 7, "multi_rsi_smal": 5,
+        "crsi_dom_cycle": 50, "crsi_vibration": 21, "crsi_leveling": 8,
+        "stoch_macd_fast_len": 8, "stoch_macd_slow_len": 21, "stoch_macd_signal_len": 5,
+        "stoch_macd_lookback": 3, "stoch_macd_fast_len_xd": 13,
+        "stoch_macd_slow_len_xd": 34, "stoch_macd_signal_len_xd": 8,
+        "stoch_macd_lookback_xd": 5, "confirmation_lookback_bars": 5,
+        "use_fast_stoch_exit": True, "use_slow_stoch_exit": False,
+    }
+
+    print("\n=== P1-6 Objective Score Re-Baseline (fail-closed) ===")
+
+    # ---- Stage 1: the retired scalar contract must survive in the .bak -------
+    bak_src = bak_path.read_text(encoding="utf-8")
+    stage1_markers = {
+        "scalar objective signature": "def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = \"trial\", use_gpu: bool = False) -> float:",
+        "no-signals sentinel": "return -9999.0",
+        "no-trades sentinel": "return -8888.0",
+        "linear penalty math": "penalty += (",
+        "penalty weights applied": "objective_score -= penalty",
+    }
+    stage1_missing = [label for label, needle in stage1_markers.items() if needle not in bak_src]
+    if stage1_missing:
+        print(f"FAIL: .bak baseline no longer carries the retired contract: {stage1_missing}")
+        return False
+    print(f"STAGE 1 ok: pre-P1-6 .bak baseline preserved untouched "
+          f"({len(stage1_markers)} contract markers present, .bak not rewritten)")
+
+    # The live calibrators must NOT carry that contract any more.
+    live_markers = {
+        "optuna_calibrate_vm.py": ["penalty += (", "objective_score -= penalty",
+                                   "penalty_weight_risk", "return -9999.0", "return -8888.0",
+                                   "direction=\"maximize\"", "study.best_value", "study.best_params"],
+        "optuna_calibrate_tv.py": ["penalty += (", "objective_score -= penalty",
+                                   "penalty_weight_risk", "return -9999.0", "return -8888.0",
+                                   "direction=\"maximize\"", "study.best_value", "study.best_params"],
+        "optuna_calibrate_trend.py": ["penalty += (", "objective_score -= penalty",
+                                      "penalty_weight_risk", "return -9999.0", "return -8888.0",
+                                      "direction=\"maximize\"", "study.best_value", "study.best_params"],
+    }
+    leaked = {}
+    for fname, needles in live_markers.items():
+        live_src = (v6_dir / fname).read_text(encoding="utf-8")
+        hits = [n for n in needles if n in live_src]
+        if hits:
+            leaked[fname] = hits
+    if leaked:
+        print(f"FAIL: retired scalar/penalty contract still present in live calibrators: {leaked}")
+        return False
+    print("STAGE 1 ok: retired scalar score + linear penalty math removed from all "
+          "three live calibrators")
+
+    # ---- Stage 2: the live MOO contract --------------------------------------
+    import cudf
+    gdf = cudf.from_pandas(data)
+    try:
+        metrics = objective_wrapper(dict(vm_params), gdf, trial_id="live_score",
+                                    cpcv_config=SMOKE_CPCV_CONFIG)
+        repeat = objective_wrapper(dict(vm_params), gdf, trial_id="live_score_repeat",
+                                   cpcv_config=SMOKE_CPCV_CONFIG)
+    except optuna.exceptions.TrialPruned as e:
+        print(f"FAIL: live objective_wrapper pruned during re-baseline: {e}")
+        return False
+    except Exception as e:
+        print(f"FAIL: live objective_wrapper error: {type(e).__name__}: {e}")
+        return False
+
+    if not isinstance(metrics, dict) or len(metrics.get("objectives", [])) != 3:
+        print("FAIL: live objective_wrapper did not return a 3-objective metrics dict")
+        return False
+    if metrics != repeat:
+        print("FAIL: live objective_wrapper is not deterministic across identical calls")
+        return False
+
+    evidence = {
+        "strategy": "vm",
+        "rows_evaluated": len(data),
+        "params": dict(vm_params),
+        "pre_p1_6_contract": {
+            "source": "v6/parity_maintenance/optuna_calibrate_vm.py.bak",
+            "objective_type": "single scalar (CAGR + linear penalties, -9999/-8888 sentinels)",
+            "executable_against_current_definitions_py": False,
+            "reason_not_executed": ("the .bak pandas dual-path signal code fails inside the "
+                                    "cudf-only definitions.py indicator helpers"),
+            "engine_parity_proven_by": "parity_test_backtesting.py --compare-backup (exact)",
+        },
+        "p1_6_objectives": [float(v) for v in metrics["objectives"]],
+        "p1_6_objective_keys": ["psr", "max_dd_pct", "profit_factor"],
+        "p1_6_cpcv_summary": {
+            "fold_count": metrics["cpcv"]["fold_count"],
+            "paths_count": metrics["cpcv"]["paths_count"],
+            "median_sharpe": metrics["cpcv"]["median_sharpe"],
+            "median_calmar": metrics["cpcv"]["median_calmar"],
+            "admissible": metrics["cpcv"]["admissible"],
+            "cpcv_config": metrics["cpcv"]["cpcv_config"],
+        },
+        "deterministic_repeat_match": True,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(evidence, indent=2))
+    print(f"STAGE 2 ok: P1-6 objectives = {[round(v, 6) for v in metrics['objectives']]} "
+          f"(deterministic); evidence written to {out_path}")
+    print("RE-BASELINED: the retired scalar contract is recorded for the record; the live "
+          "objective is now the CPCV MOO triple.")
+    return True
 
 
 def benchmark_strategy(strategy_name, load_func, run_func, params_fn, data_sizes, n_runs=5):
@@ -660,6 +837,17 @@ def main():
                 all_passed = all_passed and passed
             except Exception as e:
                 print(f"VM backup comparison error: {e}")
+                all_passed = False
+
+        # P1-6 score-level re-baseline (two-stage, fail-closed). Runs after the
+        # GPU tests because loading the .bak module resets the CUDA context.
+        if args.strategy in ("vm", "both"):
+            try:
+                passed = test_objective_score_rebaseline(
+                    data, Path(__file__).resolve().parents[1] / "tmp" / "p1_6_score_rebaseline.json")
+                all_passed = all_passed and passed
+            except Exception as e:
+                print(f"Score re-baseline error: {e}")
                 all_passed = False
 
         if args.strategy in ("tv", "both") and tv_signals_current is not None:

@@ -18,6 +18,13 @@ Also verifies:
     reproduces the pre-fix standalone trades (when --baseline-trades given),
     and config overrides (SL=1 vs SL=50) produce different trade lists.
 
+P1-6 re-anchoring: the objective now returns the CPCV MOO metrics dict, and each
+objective call runs the engine once per unique CPCV fold. The capture is
+installed on backtest_xauusd_signal_csv.run_backtest (the calibrators reach the
+engine through that module attribute), byte-identity is checked across the whole
+fold list, and the concurrent study is multi-objective (3 directions, compared
+via trial.values).
+
 Run from v6/ inside the rapids venv:
     cd v6 && source ~/venvs/rapids/bin/activate && unset PYTHONPATH
     python parity_maintenance/test_backtest_config_isolation.py
@@ -71,12 +78,18 @@ STRATEGY_SPECS = {
 _tls = threading.local()
 
 
-def install_capture(mod):
-    """Wrap mod.run_backtest so each call records (set_name, trades_csv, cfg_exit_values)."""
-    real_rb = mod.run_backtest
+def install_capture(bt_mod):
+    """Wrap backtest_xauusd_signal_csv.run_backtest so each call records
+    (trades_csv, cfg_exit_values) for the calling thread.
 
-    def capturing_run_backtest(data, signals, seed=None, config=None):
-        result = real_rb(data, signals, seed=seed, config=config)
+    P1-6: the calibrators call the engine through bt_mod.run_backtest (module
+    attribute lookup inside _checkpoint_engine), so the capture must be installed
+    on the backtester module - one capture per CPCV fold.
+    """
+    real_rb = bt_mod.run_backtest
+
+    def capturing_run_backtest(data, signals, seed=None, config=None, **extra):
+        result = real_rb(data, signals, seed=seed, config=config, **extra)
         store = getattr(_tls, "captures", None)
         if store is not None:
             trades = result[0]
@@ -84,14 +97,25 @@ def install_capture(mod):
             store.append({"trades_csv": trades.to_csv(index=False), "cfg_exits": cfg_exits})
         return result
 
-    mod.run_backtest = capturing_run_backtest
+    bt_mod.run_backtest = capturing_run_backtest
 
 
 def call_objective(mod, strategy, params, data, trial_id):
-    """objective_wrapper signature differs for TV (no trial_id kwarg)."""
-    if strategy == "tv":
-        return mod.objective_wrapper(params, data)
-    return mod.objective_wrapper(params, data, trial_id=trial_id)
+    """P1-6: all three calibrators share the same objective_wrapper kwargs contract."""
+    return mod.objective_wrapper(params, data, trial_id=trial_id,
+                                 cpcv_config=mod.SMOKE_CPCV_CONFIG)
+
+
+def objectives_of(score):
+    """Extract the comparable objective triple from a P1-6 metrics dict (or PRUNED)."""
+    if isinstance(score, dict):
+        return [round(float(v), 12) for v in score.get("objectives", [])]
+    return score
+
+
+def captures_csv(captures):
+    """Byte-identity key for a whole CPCV evaluation: every fold's trade list."""
+    return [c["trades_csv"] for c in captures]
 
 
 def run_objective_once(mod, strategy, params, data, set_name, trial_id):
@@ -110,12 +134,25 @@ def trades_csv_of(trades_df: pd.DataFrame) -> str:
     return trades_df.to_csv(index=False)
 
 
-def exit_reason_counts(trades_csv: str) -> dict:
+def exit_reason_counts(trades_csv) -> dict:
     import io
-    df = pd.read_csv(io.StringIO(trades_csv)) if trades_csv.strip() else pd.DataFrame(columns=["exit_reason"])
+    if isinstance(trades_csv, list):
+        frames = [pd.read_csv(io.StringIO(c)) for c in trades_csv if c.strip()]
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["exit_reason"])
+    else:
+        df = pd.read_csv(io.StringIO(trades_csv)) if trades_csv.strip() else pd.DataFrame(columns=["exit_reason"])
     if df.empty:
         return {}
     return df["exit_reason"].value_counts().to_dict()
+
+
+def concat_fold_trades(captures) -> pd.DataFrame:
+    """All CPCV fold trade tables joined into one frame (for trade-level proofs)."""
+    import io
+    frames = [pd.read_csv(io.StringIO(c["trades_csv"])) for c in captures if c["trades_csv"].strip()]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool:
@@ -129,7 +166,7 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
     print(f"Data window: rows [{end_row - rows}, {end_row}] ({rows:,} bars)")
 
     data = mod.load_calibration_data(rows, end_row)
-    install_capture(mod)
+    install_capture(bt_mod)
 
     bp_before = copy.deepcopy(mod.BP)
     bt_bp_before = copy.deepcopy(bt_mod.BP)
@@ -159,36 +196,37 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
         fail("serial objective produced no run_backtest capture (empty signals?) — increase --rows")
         return False
 
-    trades_a_serial = cap_a1[0]["trades_csv"]
-    trades_b_serial = cap_b1[0]["trades_csv"]
+    trades_a_serial = captures_csv(cap_a1)
+    trades_b_serial = captures_csv(cap_b1)
 
-    if trades_a_serial == trades_csv_of_capture(cap_a2):
-        ok("Set A serial run 1 == run 2 (byte-identical trades)")
+    if trades_a_serial == captures_csv(cap_a2):
+        ok(f"Set A serial run 1 == run 2 (byte-identical trades across {len(cap_a1)} CPCV folds)")
     else:
         fail("Set A serial runs differ (non-deterministic)")
-    if score_a1 == score_a2:
-        ok(f"Set A serial score stable: {score_a1}")
+    if objectives_of(score_a1) == objectives_of(score_a2):
+        ok(f"Set A serial objectives stable: {objectives_of(score_a1)}")
     else:
-        fail(f"Set A serial scores differ: {score_a1} vs {score_a2}")
+        fail(f"Set A serial objectives differ: {objectives_of(score_a1)} vs {objectives_of(score_a2)}")
 
-    if trades_b_serial == trades_csv_of_capture(cap_b2):
-        ok("Set B serial run 1 == run 2 (byte-identical trades)")
+    if trades_b_serial == captures_csv(cap_b2):
+        ok(f"Set B serial run 1 == run 2 (byte-identical trades across {len(cap_b1)} CPCV folds)")
     else:
         fail("Set B serial runs differ (non-deterministic)")
-    if score_b1 == score_b2:
-        ok(f"Set B serial score stable: {score_b1}")
+    if objectives_of(score_b1) == objectives_of(score_b2):
+        ok(f"Set B serial objectives stable: {objectives_of(score_b1)}")
     else:
-        fail(f"Set B serial scores differ: {score_b1} vs {score_b2}")
+        fail(f"Set B serial objectives differ: {objectives_of(score_b1)} vs {objectives_of(score_b2)}")
 
     # ---- 2. Real invariant: conflicting sets must produce DIFFERENT results ----
     if trades_a_serial == trades_b_serial:
         fail("Set A and Set B produced IDENTICAL trades — sampled exits are NOT reaching the backtest (dead dimensions)")
     else:
-        ok(f"Set A and Set B produce different trades ({len(cap_a1[0]['trades_csv'])} vs {len(cap_b1[0]['trades_csv'])} bytes)")
-    if score_a1 == score_b1:
-        fail("Set A and Set B produced identical scores — exit overrides have no effect")
+        ok(f"Set A and Set B produce different trades ({sum(len(c) for c in trades_a_serial)} vs "
+           f"{sum(len(c) for c in trades_b_serial)} bytes across folds)")
+    if objectives_of(score_a1) == objectives_of(score_b1):
+        fail("Set A and Set B produced identical objectives — exit overrides have no effect")
     else:
-        ok(f"Set A score {score_a1} != Set B score {score_b1}")
+        ok(f"Set A objectives {objectives_of(score_a1)} != Set B objectives {objectives_of(score_b1)}")
 
     # Direct proof the overrides reached execution: A's max_hold=10 must cap
     # every A trade at <=10 bars held, while B (max_hold=1440) must contain at
@@ -199,8 +237,8 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
     print(f"  INFO: Set B exit reasons: {b_reasons}")
 
     import io as _io
-    df_a = pd.read_csv(_io.StringIO(trades_a_serial))
-    df_b = pd.read_csv(_io.StringIO(trades_b_serial))
+    df_a = concat_fold_trades(cap_a1)
+    df_b = concat_fold_trades(cap_b1)
     # The backtester skips ALL risk-exit checks (including max_hold) while
     # i < warmup_bars, so positions entered during warmup may legitimately be
     # held longer than max_hold. Only post-warmup entries prove the cap.
@@ -235,17 +273,19 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
     else:
         print("  INFO: Set A had no max_hold_bars exits (signal exits fired first) — bars_held cap check above is the proof")
 
-    # Captured cfg at the run_backtest boundary must carry the set's exit values.
-    for cap, set_params, name in ((cap_a1[0], set_a, "A"), (cap_b1[0], set_b, "B")):
-        if cap["cfg_exits"] is None:
-            fail(f"Set {name}: objective passed config=None to run_backtest")
-        elif any(cap["cfg_exits"][k] != set_params[k] for k in EXIT_KEYS):
-            fail(f"Set {name}: run_backtest received cfg exits {cap['cfg_exits']} != {set_params}")
+    # Captured cfg at the run_backtest boundary must carry the set's exit values
+    # on EVERY CPCV fold call.
+    for caps, set_params, name in ((cap_a1, set_a, "A"), (cap_b1, set_b, "B")):
+        bad = [c for c in caps if c["cfg_exits"] is None
+               or any(c["cfg_exits"][k] != set_params[k] for k in EXIT_KEYS)]
+        if bad:
+            fail(f"Set {name}: {len(bad)}/{len(caps)} run_backtest fold call(s) did not carry "
+                 f"the set's exit values (e.g. {bad[0]['cfg_exits']})")
         else:
-            ok(f"Set {name}: run_backtest call carried the set's exit values")
+            ok(f"Set {name}: all {len(caps)} run_backtest fold calls carried the set's exit values")
 
     # ---- 3. Concurrent mode: Optuna n_jobs=2 threads, same fixed sets ----
-    study = optuna.create_study(direction="maximize")  # in-memory: no PostgreSQL writes
+    study = optuna.create_study(directions=["maximize", "minimize", "maximize"])  # in-memory
     captures_by_trial: dict[int, list] = {}  # trial.number -> captures (unique keys: GIL-safe)
 
     def fixed_objective(trial):
@@ -253,14 +293,14 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
         params = set_a if set_name == "A" else set_b
         _tls.captures = []
         try:
-            score = call_objective(mod, strategy, params, data, f"conc_{trial.number}")
+            metrics = call_objective(mod, strategy, params, data, f"conc_{trial.number}")
         except optuna.exceptions.TrialPruned:
             captures_by_trial[trial.number] = _tls.captures
             _tls.captures = None
             raise
         captures_by_trial[trial.number] = _tls.captures
         _tls.captures = None
-        return score
+        return tuple(metrics["objectives"])
 
     study.optimize(fixed_objective, n_trials=n_trials, n_jobs=2)
 
@@ -272,32 +312,34 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
         if not caps:
             fail(f"concurrent trial {t.number} (Set A): no capture")
             continue
-        if caps[0]["trades_csv"] != trades_a_serial:
+        if captures_csv(caps) != trades_a_serial:
             fail(f"concurrent trial {t.number} (Set A): trades differ from serial Set A (config leak)")
         else:
-            ok(f"concurrent trial {t.number} (Set A): byte-identical to serial")
-        expected = score_a1
-        got = t.value if t.value is not None else ("PRUNED" if t.state.name == "PRUNED" else None)
+            ok(f"concurrent trial {t.number} (Set A): byte-identical to serial across all folds")
+        expected = objectives_of(score_a1)
+        got = ([round(float(v), 12) for v in t.values] if t.values is not None
+               else ("PRUNED" if t.state.name == "PRUNED" else None))
         if got == expected:
-            ok(f"concurrent trial {t.number} (Set A): score {got} == serial")
+            ok(f"concurrent trial {t.number} (Set A): objectives {got} == serial")
         else:
-            fail(f"concurrent trial {t.number} (Set A): score {got} != serial {expected}")
+            fail(f"concurrent trial {t.number} (Set A): objectives {got} != serial {expected}")
 
     for t in conc_b:
         caps = captures_by_trial.get(t.number, [])
         if not caps:
             fail(f"concurrent trial {t.number} (Set B): no capture")
             continue
-        if caps[0]["trades_csv"] != trades_b_serial:
+        if captures_csv(caps) != trades_b_serial:
             fail(f"concurrent trial {t.number} (Set B): trades differ from serial Set B (config leak)")
         else:
-            ok(f"concurrent trial {t.number} (Set B): byte-identical to serial")
-        expected = score_b1
-        got = t.value if t.value is not None else ("PRUNED" if t.state.name == "PRUNED" else None)
+            ok(f"concurrent trial {t.number} (Set B): byte-identical to serial across all folds")
+        expected = objectives_of(score_b1)
+        got = ([round(float(v), 12) for v in t.values] if t.values is not None
+               else ("PRUNED" if t.state.name == "PRUNED" else None))
         if got == expected:
-            ok(f"concurrent trial {t.number} (Set B): score {got} == serial")
+            ok(f"concurrent trial {t.number} (Set B): objectives {got} == serial")
         else:
-            fail(f"concurrent trial {t.number} (Set B): score {got} != serial {expected}")
+            fail(f"concurrent trial {t.number} (Set B): objectives {got} != serial {expected}")
 
     # ---- 4. Module BP immutability ----
     if mod.BP == bp_before:

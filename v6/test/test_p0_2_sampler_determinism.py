@@ -7,9 +7,10 @@ Run from v6/ inside the rapids venv (GPU required for Part 3):
     CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB \
         python -u test/test_p0_2_sampler_determinism.py
 
-What it proves (docs/externalReview_pipeline_correctness.md, P0-2 verdict):
+What it proves (docs/externalReview_pipeline_correctness.md, P0-2 verdict,
+re-anchored for the P1-6 MOO rollout — every phase now runs NSGA-II):
 
-1. Static audit — all three calibrators import QMCSampler, give
+1. Static audit — all three calibrators import NSGAIISampler, give
    sqlite_retry_optimize a `sampler=None` parameter, apply it to the shared study,
    receive `sampler=sampler` from run_study, tag every trial with
    `user_attr["phase"]`, and derive each phase seed from
@@ -17,17 +18,17 @@ What it proves (docs/externalReview_pipeline_correctness.md, P0-2 verdict):
 
 2. Seed scheme — the derived seed is stable for a given (window_index, phase),
    differs across window_index, differs across phase, and fits in 32 bits.
-   Samplers built from those seeds reproduce identical trial archives when run
-   sequentially (n_jobs=1) and differ when the window_index differs.
+   NSGA-II samplers built from those seeds reproduce identical trial archives when
+   run sequentially (n_jobs=1) and differ when the window_index differs.
 
 3. Real calibrator (VM, smoke, 1000-row window, n_jobs forced to 1) — three runs:
    A: --window-index 0, B: --window-index 0, C: --window-index 7.
    Each run's full trial archive is read back from the PostgreSQL Optuna storage.
    A == B (deterministic per-phase seeds), A != C (the seed reaches the sampler).
    Every trial must carry user_attr["phase"], the sampler handed to run_study per
-   phase must be QMCSampler (phase 1) / TPESampler (phases 2-3), the study sampler
-   must be the *same object* after optimize (the sampler argument is no longer
-   ignored), and the logged sampler class/seed must match what was actually wired.
+   phase must be NSGAIISampler, the study sampler must be the *same object* after
+   optimize (the sampler argument is no longer ignored), and the logged
+   sampler class/seed must match what was actually wired.
 
 Exit code 0 only if every check passes.
 """
@@ -44,7 +45,7 @@ V6 = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(V6))
 
 import optuna  # noqa: E402
-from optuna.samplers import QMCSampler, TPESampler  # noqa: E402
+from optuna.samplers import NSGAIISampler  # noqa: E402
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -74,7 +75,9 @@ def part1_static_audit() -> None:
     print("\n=== Part 1: static sampler-wiring audit ===")
     for fname in CALIBRATORS:
         src = (V6 / fname).read_text()
-        check(f"{fname}: imports QMCSampler", "from optuna.samplers import QMCSampler" in src)
+        check(f"{fname}: imports NSGAIISampler", "from optuna.samplers import NSGAIISampler" in src)
+        check(f"{fname}: no retired QMCSampler/TPESampler sampler wiring remains",
+              "QMCSampler(" not in src and "TPESampler(" not in src)
         check(f"{fname}: sqlite_retry_optimize accepts sampler=None",
               "def sqlite_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20, sampler=None):" in src)
         check(f"{fname}: sampler applied to the shared study",
@@ -97,16 +100,19 @@ def part1_static_audit() -> None:
 # ---------------------------------------------------------------------------
 
 def _synthetic_objective(trial):
-    return (trial.suggest_float("a", 0.0, 1.0)
-            + trial.suggest_int("b", 1, 50)
-            + trial.suggest_float("c", 0.0, 100.0))
+    trial.set_user_attr("phase", 1)
+    a = trial.suggest_float("a", 0.0, 1.0)
+    b = trial.suggest_int("b", 1, 50)
+    c = trial.suggest_float("c", 0.0, 100.0)
+    # MOO triple matching the P1-6 contract: (PSR maximize, MaxDD% minimize, PF maximize)
+    return (a + b / 50.0, c, a * c)
 
 
 def _archive(sampler, n_trials: int = 6) -> list:
-    study = optuna.create_study(direction="maximize")
-    study.sampler = sampler
+    study = optuna.create_study(directions=["maximize", "minimize", "maximize"],
+                                sampler=sampler)
     study.optimize(_synthetic_objective, n_trials=n_trials, n_jobs=1)
-    return [(t.number, t.state.name, tuple(sorted(t.params.items())))
+    return [(t.number, t.state.name, tuple(sorted(t.params.items())), tuple(t.values))
             for t in sorted(study.trials, key=lambda t: t.number)]
 
 
@@ -125,35 +131,35 @@ def part2_seed_scheme() -> None:
           all(0 <= s <= 0xFFFFFFFF for s in seeds.values()),
           f"phase1 window0 seed={seeds[(0, 1)]}, window184 seed={seeds[(184, 1)]}")
 
-    qmc_a = _archive(QMCSampler(seed=seeds[(0, 1)]))
-    qmc_b = _archive(QMCSampler(seed=seeds[(0, 1)]))
-    qmc_c = _archive(QMCSampler(seed=seeds[(7, 1)]))
-    check("QMCSampler: same (window_index, phase) seed reproduces identical archive",
-          qmc_a == qmc_b)
-    check("QMCSampler: different window_index seed produces different archive",
-          qmc_a != qmc_c)
+    nsga_a = _archive(NSGAIISampler(seed=seeds[(0, 1)]))
+    nsga_b = _archive(NSGAIISampler(seed=seeds[(0, 1)]))
+    nsga_c = _archive(NSGAIISampler(seed=seeds[(7, 1)]))
+    check("NSGAIISampler: same (window_index, phase) seed reproduces identical archive",
+          nsga_a == nsga_b)
+    check("NSGAIISampler: different window_index seed produces different archive",
+          nsga_a != nsga_c)
+    check("NSGAIISampler: archive carries the 3-objective value triple per trial",
+          all(len(rec[3]) == 3 for rec in nsga_a),
+          json.dumps(nsga_a[0][3]))
 
-    tpe_a = _archive(TPESampler(n_startup_trials=3, seed=seeds[(0, 3)]))
-    tpe_b = _archive(TPESampler(n_startup_trials=3, seed=seeds[(0, 3)]))
-    tpe_c = _archive(TPESampler(n_startup_trials=3, seed=seeds[(7, 3)]))
-    check("TPESampler: same (window_index, phase) seed reproduces identical archive",
-          tpe_a == tpe_b)
-    check("TPESampler: different window_index seed produces different archive",
-          tpe_a != tpe_c)
+    # NSGA-II exposes no public seed attribute; determinism comes from the seed
+    # passed at construction plus sequential optimization (asserted in Part 3).
+    check("NSGAIISampler: no public .seed attribute (determinism is seed-at-construction)",
+          getattr(NSGAIISampler(seed=seeds[(0, 1)]), "seed", None) is None)
 
     # Documented Optuna behaviour (not a P0-2 regression): with n_jobs>1 Optuna
     # reseeds the sampler per parallel worker, so seeds only give reproducibility
-    # in sequential mode. Reported, not asserted.
+    # in sequential mode. Reported, not asserted. The P1-6 calibrators pin n_jobs=1.
     def par_archive(sampler):
-        study = optuna.create_study(direction="maximize")
-        study.sampler = sampler
+        study = optuna.create_study(directions=["maximize", "minimize", "maximize"],
+                                    sampler=sampler)
         study.optimize(_synthetic_objective, n_trials=12, n_jobs=8)
         return [(t.number, tuple(sorted(t.params.items()))) for t in sorted(study.trials, key=lambda t: t.number)]
 
-    p1, p2 = par_archive(TPESampler(n_startup_trials=3, seed=seeds[(0, 3)])), par_archive(TPESampler(n_startup_trials=3, seed=seeds[(0, 3)]))
+    p1, p2 = par_archive(NSGAIISampler(seed=seeds[(0, 3)])), par_archive(NSGAIISampler(seed=seeds[(0, 3)]))
     print(f"[INFO] n_jobs=8 reproducibility with a fixed seed: {p1 == p2} "
           "(Optuna reseeds samplers per parallel worker; seeds are only "
-          "reproducible at n_jobs=1 — see docs/P0-2_sampler_wiring.md)")
+          "reproducible at n_jobs=1 — the P1-6 calibrators pin n_jobs=1)")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +210,8 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
     orig_run_study = cal.run_study
     orig_retry = cal.sqlite_retry_optimize
 
-    def spy_run_study(phase, n_trials, sampler, data, study, current_best=None, distribution_prior=None):
+    def spy_run_study(phase, n_trials, sampler, data, study, current_best=None,
+                      distribution_prior=None, cpcv_config=None, quality_floors=True):
         current_phase[0] = phase
         samplers_seen.append({
             "phase": phase,
@@ -212,9 +219,14 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
             "class": type(sampler).__name__,
             "seed": _sampler_seed(sampler),
             "expected_seed": seed_for(window_index, phase),
+            "cpcv_knobs": dict(cpcv_config or {}),
+            "quality_floors": quality_floors,
         })
         return orig_run_study(phase, n_trials, sampler, data, study,
-                              current_best=current_best, distribution_prior=distribution_prior)
+                              current_best=current_best,
+                              distribution_prior=distribution_prior,
+                              cpcv_config=cpcv_config,
+                              quality_floors=quality_floors)
 
     def spy_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20, sampler=None):
         out = orig_retry(study, objective, n_trials, n_jobs, max_retries=max_retries, sampler=sampler)
@@ -252,9 +264,11 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
     archive = [{
         "number": t.number,
         "state": t.state.name,
-        "value": t.value,
+        "values": list(t.values) if t.values is not None else None,
+        "constraints": t.constraints,
         "params": t.params,
         "phase": t.user_attrs.get("phase"),
+        "admissible": t.user_attrs.get("admissible"),
     } for t in sorted(study.trials, key=lambda t: t.number)]
 
     return {
@@ -272,6 +286,7 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
 
 def part3_real_runs() -> None:
     print("\n=== Part 3: real VM calibrator runs (smoke, n_jobs=1) ===")
+    import backtest_xauusd_signal_csv as bt_mod
     import optuna_calibrate_vm as cal
     storage_url = cal.get_postgres_url()
 
@@ -293,22 +308,25 @@ def part3_real_runs() -> None:
         check(f"{tag}: every phase ran with n_jobs=1",
               all(w["n_jobs"] == 1 for w in run["wiring_seen"]))
 
-        # Per-phase sampler class + seed actually used.
+        # Per-phase sampler class + seed actually used (P1-6: NSGA-II in every phase).
         by_phase = {s["phase"]: s for s in run["samplers_seen"]}
-        check(f"{tag}: Phase 1 sampler is QMCSampler",
-              by_phase.get(1, {}).get("class") == "QMCSampler",
-              json.dumps(by_phase.get(1)))
-        check(f"{tag}: Phase 1 seed matches uuid5(window_index, 1)",
-              by_phase.get(1, {}).get("seed") == by_phase.get(1, {}).get("expected_seed"))
-        check(f"{tag}: Phase 3 sampler is TPESampler",
-              by_phase.get(3, {}).get("class") == "TPESampler",
-              json.dumps(by_phase.get(3)))
-        check(f"{tag}: Phase 3 seed matches uuid5(window_index, 3) (logged)",
-              any(f"Phase 3 sampler: TPESampler seed={seed_for(run['window_index'], 3)}" in ln
-                  for ln in run["sampler_log_lines"]),
-              " | ".join(run["sampler_log_lines"]))
+        log_blob = " | ".join(run["sampler_log_lines"])
+        for phase in sorted(by_phase):
+            check(f"{tag}: Phase {phase} sampler is NSGAIISampler",
+                  by_phase[phase].get("class") == "NSGAIISampler",
+                  json.dumps(by_phase[phase]))
+            check(f"{tag}: Phase {phase} seed logged from uuid5(window_index, {phase})",
+                  f"Phase {phase} sampler: NSGAIISampler seed={seed_for(run['window_index'], phase)}" in log_blob,
+                  log_blob)
+        check(f"{tag}: smoke runs disable the Sharpe/Calmar quality floors (admissibility stays on)",
+              all(s["quality_floors"] is False for s in run["samplers_seen"]),
+              json.dumps([s["quality_floors"] for s in run["samplers_seen"]]))
+        check(f"{tag}: smoke runs evaluate with the SMOKE CPCV knob set",
+              all(s["cpcv_knobs"].get("n_splits") == bt_mod.SMOKE_CPCV_CONFIG["n_splits"]
+                  for s in run["samplers_seen"] if s["cpcv_knobs"]),
+              json.dumps([s["cpcv_knobs"] for s in run["samplers_seen"]]))
         check(f"{tag}: logged sampler class matches wired sampler class",
-              all(f"Phase {s['phase']} sampler: {s['class']}" in " | ".join(run["sampler_log_lines"])
+              all(f"Phase {s['phase']} sampler: {s['class']}" in log_blob
                   for s in run["samplers_seen"]))
 
         # Core acceptance test (external review P0-2): the test must fail if the

@@ -236,6 +236,34 @@ def layer_a_source_audit() -> None:
 # Layer B — behavioral exec of the real blocks
 # ---------------------------------------------------------------------------
 
+def _stub_objective(params, data=None, trial_id="trial", components_out=None, **kw):
+    """P1-6 objective_wrapper contract: a metrics dict, never a scalar score."""
+    cpcv = {
+        "objectives": [0.5, 10.0, 1.5],
+        "median_psr": 0.5, "median_max_dd": 10.0, "median_profit_factor": 1.5,
+        "median_sharpe": 1.0, "median_calmar": 2.0, "fold_count": 4,
+        "usable_folds": [0, 1, 2, 3], "degenerate_folds": [],
+        "paths_count": 6, "paths_total": 6,
+        "mean_fold_sharpe": 1.0, "std_fold_sharpe": 0.5,
+        "fold_sharpes": [1.0] * 4, "fold_psrs": [0.6] * 4,
+        "fold_trades": {"0": 5, "1": 5, "2": 5, "3": 5},
+        "path_psrs": [0.6] * 6, "path_max_dd_pct": [10.0] * 6,
+        "path_profit_factors": [1.5] * 6, "path_sharpes": [1.0] * 6,
+        "path_calmars": [2.0] * 6, "train_bars_per_path": [100] * 6,
+        "admissible": True, "inadmissible_reason": None,
+        "cpcv_config": {"n_splits": 4, "test_folds": 2},
+    }
+    comps = {k: cpcv[k] for k in ("median_psr", "median_max_dd", "median_profit_factor",
+                                  "median_sharpe", "median_calmar", "fold_count",
+                                  "paths_count", "mean_fold_sharpe", "std_fold_sharpe",
+                                  "admissible", "inadmissible_reason")}
+    comps["objective_score"] = cpcv["objectives"][0]
+    if components_out is not None:
+        components_out.update(comps)
+    return {"objectives": list(cpcv["objectives"]), "admissible": True,
+            "inadmissible_reason": None, "cpcv": cpcv, "score_components": comps}
+
+
 def build_namespace(strategy: str, tmp: Path, *, annual_path: Path | None,
                     results_path: Path, phase3_only: bool) -> tuple[dict, RecordingLogger]:
     mod, ranges_key = STRATEGIES[strategy]
@@ -251,13 +279,18 @@ def build_namespace(strategy: str, tmp: Path, *, annual_path: Path | None,
         "json": json,
         "Path": Path,
         "np": mod.np,
+        "optuna": mod.optuna,
         "logger": log,
         "data": None,
-        "objective_wrapper": lambda params, data=None, trial_id="trial", **kw: 42.0,
+        "objective_wrapper": _stub_objective,
+        "cpcv_knobs": dict(mod.SMOKE_CPCV_CONFIG),
+        "_inadmissible_metrics": mod._inadmissible_metrics,
+        "_fmt_objectives": mod._fmt_objectives,
         # main() initialises these before the blocks run
         "current_best": None,
         "baseline_annual_params": None,
-        "baseline_annual_score": -mod.np.inf,
+        "baseline_objectives": None,
+        "baseline_components": {},
         "distribution_prior": None,
     }
     return ns, log

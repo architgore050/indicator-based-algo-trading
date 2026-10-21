@@ -15,6 +15,8 @@ from tqdm import tqdm
 
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
+import moo_selection as moo
+
 PYTHON = sys.executable
 
 suppress_pandas_warnings()
@@ -340,7 +342,13 @@ def _resolve_parent_path(wfv_dir, window_index, full_recal_interval, strategy):
 
 def _compute_distribution_prior(wfv_dir, window_index, full_recal_interval):
     """Compute distribution prior from parent annual's Phase 1+2 trials.
-    
+
+    P1-6: the parent's archived trials are ranked by the multi-objective Pareto
+    front (PSR / MaxDD / profit factor) and a crowding-distance-diverse subset
+    is transferred (30% of Phase 1, 20% of Phase 2, equal weight). Archives that
+    predate P1-6 (no "objectives" vectors) are reported as incompatible and the
+    transfer is skipped loudly.
+
     Returns path to the combined distribution prior JSON, or None if unavailable.
     """
     import numpy as np
@@ -359,17 +367,54 @@ def _compute_distribution_prior(wfv_dir, window_index, full_recal_interval):
     with open(phase2_path, "r") as f:
         phase2_data = json.load(f)
     
-    # Compute stats from top 30% of Phase 1
-    p1_values = [t for t in phase1_data if t["state"] != "PRUNED" and t["value"] is not None]
-    if not p1_values:
+    # P1-6: parent transfer ranks the parent's archived trials by the
+    # multi-objective front (PSR / MaxDD / profit factor) and keeps a
+    # crowding-distance-diverse subset, instead of sorting by the retired scalar
+    # score. Archives written before P1-6 carry no "objectives" vectors: the
+    # transfer is explicitly incompatible with them and is reported loudly
+    # instead of silently falling back.
+    def select_archived(trials, fraction, label):
+        complete = [
+            t for t in trials
+            if t.get("state") == "COMPLETE"
+            and t.get("objectives") is not None
+            and t.get("params")
+        ]
+        if not complete:
+            logger.warning(
+                "[ParentTransfer] %s archive in %s carries no P1-6 objective "
+                "vectors (pre-P1-6 archive format, or no COMPLETE trials). "
+                "Parent transfer is incompatible with this archive and is "
+                "skipped for window %d; its monthly refinement will calibrate "
+                "from config defaults.",
+                label, parent_dir.name, window_index,
+            )
+            return None
+        records = [
+            {
+                "params": t["params"],
+                "objectives": list(t["objectives"]),
+                "admissible": t.get("admissible", True),
+                "number": t.get("number"),
+            }
+            for t in complete
+        ]
+        front = moo.pareto_front(records)
+        pool = front if front else records
+        chosen = moo.select_diverse(pool, max(1, int(len(records) * fraction)))
+        logger.info(
+            "[ParentTransfer] %s: %d archived trials -> %d on Pareto front -> "
+            "%d diverse winners transferred (label=%s)",
+            label, len(records), len(pool), len(chosen), label,
+        )
+        return chosen
+
+    p1_top = select_archived(phase1_data, 0.30, "Phase 1")
+    if p1_top is None:
         return None
-    p1_top_n = max(1, int(len(p1_values) * 0.3))
-    p1_top = sorted(p1_values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:p1_top_n]
-    
-    # Compute stats from top 20% of Phase 2
-    p2_values = [t for t in phase2_data if t["state"] != "PRUNED" and t["value"] is not None]
-    p2_top_n = max(1, int(len(p2_values) * 0.2))
-    p2_top = sorted(p2_values, key=lambda t: t["value"] if t["value"] is not None else -np.inf, reverse=True)[:p2_top_n]
+    p2_top = select_archived(phase2_data, 0.20, "Phase 2")
+    if p2_top is None:
+        return None
     
     # Per-parameter mean+std
     def compute_stats(trials):

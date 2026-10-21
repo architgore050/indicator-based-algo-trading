@@ -41,6 +41,46 @@ BP = CONF["backtesting_params"]
 DATA_CONF = CONF["data_config"]
 
 # ---------------------------------------------------------------------------
+# CPCV knob block (Task P1-6)
+# ---------------------------------------------------------------------------
+# Combinatorial Purged Cross-Validation is an ADDITIVE evaluation layer used
+# only by the calibration objective functions (optuna_calibrate_*.py). The
+# single-pass engine (run_backtest + CLI report contract) is unchanged, and
+# the orchestrator's OOS backtest never enables CPCV.
+#
+# Knobs live here (not in config.json - config.json is frozen without explicit
+# developer approval; moving these knobs into config.json is tracked as P2-1).
+# CLI flags (--cpcv-*) override these defaults for standalone evaluation.
+CPCV_CONFIG = {
+    "n_splits": 6,              # N contiguous blocks tiling the evaluation slice
+    "test_folds": 3,            # k: test blocks per combinatorial path (C(N,k) paths)
+    "embargo_bars": 1440,       # 1 trading day: bars after a test fold excluded from training
+    "purge_bars": 1440,         # 1 trading day: bars overlapping a test fold excluded from training
+    "min_trades_per_fold": 3,   # fold degeneracy threshold (fold excluded below this)
+    "min_usable_folds": 4,      # trial admissibility: usable unique folds required (of 6)
+    "profit_factor_cap": 10.0,  # PF cap: stops low-trade folds from dominating the median
+}
+
+# Smoke-mode CPCV: the smoke IS slice is 1000 bars, so fold sizes, purge
+# distances, and degeneracy thresholds scale down. Smoke proves plumbing and
+# determinism, NOT statistical robustness (folds carry ~10-30 trades).
+# min_usable_folds=1 (vs 4/6 in full runs): VM confluence events on a
+# 1000-bar slice cluster into a single 250-bar block for most parameter
+# sets, so requiring >=2 traded blocks rejects trials that genuinely traded
+# (measured in the orchestrator smoke: window 4's admissible trials all had
+# fold_count=1). The degeneracy gate itself stays ACTIVE - zero-trade /
+# zero-signal trials remain inadmissible in every mode.
+SMOKE_CPCV_CONFIG = {
+    "n_splits": 4,
+    "test_folds": 2,
+    "embargo_bars": 240,
+    "purge_bars": 240,
+    "min_trades_per_fold": 1,
+    "min_usable_folds": 1,
+    "profit_factor_cap": 10.0,
+}
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
@@ -1031,6 +1071,350 @@ def compute_summary(
         **trade_stats,
     }
 
+# ---------------------------------------------------------------------------
+# CPCV evaluation engine (Task P1-6)
+# ---------------------------------------------------------------------------
+# Combinatorial Purged Cross-Validation (Lopez de Prado, "Advances in
+# Financial Machine Learning", Ch. 7) adapted to this pipeline. Definitions
+# implemented here follow the research paper extracted at
+# v6/tmp/cpcv_paper.txt:
+#
+#   PSR = Phi( SR_hat * sqrt(T - 1) / sqrt(1 - gamma3*SR_hat
+#                 + ((gamma4 - 1)/4) * SR_hat^2) )
+#   with per-bar SR_hat = mean(r)/std(r), T = number of fold bar returns,
+#   gamma3/gamma4 = sample skew / kurtosis (non-Fisher, normal=4... normal
+#   kurtosis = 3 in the paper's convention: gamma4 - 1 term uses raw kurtosis
+#   where Gaussian gamma4 = 3), benchmark SR* = 0.
+#
+# Splitter: combinatorial purged WALK-FORWARD on numpy row indices.
+#   - N contiguous blocks tile [0, n).
+#   - Paths = C(N, k) chronological combinations of k test blocks.
+#   - Within a path, each test fold's training region is strictly BEFORE the
+#     fold start (mandated invariant: no test fold bar precedes its training
+#     bars), minus the purge region [s - purge, e) and embargo region
+#     [e, e + embargo) of every test fold in the path.
+#   - Deviation from full CPCV (documented): this pipeline fits NO parameters
+#     on training bars (indicators are causal, parameters come from Optuna),
+#     so the training region is reported for audit but never consumed. The
+#     leakage protection that matters here is fold-side: fold j is evaluated
+#     ONLY on data[s:e] with signals[s:e], so signals generated in the
+#     purge/embargo region can never enter the fold (entry-side purge).
+#
+# CRN fold seeding: fold seed = cfg["random_seed"] + fold_index. It is NEVER
+# trial-dependent, so every trial is evaluated on identical random slippage
+# draws (Common Random Numbers) - trial-to-trial differences are then purely
+# parameter differences.
+
+def cpcv_block_bounds(n: int, n_splits: int) -> list[int]:
+    """Row-index bounds for N contiguous blocks tiling [0, n). Block i = [bounds[i], bounds[i+1])."""
+    if n_splits < 2:
+        raise ValueError(f"cpcv n_splits must be >= 2, got {n_splits}")
+    return [int(round(i * n / n_splits)) for i in range(n_splits + 1)]
+
+
+def cpcv_paths(n_splits: int, test_folds: int) -> list[tuple[int, ...]]:
+    """All C(N, k) chronological (ascending) combinations of test-block indices."""
+    import itertools
+    if test_folds < 1 or test_folds >= n_splits:
+        raise ValueError(f"cpcv test_folds must be in [1, n_splits), got {test_folds} for n_splits={n_splits}")
+    return list(itertools.combinations(range(n_splits), test_folds))
+
+
+def cpcv_train_region(n: int, bounds: list[int], test_blocks: tuple[int, ...],
+                      purge_bars: int, embargo_bars: int) -> list[tuple[int, int]]:
+    """
+    Walk-forward training intervals (row-index half-open ranges) for one path:
+    bars strictly before each test fold start, excluding every test fold's
+    purge region [s - purge, e) and embargo region [e, e + embargo).
+    Reported for audit only (this pipeline fits nothing on training bars).
+    """
+    forbidden: list[tuple[int, int]] = []
+    for j in test_blocks:
+        s, e = bounds[j], bounds[j + 1]
+        forbidden.append((max(0, s - purge_bars), min(n, e + embargo_bars)))
+    intervals: list[tuple[int, int]] = []
+    for j in test_blocks:
+        s = bounds[j]
+        lo, hi = 0, s  # strictly before fold start (walk-forward invariant)
+        for f_lo, f_hi in forbidden:
+            if f_hi <= lo or f_lo >= hi:
+                continue
+            # split [lo, hi) around the forbidden interval
+            if f_lo <= lo and f_hi >= hi:
+                lo, hi = 0, 0
+                break
+            if f_lo > lo:
+                intervals.append((lo, min(f_lo, hi)))
+            lo = max(lo, f_hi)
+        if hi > lo:
+            intervals.append((lo, hi))
+    # merge/sort for a clean audit report
+    intervals = sorted(iv for iv in intervals if iv[1] > iv[0])
+    merged: list[tuple[int, int]] = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _psr_from_returns(returns: np.ndarray) -> float:
+    """
+    Probabilistic Sharpe Ratio (paper definition, benchmark SR* = 0).
+    returns: per-bar returns. T = len(returns). Returns 0.0 for degenerate
+    samples (T < 2 or zero variance with non-positive mean).
+    """
+    from scipy.stats import norm
+    T = len(returns)
+    if T < 2:
+        return 0.0
+    mu = float(np.mean(returns))
+    sd = float(np.std(returns, ddof=1))
+    if sd <= 0.0 or not np.isfinite(sd):
+        return 1.0 if mu > 0.0 else 0.0
+    sr = mu / sd
+    centered = returns - mu
+    g3 = float(np.mean(centered ** 3)) / (sd ** 3)
+    g4 = float(np.mean(centered ** 4)) / (sd ** 4)  # raw kurtosis: Gaussian = 3
+    denom = 1.0 - g3 * sr + ((g4 - 1.0) / 4.0) * (sr ** 2)
+    if denom <= 0.0 or not np.isfinite(denom):
+        # Moment inequality guarantees denom > 0 mathematically; guard numerics.
+        return 0.0
+    z = sr * np.sqrt(max(T - 1, 1)) / np.sqrt(denom)
+    return float(norm.cdf(z))
+
+
+def _fold_metrics_from_result(trades: pd.DataFrame, equity: pd.DataFrame,
+                              cfg: dict, pf_cap: float) -> dict | None:
+    """Fold-level metrics from one run_backtest result (None if no equity rows)."""
+    if equity is None or equity.empty or "equity_usd" not in equity.columns:
+        return None
+    eq = equity["equity_usd"].astype("float64").to_numpy()
+    capital = cfg["initial_capital_usd"]
+    if len(eq) >= 2:
+        prev = eq[:-1]
+        safe = np.where(np.abs(prev) > 1e-12, prev, np.nan)
+        returns = np.diff(eq) / safe
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        returns = np.array([], dtype=np.float64)
+    bars_per_year = cfg["bars_per_year"]
+    if len(returns) >= 2:
+        mu = float(np.mean(returns))
+        sd = float(np.std(returns, ddof=1))
+        sharpe = (mu / sd) * np.sqrt(bars_per_year) if sd > 0 else 0.0
+    else:
+        sharpe = 0.0
+    peak = np.maximum.accumulate(np.maximum(eq, 1e-12))
+    dd_frac = np.max((peak - eq) / peak) if len(eq) else 0.0
+    max_dd_pct = float(dd_frac) * 100.0
+    n_trades = 0 if trades is None else len(trades)
+    gross_profit = 0.0
+    gross_loss = 0.0
+    if trades is not None and not trades.empty:
+        pnl = trades["net_pnl_usd"].astype("float64").to_numpy()
+        gross_profit = float(np.sum(pnl[pnl > 0]))
+        gross_loss = float(np.sum(pnl[pnl < 0]))
+    if gross_loss < 0:
+        profit_factor = gross_profit / abs(gross_loss)
+    elif gross_profit > 0:
+        profit_factor = pf_cap
+    else:
+        profit_factor = 0.0
+    profit_factor = min(profit_factor, pf_cap)
+    return {
+        "returns": returns,
+        "sharpe": float(sharpe),
+        "max_dd_pct": max_dd_pct,
+        "profit_factor": profit_factor,
+        "psr": _psr_from_returns(returns),
+        "trades": n_trades,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "final_equity": float(eq[-1]) if len(eq) else capital,
+    }
+
+
+def evaluate_cpcv(data, signals, cfg: dict, cpcv_config: dict | None = None,
+                  backtest_fn=None) -> dict:
+    """
+    CPCV evaluation of a (data, signals) pair - additive layer for calibration
+    objectives ONLY. The single-pass engine and CLI report contract are not
+    touched by this function; each fold re-runs that same engine.
+
+    data:    full evaluation slice (cudf or pandas DataFrame, with timestamp)
+    signals: pandas DataFrame covering the same time range as data
+             (timestamp/signal/action columns); folds select signals by
+             timestamp range, so exact row alignment is not required.
+    cfg:     backtesting config dict (BP-style; random_seed drives CRN folds)
+    cpcv_config: knob dict (defaults to CPCV_CONFIG)
+    backtest_fn: engine callable, defaults to this module's run_backtest.
+                 Injectable so tests can intercept fold runs. Signature:
+                 fn(data_slice, signals_slice, config=cfg, seed=fold_seed).
+
+    Returns a metrics dict with:
+      objectives [median_psr, median_max_dd_pct, median_profit_factor],
+      admissible / inadmissible_reason, fold_count (usable unique folds),
+      paths_count, per-fold and per-path diagnostics, cpcv_config used.
+    """
+    knobs = dict(CPCV_CONFIG)
+    if cpcv_config:
+        knobs.update(cpcv_config)
+    n_splits = int(knobs["n_splits"])
+    test_folds = int(knobs["test_folds"])
+    purge_bars = int(knobs["purge_bars"])
+    embargo_bars = int(knobs["embargo_bars"])
+    min_trades_per_fold = int(knobs["min_trades_per_fold"])
+    min_usable_folds = int(knobs["min_usable_folds"])
+    pf_cap = float(knobs["profit_factor_cap"])
+
+    engine = backtest_fn if backtest_fn is not None else run_backtest
+    n = len(data)
+    bounds = cpcv_block_bounds(n, n_splits)
+    paths = cpcv_paths(n_splits, test_folds)
+
+    # Extract data timestamps once (pandas bridge works for cudf and pandas).
+    if hasattr(data, "to_arrow"):
+        ts_np = data["timestamp"].to_arrow().to_pandas().to_numpy()
+    else:
+        ts_np = data["timestamp"].to_numpy()
+
+    # --- Fold evaluation: one run_backtest per UNIQUE block (not per path) ---
+    # CRN: fold seed = cfg random_seed + fold_index, never trial-dependent.
+    base_seed = int(cfg["random_seed"])
+    fold_metrics: dict[int, dict | None] = {}
+    for j in range(n_splits):
+        s, e = bounds[j], bounds[j + 1]
+        fold_data = data.iloc[s:e]
+        fold_start_ts = pd.Timestamp(ts_np[s])
+        fold_end_ts = pd.Timestamp(ts_np[e - 1])
+        # Entry-side purge: signals before the fold start (including any
+        # purge/embargo-region signals) can never enter the fold evaluation.
+        fold_signals = signals[(signals["timestamp"] >= fold_start_ts)
+                               & (signals["timestamp"] <= fold_end_ts)]
+        trades, equity, _, _ = engine(fold_data, fold_signals, config=cfg,
+                                      seed=base_seed + j)
+        fold_metrics[j] = _fold_metrics_from_result(trades, equity, cfg, pf_cap)
+
+    usable_folds = sorted(
+        j for j, fm in fold_metrics.items()
+        if fm is not None and fm["trades"] >= min_trades_per_fold
+    )
+    degenerate_folds = sorted(set(range(n_splits)) - set(usable_folds))
+    fold_count = len(usable_folds)
+
+    # Walk-forward training-region audit (reported, never consumed).
+    train_bars_per_path = [
+        sum(hi - lo for lo, hi in cpcv_train_region(n, bounds, path, purge_bars, embargo_bars))
+        for path in paths
+    ]
+
+    inadmissible_reason = None
+    if fold_count < min_usable_folds:
+        inadmissible_reason = (
+            f"fold degeneracy: {fold_count}/{n_splits} folds reached "
+            f"min_trades_per_fold={min_trades_per_fold} "
+            f"(degenerate folds: {degenerate_folds}); "
+            f"required >= {min_usable_folds} usable folds"
+        )
+
+    # --- Path-level aggregation (primary): concatenate usable folds per path ---
+    path_psrs: list[float] = []
+    path_max_dds: list[float] = []
+    path_pfs: list[float] = []
+    path_sharpes: list[float] = []
+    path_calmars: list[float] = []
+    evaluated_paths = 0
+    for path in paths:
+        usable_in_path = [j for j in path if j in fold_metrics and j in usable_folds]
+        if not usable_in_path:
+            continue
+        evaluated_paths += 1
+        all_returns = np.concatenate(
+            [fold_metrics[j]["returns"] for j in usable_in_path]) if usable_in_path else np.array([])
+        gp = sum(fold_metrics[j]["gross_profit"] for j in usable_in_path)
+        gl = sum(fold_metrics[j]["gross_loss"] for j in usable_in_path)
+        if gl < 0:
+            pf = gp / abs(gl)
+        elif gp > 0:
+            pf = pf_cap
+        else:
+            pf = 0.0
+        pf = min(pf, pf_cap)
+        # Path equity reconstructed from concatenated per-bar returns so
+        # MaxDD spans the whole path continuously (folds each start at capital).
+        if len(all_returns):
+            path_equity = cfg["initial_capital_usd"] * np.cumprod(1.0 + all_returns)
+            peak = np.maximum.accumulate(np.maximum(path_equity, 1e-12))
+            path_dd = float(np.max((peak - path_equity) / peak)) * 100.0
+            mu = float(np.mean(all_returns))
+            sd = float(np.std(all_returns, ddof=1))
+            path_sharpe = (mu / sd) * np.sqrt(cfg["bars_per_year"]) if sd > 0 else 0.0
+            years = len(all_returns) / cfg["bars_per_year"]
+            total_ret = float(path_equity[-1] / cfg["initial_capital_usd"] - 1.0)
+            ann_ret_pct = ((1.0 + total_ret) ** (1.0 / years) - 1.0) * 100.0 if years > 0 and total_ret > -1.0 else -100.0
+            # Calmar convention matches compute_summary: 0.0 when MaxDD is zero.
+            path_calmar = ann_ret_pct / path_dd if path_dd > 0 else 0.0
+        else:
+            path_dd = 0.0
+            path_sharpe = 0.0
+            path_calmar = 0.0
+        path_psrs.append(_psr_from_returns(all_returns))
+        path_max_dds.append(path_dd)
+        path_pfs.append(pf)
+        path_sharpes.append(path_sharpe)
+        path_calmars.append(path_calmar)
+
+    # --- Median aggregation across paths (primary objectives) ---
+    if evaluated_paths > 0:
+        median_psr = float(np.median(path_psrs))
+        median_max_dd = float(np.median(path_max_dds))
+        median_pf = float(np.median(path_pfs))
+        median_sharpe = float(np.median(path_sharpes))
+        median_calmar = float(np.median(path_calmars))
+    else:
+        median_psr = 0.0
+        median_max_dd = 100.0
+        median_pf = 0.0
+        median_sharpe = 0.0
+        median_calmar = 0.0
+
+    # --- Fold-level diagnostics ---
+    fold_sharpes = [fold_metrics[j]["sharpe"] for j in usable_folds]
+    fold_psrs = [fold_metrics[j]["psr"] for j in usable_folds]
+    std_fold_sharpe = float(np.std(fold_sharpes, ddof=1)) if len(fold_sharpes) >= 2 else 0.0
+    mean_fold_sharpe = float(np.mean(fold_sharpes)) if fold_sharpes else 0.0
+
+    return {
+        "objectives": [median_psr, median_max_dd, median_pf],
+        "admissible": inadmissible_reason is None,
+        "inadmissible_reason": inadmissible_reason,
+        "median_psr": median_psr,
+        "median_max_dd": median_max_dd,
+        "median_profit_factor": median_pf,
+        "median_sharpe": median_sharpe,
+        "median_calmar": median_calmar,
+        "fold_count": fold_count,
+        "usable_folds": usable_folds,
+        "degenerate_folds": degenerate_folds,
+        "paths_count": evaluated_paths,
+        "paths_total": len(paths),
+        "mean_fold_sharpe": mean_fold_sharpe,
+        "std_fold_sharpe": std_fold_sharpe,
+        "fold_sharpes": fold_sharpes,
+        "fold_psrs": fold_psrs,
+        "fold_trades": {int(j): int(fold_metrics[j]["trades"]) for j in usable_folds},
+        "path_psrs": path_psrs,
+        "path_max_dd_pct": path_max_dds,
+        "path_profit_factors": path_pfs,
+        "path_sharpes": path_sharpes,
+        "path_calmars": path_calmars,
+        "train_bars_per_path": train_bars_per_path,
+        "cpcv_config": knobs,
+    }
+
+
 def output_subdir(signal_path: Path, mode: str, override_dir: Path | None = None) -> Path:
     if override_dir:
         override_dir.mkdir(parents=True, exist_ok=True)
@@ -1264,6 +1648,15 @@ def main() -> None:
                         help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
                              "Bars before it are indicator history only: no trade accounting and no "
                              "equity-curve rows are produced for them. Default None = whole slice is OOS.")
+    parser.add_argument("--cpcv", action="store_true",
+                        help="Additionally run CPCV evaluation on this slice (Task P1-6 robustness "
+                             "metrics). The standard single-pass report contract is unchanged.")
+    parser.add_argument("--cpcv-splits", type=int, default=None, help="CPCV n_splits (block count).")
+    parser.add_argument("--cpcv-test-folds", type=int, default=None, help="CPCV k (test blocks per path).")
+    parser.add_argument("--cpcv-embargo-bars", type=int, default=None, help="CPCV embargo bars after each test fold.")
+    parser.add_argument("--cpcv-purge-bars", type=int, default=None, help="CPCV purge bars before each test fold.")
+    parser.add_argument("--cpcv-min-trades-per-fold", type=int, default=None, help="Fold degeneracy threshold.")
+    parser.add_argument("--cpcv-min-usable-folds", type=int, default=None, help="Usable folds required for an admissible evaluation.")
     args = parser.parse_args()
 
     # Override SL/TP from calibration results if provided.
@@ -1358,6 +1751,41 @@ def main() -> None:
     print(f"Backtest complete. Results in {out_dir}")
     print(f"Net Profit: ${summary.get('net_profit_usd', 0):,.2f} ({summary['total_return_pct']:.2f}%)")
     print(f"Sharpe: {summary['sharpe_ratio']:.2f}, Max DD: {summary['max_drawdown_pct']:.2f}%")
+
+    # --- Optional CPCV evaluation (Task P1-6): additive, report contract above unchanged ---
+    if args.cpcv:
+        cpcv_cfg = dict(cfg) if cfg is not None else dict(BP)
+        if args.random_seed is not None:
+            cpcv_cfg["random_seed"] = args.random_seed
+        knobs = dict(SMOKE_CPCV_CONFIG if args.mode == "smoke" else CPCV_CONFIG)
+        if args.cpcv_splits is not None:
+            knobs["n_splits"] = args.cpcv_splits
+        if args.cpcv_test_folds is not None:
+            knobs["test_folds"] = args.cpcv_test_folds
+        if args.cpcv_embargo_bars is not None:
+            knobs["embargo_bars"] = args.cpcv_embargo_bars
+        if args.cpcv_purge_bars is not None:
+            knobs["purge_bars"] = args.cpcv_purge_bars
+        if args.cpcv_min_trades_per_fold is not None:
+            knobs["min_trades_per_fold"] = args.cpcv_min_trades_per_fold
+        if args.cpcv_min_usable_folds is not None:
+            knobs["min_usable_folds"] = args.cpcv_min_usable_folds
+        cpcv_metrics = evaluate_cpcv(data, signals, cpcv_cfg, cpcv_config=knobs)
+        with open(out_dir / "cpcv_metrics.json", "w") as f:
+            json.dump(cpcv_metrics, f, indent=2, default=str)
+        print(
+            f"CPCV: folds usable {cpcv_metrics['fold_count']}/{knobs['n_splits']} "
+            f"(paths {cpcv_metrics['paths_count']}/{cpcv_metrics['paths_total']}), "
+            f"admissible={cpcv_metrics['admissible']}"
+        )
+        print(
+            f"CPCV objectives: median PSR={cpcv_metrics['median_psr']:.4f}, "
+            f"median MaxDD={cpcv_metrics['median_max_dd']:.2f}%, "
+            f"median PF={cpcv_metrics['median_profit_factor']:.3f}, "
+            f"median Sharpe={cpcv_metrics['median_sharpe']:.2f}"
+        )
+        if cpcv_metrics["inadmissible_reason"]:
+            print(f"CPCV inadmissible: {cpcv_metrics['inadmissible_reason']}")
 
 if __name__ == "__main__":
     main()
