@@ -143,6 +143,80 @@ def compute_window_ranges(i: int, oos_start_base: int, rows_per_window: int,
 
 
 # ---------------------------------------------------------------------------
+# Pre-Roll Derivation (P0-6: indicator history for OOS windows)
+# ---------------------------------------------------------------------------
+
+def compute_pre_roll_bars() -> int:
+    """Derive the pre-roll bar count from the max lookback bounds in config.
+
+    P0-6: signal generation and backtesting receive a data slice extended
+    backwards from the OOS start so every indicator is warm (non-NaN) at the
+    first OOS bar. The pre-roll must cover the largest lookback any strategy
+    can sample from its search ranges, plus 50 bars of headroom for composite
+    / nested lookbacks (e.g. MACD slow + signal, RSI + smoothing).
+
+    Derivation (reviewer-hardened, 2026-10-21): instead of a hand-picked key
+    list, every lookback-suffix bound in every strategy range is scanned
+    (new tunable lookback keys are covered automatically), plus explicit
+    nested composite chains from definitions.py whose effective lookback
+    exceeds any single key:
+      - TSM Vol_Z: rolling(vol_lb*4, min_periods=vol_lb) over rolling(vol_lb)
+        -> 5 * tsm_vol_lb
+      - Stoch MACD: EMA(slow_len) -> stoch(lookback) -> EMA(signal_len)
+      - EL MACD: EMA(macd_slow) -> EMA(macd_signal)
+      - TDI: RSI(rsi_period) -> SMA(band_length)
+    With current config.json the dominant term is still tsm_slow_lb (5760)
+    and the derived value is unchanged (5810).
+
+    Deviation from the review doc snippet: the doc names
+    `trend_ranges.donchian_dc_len`, which does not exist in config.json — the
+    trend strategy's Donchian key is `bo_donchian_lb` (donchian_dc_len lives
+    in tv_ranges). Both actual keys are covered by the generic scan. See
+    docs/P0-6_oos_preroll_and_risk_bypass.md.
+    """
+    cal = CALIB_PARAMS
+
+    def ub(ranges_key, name, default):
+        return cal.get(ranges_key, {}).get(name, [default])[1]
+
+    # 1) Generic safety net: every lookback-suffix bound in every strategy range.
+    lookback_suffixes = ("_lb", "_len", "_length", "_lookback", "_period", "_cycle")
+    candidates = [
+        bounds[1]
+        for ranges_key in ("vm_ranges", "tv_ranges", "trend_ranges")
+        for name, bounds in cal.get(ranges_key, {}).items()
+        if name.endswith(lookback_suffixes)
+    ]
+
+    # 2) Explicit nested composite chains (effective lookback > any single key).
+    candidates.append(5 * ub("trend_ranges", "tsm_vol_lb", 240))
+    candidates.append(ub("vm_ranges", "stoch_macd_slow_len", 60)
+                      + ub("vm_ranges", "stoch_macd_lookback", 80)
+                      + ub("vm_ranges", "stoch_macd_signal_len", 20))
+    candidates.append(ub("tv_ranges", "el_macd_slow", 500) + ub("tv_ranges", "el_macd_signal", 100))
+    candidates.append(ub("tv_ranges", "tdi_rsi_period", 80) + ub("tv_ranges", "tdi_band_length", 150))
+
+    return max(candidates) + 50
+
+
+def compute_signal_chunk_range(oos_start: int, oos_end: int, pre_roll_bars: int) -> tuple:
+    """Half-open [signal_start, oos_end) chunk key for the signal/backtest slice.
+
+    P0-6: extends the slice backwards by pre_roll_bars (clamped at row 0).
+    Returns (signal_start, oos_end, oos_start_in_slice), where
+    oos_start_in_slice is the index of the first OOS bar inside the chunk.
+    Pre-roll bars are indicator history only — they are never eligible for OOS
+    signal output or OOS trade accounting (enforced by the signal generators'
+    --oos-start-row-in-slice filter and the backtester's accounting boundary).
+    Calibration IS chunks are unaffected: they stay [is_start, is_end) and
+    never include pre-roll bars.
+    """
+    signal_start = max(0, oos_start - pre_roll_bars)
+    oos_start_in_slice = oos_start - signal_start
+    return signal_start, oos_end, oos_start_in_slice
+
+
+# ---------------------------------------------------------------------------
 # Data Slicing (prevents OOM from parallel pd.read_csv on data.csv)
 # ---------------------------------------------------------------------------
 
@@ -347,7 +421,7 @@ def _compute_distribution_prior(wfv_dir, window_index, full_recal_interval):
 
 def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv_rows, 
                    recal_windows_count, full_recal_interval, full_cal_rows, 
-                   wfv_dir, row_to_chunk):
+                   wfv_dir, row_to_chunk, pre_roll_bars):
     """
     Processes a single WFV window. This function is designed to run in a separate process.
     """
@@ -415,15 +489,21 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     if res_file.exists():
         atomic_write(res_file, PROJECT_DIR / f"calibration_results_{strategy}.json")
 
-    # 5. Signal Generation (OOS) — use per-window calibration results to avoid race conditions
+    # 5. Signal Generation (OOS + pre-roll) — use per-window calibration results
+    # to avoid race conditions. P0-6: the slice is extended backwards by
+    # pre_roll_bars so indicators are warm at the first OOS bar; the generator
+    # filters out any signal generated before the OOS boundary.
     window_cal = current_dir / f"calibration_results_{strategy}.json"
-    oos_window_size = oos_end - oos_start
+    signal_start, signal_end, oos_start_in_slice = compute_signal_chunk_range(
+        oos_start, oos_end, pre_roll_bars)
+    signal_slice_size = signal_end - signal_start
     signal_cmd = [
         PYTHON, str(PROJECT_DIR / get_signal_script(strategy)),
         "--mode", "smoke" if args.smoke else "test",
-        "--data-csv", row_to_chunk[(oos_start, oos_end)],
+        "--data-csv", row_to_chunk[(signal_start, signal_end)],
         "--start-row", "0",
-        "--end-row", str(oos_window_size),
+        "--end-row", str(signal_slice_size),
+        "--oos-start-row-in-slice", str(oos_start_in_slice),
         "--output-dir", str(current_dir)
     ]
     if window_cal.exists():
@@ -446,13 +526,18 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         base_sig = "vm_automation_logic_signals"
     signal_file_path = current_dir / f"{base_sig}{sig_suffix}"
     
+    # P0-6: the backtester receives the same pre-roll slice; --oos-start-row-in-slice
+    # makes bars before the OOS boundary indicator history only — no trade
+    # accounting and no equity-curve rows are emitted for them, so window N's
+    # equity curve never overlaps window N-1's.
     run_step([
         PYTHON, str(PROJECT_DIR / "backtest_xauusd_signal_csv.py"),
         "--strategy", strategy,
         "--mode", "smoke" if args.smoke else "test",
-        "--data-csv", row_to_chunk[(oos_start, oos_end)],
+        "--data-csv", row_to_chunk[(signal_start, signal_end)],
         "--start-row", "0",
-        "--end-row", str(oos_window_size),
+        "--end-row", str(signal_slice_size),
+        "--oos-start-row-in-slice", str(oos_start_in_slice),
         "--headless",
         "--output-dir", str(backtest_dir),
         "--signals", str(signal_file_path),
@@ -488,6 +573,8 @@ def main():
     # Logic Parameters (needed before VRAM estimation)
     # P0-5: oos_start_base is derived, not configured. The first OOS window can
     # only start after a full calibration window of IS history exists in the CSV.
+    # P0-6: PRE_ROLL_BARS is derived from config lookback bounds — the amount of
+    # history prepended to each OOS slice so indicators are warm at bar 0 of OOS.
     data_start_row = DATA_CONF.get("data_start_row", 0)
     full_cal_rows = CALIB_PARAMS["calibration_rows_per_trial"]
     oos_start_base = data_start_row + full_cal_rows
@@ -495,6 +582,7 @@ def main():
     total_wfv_rows = DATA_CONF["wfv_total_rows"]
     recal_windows_count = WFV_CONF["recalibration_windows"]
     full_recal_interval = WFV_CONF["windows_per_full_recalibration"]
+    pre_roll_bars = compute_pre_roll_bars()
 
     total_windows = total_wfv_rows // rows_per_window
 
@@ -523,6 +611,7 @@ def main():
 
     mode_label = "SMOKE" if args.smoke else "FULL"
     logger.info(f"[{mode_label}] Max rows per worker: IS={max_is_rows:,} + OOS={oos_rows:,} = {max_total_rows:,}")
+    logger.info(f"[{mode_label}] P0-6 pre-roll: {pre_roll_bars} bars prepended to each OOS signal/backtest slice (calibration chunks unchanged)")
 
     multiplier = STRATEGY_MEMORY_MULTIPLIER.get(args.strategy, 1.0)
     effective_ram = RAM_PER_WORKER_GB * multiplier
@@ -560,8 +649,10 @@ def main():
         oos_start, oos_end, is_start, is_end = compute_window_ranges(
             i, oos_start_base, rows_per_window, full_recal_interval,
             recal_windows_count, full_cal_rows, args.smoke)
-        row_ranges.append((is_start, is_end))      # calibration IS range [is_start, is_end)
-        row_ranges.append((oos_start, oos_end))    # signal/backtest OOS range [oos_start, oos_end)
+        row_ranges.append((is_start, is_end))      # calibration IS range [is_start, is_end) — never includes pre-roll
+        # P0-6: signal/backtest range [signal_start, oos_end) — OOS plus pre-roll history.
+        signal_start, signal_end, _ = compute_signal_chunk_range(oos_start, oos_end, pre_roll_bars)
+        row_ranges.append((signal_start, signal_end))
 
     # Deduplicate ranges
     unique_ranges = sorted(set(row_ranges))
@@ -590,7 +681,7 @@ def main():
                 process_window, 
                 i, args.strategy, args, oos_start_base, rows_per_window, 
                 total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk
+                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars
             ))
 
         for f in tqdm(annual_futures, desc="Phase 1 — Annual Windows", unit="window"):
@@ -613,7 +704,7 @@ def main():
                 process_window, 
                 i, args.strategy, args, oos_start_base, rows_per_window, 
                 total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk
+                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars
             ))
 
         for f in tqdm(monthly_futures, desc="Phase 2 — Monthly Windows", unit="window"):

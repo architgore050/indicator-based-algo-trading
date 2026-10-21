@@ -16,6 +16,58 @@ import numpy as np
 import pandas as pd
 
 
+# ---------------------------------------------------------------------------
+# P0-6: documented warmup divergence (baseline semantics change)
+# ---------------------------------------------------------------------------
+# The .bak baseline encodes the pre-P0-6 warmup bypass: risk/margin checks were
+# wrapped in `if i >= warmup_bars:` (warmup_bars=500), so trades opened in the
+# first 500 bars of a slice ran UNPROTECTED. P0-6 removed that bypass on
+# purpose (docs/externalReview_pipeline_correctness.md §P0-6 developer verdict;
+# docs/P0-6_oos_preroll_and_risk_bypass.md). The .bak files are protected
+# historical baselines and are NOT rewritten. Instead the backup comparison is
+# split into two fail-closed checks:
+#   1. Post-warmup parity — with fixture signals filtered to start at/after the
+#      old warmup boundary, live and .bak must be byte-identical (this is the
+#      optimization-parity guarantee the test was originally built for).
+#   2. Warmup divergence audit — with full fixture signals, every trade
+#      divergence must lie in the warmup region, be exit-side only, show the
+#      live risk exit firing EARLIER than the baseline indicator exit, and
+#      match EXPECTED_WARMUP_DIVERGENCES exactly. Any other divergence fails.
+BASELINE_WARMUP_BARS = 500  # bypass value the .bak baseline encodes (config.json warmup_bars at P0-6 time; P2-1 removes the config key)
+
+RISK_EXIT_REASONS = {"stop_loss", "take_profit", "trailing_stop", "max_hold_bars", "margin_call"}
+
+# Exact expected warmup-region trade divergences per fixture. Verified
+# 2026-10-21 against data.csv + the *_smoke.csv fixtures (reviewer audit,
+# docs/P0-6_oos_preroll_and_risk_bypass.md §Review findings): TV trade #0 opens
+# at bar 280 (inside the old warmup window); its max_hold_bars=60 exit at bar
+# 340 was previously suppressed, so the baseline held to bar 377 and exited on
+# the indicator. VM has no warmup-region trade. If fixtures/config legitimately
+# change, this audit fails loudly and the expectation must be re-derived by a
+# human — never widened silently.
+EXPECTED_WARMUP_DIVERGENCES = {
+    "vm": [],
+    "tv": [
+        {
+            "entry_bar": 280,
+            "old_exit_reason": "exit_indicator",
+            "old_bars_held": 97,
+            "new_exit_reason": "max_hold_bars",
+            "new_bars_held": 60,
+        },
+    ],
+}
+
+TRADE_COLS = [
+    "entry_time", "exit_time", "side", "entry_signal", "exit_signal",
+    "entry_reason", "exit_reason", "lots", "units_oz",
+    "entry_mid", "entry_fill", "exit_mid", "exit_fill",
+    "gross_pnl_usd", "swap_usd", "commission_usd",
+    "spread_slippage_cost_usd", "net_pnl_usd", "entry_bar",
+    "bars_held", "hours_held", "mfe_usd", "mae_usd",
+]
+
+
 def load_data(end_row: int = 50000) -> pd.DataFrame:
     """Load a small data window for fast parity testing."""
     project_dir = Path(__file__).resolve().parent.parent
@@ -305,8 +357,97 @@ def test_original_vs_optimized(data, signals, original_mod, optimized_mod, signa
     return passed
 
 
-def test_against_backup(data, signals, bak_path, signal_name="test"):
-    """Compare optimized backtester against .bak backup file."""
+def _trade_row_diffs(row_a, row_b, cols):
+    """Columns where two trade rows differ (tz-tolerant timestamps, float tolerance 1e-9)."""
+    diffs = []
+    for c in cols:
+        va, vb = row_a[c], row_b[c]
+        if c in ("entry_time", "exit_time"):
+            if pd.Timestamp(va).tz_localize(None) != pd.Timestamp(vb).tz_localize(None):
+                diffs.append(c)
+            continue
+        if pd.isna(va) and pd.isna(vb):
+            continue
+        if (isinstance(va, (int, float, np.number)) and not isinstance(va, bool)
+                and isinstance(vb, (int, float, np.number)) and not isinstance(vb, bool)):
+            if abs(float(va) - float(vb)) > 1e-9:
+                diffs.append(c)
+        elif va != vb:
+            diffs.append(c)
+    return diffs
+
+
+def audit_warmup_divergence(trades_orig, trades_opt, strategy, trades_cols=TRADE_COLS):
+    """Assert live-vs-.bak trade divergences are EXACTLY the documented P0-6 warmup change.
+
+    Fail-closed rules:
+      - trade lists must be aligned (same length);
+      - every divergent trade must have entry_bar < BASELINE_WARMUP_BARS;
+      - entry-side fields (time/bar/side/mid) must be identical on divergent trades;
+      - the live (fixed) exit must be a RISK exit that fired EARLIER than the
+        baseline's exit — the documented direction of the P0-6 fix;
+      - the observed divergence set must equal EXPECTED_WARMUP_DIVERGENCES[strategy]
+        exactly (count AND per-trade exit reasons/bars held).
+    """
+    print(f"\n--- P0-6 Warmup Divergence Audit ({strategy}) ---")
+    expected = EXPECTED_WARMUP_DIVERGENCES.get(strategy, [])
+    ok = True
+
+    if len(trades_orig) != len(trades_opt):
+        print(f"FAIL: trade count mismatch ({len(trades_orig)} vs {len(trades_opt)}) — audit needs aligned trade lists")
+        return False
+
+    observed = []
+    for i in range(len(trades_orig)):
+        a, b = trades_orig.iloc[i], trades_opt.iloc[i]
+        diffs = _trade_row_diffs(a, b, trades_cols)
+        if not diffs:
+            continue
+        entry_bar = int(a["entry_bar"])
+        if entry_bar >= BASELINE_WARMUP_BARS:
+            print(f"FAIL: trade idx {i} diverges OUTSIDE the warmup region (entry_bar {entry_bar} >= {BASELINE_WARMUP_BARS}): {diffs}")
+            ok = False
+            continue
+        entry_identical = (
+            pd.Timestamp(a["entry_time"]).tz_localize(None) == pd.Timestamp(b["entry_time"]).tz_localize(None)
+            and int(b["entry_bar"]) == entry_bar
+            and a["side"] == b["side"]
+            and abs(float(a["entry_mid"]) - float(b["entry_mid"])) <= 1e-9
+        )
+        if not entry_identical:
+            print(f"FAIL: warmup trade idx {i} entry-side fields differ — divergence must be exit-side only: {diffs}")
+            ok = False
+        if b["exit_reason"] not in RISK_EXIT_REASONS:
+            print(f"FAIL: warmup trade idx {i} live exit '{b['exit_reason']}' is not a risk exit — P0-6 makes risk exits fire, never suppress them")
+            ok = False
+        if int(b["bars_held"]) >= int(a["bars_held"]):
+            print(f"FAIL: warmup trade idx {i} live exit not earlier than baseline ({b['bars_held']} >= {a['bars_held']} bars)")
+            ok = False
+        observed.append({
+            "entry_bar": entry_bar,
+            "old_exit_reason": a["exit_reason"], "old_bars_held": int(a["bars_held"]),
+            "new_exit_reason": b["exit_reason"], "new_bars_held": int(b["bars_held"]),
+        })
+
+    if observed != expected:
+        print(f"FAIL: warmup divergence set does not match the documented expectation for {strategy.upper()}:")
+        print(f"  observed: {observed}")
+        print(f"  expected: {expected}")
+        print("  If fixtures/config legitimately changed, re-derive the expectation manually")
+        print("  (docs/P0-6_oos_preroll_and_risk_bypass.md) — do not widen it silently.")
+        ok = False
+    else:
+        print(f"PASS: divergence is exactly the documented P0-6 warmup change "
+              f"({len(expected)} trade(s); other {len(trades_orig) - len(observed)} trades byte-identical)")
+    return ok
+
+
+def test_against_backup(data, signals, bak_path, signal_name="test", strategy=None):
+    """Compare optimized backtester against .bak backup file.
+
+    P0-6 split (see module header): full-signal warmup divergence audit +
+    post-warmup-filtered strict parity. Both must pass.
+    """
     print(f"\n=== Backtest Against Backup Comparison ===")
 
     if not bak_path.exists():
@@ -319,9 +460,26 @@ def test_against_backup(data, signals, bak_path, signal_name="test"):
         import importlib
         live_mod = importlib.import_module("backtest_xauusd_signal_csv")
 
-        return test_original_vs_optimized(
-            data, signals, original_mod, live_mod, signal_name
+        if strategy is None or len(data) <= BASELINE_WARMUP_BARS:
+            print(f"FAIL: backup comparison requires a strategy label and > {BASELINE_WARMUP_BARS} data rows "
+                  f"(got strategy={strategy}, rows={len(data)}) — warmup-region semantics cannot be audited")
+            return False
+
+        # 1) Full-signal run: divergences must be EXACTLY the documented warmup change.
+        trades_orig, _, _, _, _ = _run_backtester(data, signals, original_mod, signal_name)
+        trades_opt, _, _, _, _ = _run_backtester(data, signals, live_mod, signal_name)
+        audit_ok = audit_warmup_divergence(trades_orig, trades_opt, strategy)
+
+        # 2) Post-warmup-filtered run: strict byte-identical parity (no position can
+        #    exist inside the warmup region, so baseline and live semantics coincide).
+        boundary_ts = data["timestamp"].iloc[BASELINE_WARMUP_BARS]
+        signals_post = signals[signals["timestamp"] >= boundary_ts].reset_index(drop=True)
+        print(f"\n--- Post-warmup strict parity (signals from bar {BASELINE_WARMUP_BARS}: {len(signals_post)} of {len(signals)}) ---")
+        strict_ok = test_original_vs_optimized(
+            data, signals_post, original_mod, live_mod, signal_name
         )
+
+        return audit_ok and strict_ok
     except Exception as e:
         print(f"WARN: Could not load backup module: {e}")
         import traceback
@@ -420,7 +578,7 @@ def main():
         # Original vs optimized (against backup)
         if args.compare_backup:
             bak = project_dir / "backtest_xauusd_signal_csv_bak.py"
-            passed = test_against_backup(data, signals, bak, f"{strategy}_smoke")
+            passed = test_against_backup(data, signals, bak, f"{strategy}_smoke", strategy)
             all_passed = all_passed and passed
 
     print("\n" + "=" * 50)

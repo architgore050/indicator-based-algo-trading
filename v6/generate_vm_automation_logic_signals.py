@@ -280,6 +280,7 @@ def generate_signals(
     end_row: int = None,
     data_csv_path: str = None,
     output_dir: str = None,
+    oos_start_row_in_slice: int = None,
 ) -> Path:
     base_csv = OUTPUT_CSV
     if output_dir:
@@ -381,6 +382,14 @@ def generate_signals(
             sell_checks=[("multi_bear", multi_bear), ("stoch_bear", stoch_bear), ("cyclic_bear", cyclic_bear)],
         )
 
+        # P0-6: when the slice carries pre-roll history before the OOS boundary,
+        # discard every signal generated before the first OOS bar (timestamps are
+        # int64 epoch ms at this point). Standalone runs (arg absent) are unfiltered.
+        if (oos_start_row_in_slice is not None and 0 <= oos_start_row_in_slice < len(data_gdf)
+                and not signals.empty):
+            oos_start_timestamp = int(data_gdf["timestamp"].iloc[oos_start_row_in_slice])
+            signals = signals[signals["timestamp"] >= oos_start_timestamp].reset_index(drop=True)
+
         # Convert int64 timestamps back to datetime for CSV output
         if not signals.empty:
             ts_col = signals["timestamp"]
@@ -402,6 +411,9 @@ def main() -> None:
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
+    parser.add_argument("--oos-start-row-in-slice", type=int, default=None,
+                        help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
+                             "Signals generated before it are discarded. Default None = no filtering.")
     args = parser.parse_args()
 
     # Load params AFTER arg parsing so --calibration is respected before any module-level work
@@ -411,6 +423,7 @@ def main() -> None:
         params, args.mode, args.start_row, args.end_row,
         data_csv_path=args.data_csv,
         output_dir=args.output_dir,
+        oos_start_row_in_slice=args.oos_start_row_in_slice,
     )
     print(f"Wrote {output_path}")
 

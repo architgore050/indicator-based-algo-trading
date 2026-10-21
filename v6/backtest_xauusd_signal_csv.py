@@ -338,7 +338,8 @@ def action_to_side(action: str, signal: str) -> int | None:
 # Backtest (OPTIMIZED)
 # ---------------------------------------------------------------------------
 
-def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, config: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, config: dict | None = None,
+                 oos_start_row_in_slice: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # Immutable per-evaluation config: callers pass an explicit dict; module BP is only
     # the default for standalone CLI use. Neither dict is ever mutated here.
     cfg = BP if config is None else config
@@ -370,13 +371,28 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, co
     # Pre-compute dates array for swap accrual (avoids repeated pd.Timestamp() in loop)
     dates = np.array([pd.Timestamp(ts).date() for ts in timestamps_np], dtype=object)
 
+    # === P0-6: OOS accounting boundary ===
+    # When the slice carries pre-roll history before the OOS start, bars before
+    # `account_start` are indicator history only: signals generated there are
+    # discarded, no trade accounting happens on them, and no equity-curve rows
+    # are emitted for them (window N's equity curve must not overlap window
+    # N-1's). Default None keeps standalone/calibration behavior unchanged.
+    n = len(data)
+    account_start = 0 if oos_start_row_in_slice is None else int(oos_start_row_in_slice)
+    if account_start < 0 or account_start >= n:
+        raise ValueError(
+            f"oos_start_row_in_slice={account_start} is outside the data slice [0, {n - 1}]"
+        )
+    if account_start > 0:
+        oos_boundary_ts = pd.Timestamp(timestamps_np[account_start])
+        signals = signals[signals["timestamp"] >= oos_boundary_ts]
+
     signal_events = signals.groupby("timestamp", sort=True).apply(lambda frame: frame.to_dict("records"), include_groups=False)
     signal_lookup = signal_events.to_dict()
     equity_rows: list[dict[str, object]] = []
     execution_log: list[dict[str, object]] = []
 
     # === B. Cache cfg config values into locals ===
-    warmup_bars = cfg["warmup_bars"]
     trade_size_lots = cfg["trade_size_lots"]
     standard_lot_oz = cfg["standard_lot_oz"]
     units_oz = trade_size_lots * standard_lot_oz
@@ -398,8 +414,6 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, co
     maint_margin = cfg["maintenance_margin_ratio"]
     long_swap_rate = cfg["long_swap_usd_per_lot_per_day"]
     short_swap_rate = cfg["short_swap_usd_per_lot_per_day"]
-
-    n = len(data)
 
     for i in tqdm(range(n), desc="Backtest bars", unit="bar"):
         ts = pd.Timestamp(timestamps_np[i])
@@ -442,7 +456,7 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, co
             pos.best_price = max(pos.best_price, h) if pos.best_price else h
             pos.worst_price = min(pos.worst_price, l) if pos.worst_price else l
 
-        # === D. Signal processing (always runs, including during warmup) ===
+        # === D. Signal processing (always runs) ===
         source_ts = pd.Timestamp(timestamps_np[i - 1]) if execute_on_next and i > 0 else ts
         execution_mid = opens[i] if execute_on_next else closes[i]
 
@@ -593,90 +607,98 @@ def run_backtest(data: pd.DataFrame, signals: pd.DataFrame, seed: int = None, co
                 }
             )
 
-        # === E. Warmup check: skip risk/margin checks during warmup ===
-        if i >= warmup_bars:
-            # === E1. Inline risk_exit_reason (uses numpy arrays, not pd.Series row) ===
-            if state.position is not None:
-                pos = state.position
-                if enable_risk:
-                    hit_max_hold = max_hold > 0 and i - pos.entry_bar >= max_hold
-                    if hit_max_hold:
-                        close_position(state, ts, closes[i], i, "max_hold_bars", "MAX_HOLD_BARS", rng, cfg)
-                    elif pos.trailing_stop_mid is not None or sl_usd > 0 or tp_usd > 0:
-                        hit_sl = False
-                        hit_tp = False
-                        hit_tsl = False
-                        stop_mid = 0.0
-                        target_mid = 0.0
-
-                        if pos.side == 1:
-                            if sl_usd > 0:
-                                stop_mid = pos.entry_mid - sl_usd
-                                hit_sl = lows[i] <= stop_mid
-                            if tp_usd > 0:
-                                target_mid = pos.entry_mid + tp_usd
-                                hit_tp = highs[i] >= target_mid
-                            hit_tsl = lows[i] <= pos.trailing_stop_mid
-
-                            if hit_sl and (cons_fill or not hit_tp):
-                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
-                            elif hit_tsl and (cons_fill or not hit_tp):
-                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
-                            elif hit_tp:
-                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
-                        else:
-                            if sl_usd > 0:
-                                stop_mid = pos.entry_mid + sl_usd
-                                hit_sl = highs[i] >= stop_mid
-                            if tp_usd > 0:
-                                target_mid = pos.entry_mid - tp_usd
-                                hit_tp = lows[i] <= target_mid
-                            hit_tsl = highs[i] >= pos.trailing_stop_mid
-
-                            if hit_sl and (cons_fill or not hit_tp):
-                                close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
-                            elif hit_tsl and (cons_fill or not hit_tp):
-                                close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
-                            elif hit_tp:
-                                close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
-
-            # === E2. Margin call check (uses numpy arrays) ===
-            if state.position is not None:
-                used_margin = (closes[i] * state.position.units_oz) / leverage
-                unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
-                equity_now = state.cash + unrealized
-                if equity_now < used_margin * maint_margin:
-                    close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng, cfg)
-
-        # === F. Record equity (always) ===
-        close_i = float(closes[i])
-        unrealized = 0.0
+        # === E. Risk exits + margin call (P0-6: unconditional from bar 0) ===
+        # The warmup_bars bypass was removed: risk checks must execute on every
+        # bar of the provided slice. WFV slices carry pre-roll history before
+        # the OOS boundary, but no position can exist there (signals before the
+        # boundary are discarded), so this is safe for pre-roll bars too.
+        # === E1. Inline risk_exit_reason (uses numpy arrays, not pd.Series row) ===
         if state.position is not None:
-            unrealized = float((closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side)
-        equity = float(state.cash + unrealized)
-        used_margin = 0.0 if state.position is None else float(close_i * state.position.units_oz) / leverage
-        equity_rows.append(
-            {
-                "timestamp": ts,
-                "cash_usd": state.cash,
-                "unrealized_pnl_usd": unrealized,
-                "equity_usd": equity,
-                "equity_inr": equity * usdinr,
-                "used_margin_usd": used_margin,
-                "free_margin_usd": equity - used_margin,
-                "position": 0 if state.position is None else state.position.side,
-                "close": close_i,
-            }
-        )
+            pos = state.position
+            if enable_risk:
+                hit_max_hold = max_hold > 0 and i - pos.entry_bar >= max_hold
+                if hit_max_hold:
+                    close_position(state, ts, closes[i], i, "max_hold_bars", "MAX_HOLD_BARS", rng, cfg)
+                elif pos.trailing_stop_mid is not None or sl_usd > 0 or tp_usd > 0:
+                    hit_sl = False
+                    hit_tp = False
+                    hit_tsl = False
+                    stop_mid = 0.0
+                    target_mid = 0.0
+
+                    if pos.side == 1:
+                        if sl_usd > 0:
+                            stop_mid = pos.entry_mid - sl_usd
+                            hit_sl = lows[i] <= stop_mid
+                        if tp_usd > 0:
+                            target_mid = pos.entry_mid + tp_usd
+                            hit_tp = highs[i] >= target_mid
+                        hit_tsl = lows[i] <= pos.trailing_stop_mid
+
+                        if hit_sl and (cons_fill or not hit_tp):
+                            close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
+                        elif hit_tsl and (cons_fill or not hit_tp):
+                            close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
+                        elif hit_tp:
+                            close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
+                    else:
+                        if sl_usd > 0:
+                            stop_mid = pos.entry_mid + sl_usd
+                            hit_sl = highs[i] >= stop_mid
+                        if tp_usd > 0:
+                            target_mid = pos.entry_mid - tp_usd
+                            hit_tp = lows[i] <= target_mid
+                        hit_tsl = highs[i] >= pos.trailing_stop_mid
+
+                        if hit_sl and (cons_fill or not hit_tp):
+                            close_position(state, ts, stop_mid, i, "stop_loss", "STOP_LOSS", rng, cfg)
+                        elif hit_tsl and (cons_fill or not hit_tp):
+                            close_position(state, ts, pos.trailing_stop_mid, i, "trailing_stop", "TRAILING_STOP", rng, cfg)
+                        elif hit_tp:
+                            close_position(state, ts, target_mid, i, "take_profit", "TAKE_PROFIT", rng, cfg)
+
+        # === E2. Margin call check (uses numpy arrays) ===
+        if state.position is not None:
+            used_margin = (closes[i] * state.position.units_oz) / leverage
+            unrealized = (closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side
+            equity_now = state.cash + unrealized
+            if equity_now < used_margin * maint_margin:
+                close_position(state, ts, closes[i], i, "margin_call", "MARGIN_CALL", rng, cfg)
+
+        # === F. Record equity (from the OOS accounting boundary onward only) ===
+        # Pre-roll bars (i < account_start) produce no equity rows: window N's
+        # equity curve starts exactly at its OOS start and never overlaps the
+        # previous window's.
+        if i >= account_start:
+            close_i = float(closes[i])
+            unrealized = 0.0
+            if state.position is not None:
+                unrealized = float((closes[i] - state.position.entry_fill) * state.position.units_oz * state.position.side)
+            equity = float(state.cash + unrealized)
+            used_margin = 0.0 if state.position is None else float(close_i * state.position.units_oz) / leverage
+            equity_rows.append(
+                {
+                    "timestamp": ts,
+                    "cash_usd": state.cash,
+                    "unrealized_pnl_usd": unrealized,
+                    "equity_usd": equity,
+                    "equity_inr": equity * usdinr,
+                    "used_margin_usd": used_margin,
+                    "free_margin_usd": equity - used_margin,
+                    "position": 0 if state.position is None else state.position.side,
+                    "close": close_i,
+                }
+            )
 
     # Force exit remaining position
     if state.position is not None:
         close_position(state, timestamps_np[n - 1], closes[n - 1], n - 1, "end_of_data", "FORCED_EXIT", rng, cfg)
-        equity_rows[-1]["cash_usd"] = state.cash
-        equity_rows[-1]["unrealized_pnl_usd"] = 0.0
-        equity_rows[-1]["equity_usd"] = state.cash
-        equity_rows[-1]["equity_inr"] = state.cash * usdinr
-        equity_rows[-1]["position"] = 0
+        if equity_rows:
+            equity_rows[-1]["cash_usd"] = state.cash
+            equity_rows[-1]["unrealized_pnl_usd"] = 0.0
+            equity_rows[-1]["equity_usd"] = state.cash
+            equity_rows[-1]["equity_inr"] = state.cash * usdinr
+            equity_rows[-1]["position"] = 0
 
     trades_cols = ["entry_time", "exit_time", "side", "entry_signal", "exit_signal",
         "entry_reason", "exit_reason", "lots", "units_oz", "entry_mid", "entry_fill",
@@ -1238,6 +1260,10 @@ def main() -> None:
     parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
     parser.add_argument("--random-seed", type=int, default=None, help="Override random seed (for per-window seed variation in WFV).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (provides SL/TP overrides).")
+    parser.add_argument("--oos-start-row-in-slice", type=int, default=None,
+                        help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
+                             "Bars before it are indicator history only: no trade accounting and no "
+                             "equity-curve rows are produced for them. Default None = whole slice is OOS.")
     args = parser.parse_args()
 
     # Override SL/TP from calibration results if provided.
@@ -1294,7 +1320,20 @@ def main() -> None:
     start, end = data["timestamp"].min(), data["timestamp"].max()
     signals = signals[(signals["timestamp"] >= start) & (signals["timestamp"] <= end)].reset_index(drop=True)
 
-    trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed, config=cfg)
+    # P0-6: when the slice carries pre-roll history, drop pre-OOS signals here too
+    # so summary stats (signals_read) and the emitted reports describe OOS only.
+    # run_backtest enforces the same boundary for trade accounting + equity output.
+    if args.oos_start_row_in_slice is not None:
+        if args.oos_start_row_in_slice < 0 or args.oos_start_row_in_slice >= len(data):
+            print(f"Error: --oos-start-row-in-slice={args.oos_start_row_in_slice} outside data slice [0, {len(data) - 1}]")
+            sys.exit(1)
+        oos_boundary_ts = data["timestamp"].iloc[args.oos_start_row_in_slice]
+        signals = signals[signals["timestamp"] >= oos_boundary_ts].reset_index(drop=True)
+        logger.info(f"P0-6 OOS boundary: slice bar {args.oos_start_row_in_slice} ({oos_boundary_ts}); "
+                    f"pre-roll bars excluded from trade accounting and equity output.")
+
+    trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed, config=cfg,
+                                                       oos_start_row_in_slice=args.oos_start_row_in_slice)
     summary = compute_summary(trades, equity, signals, signal_path, data, config=cfg)
     
     # Save all outputs
