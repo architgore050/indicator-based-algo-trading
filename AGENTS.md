@@ -259,6 +259,11 @@ The current Walk-Forward Validation (WFV) window sizing is mathematically optimi
 - **Annual IS Window:** 1 trading year (362,880 bars).
 - **Statistical Power Source:** The robustness of this system is derived from the aggregation of ~185 independent windows (totaling ~4,794 trades in the baseline), not from shrinking individual windows to capture "intraday regime shifts."
 
+## Known Limitations & Future Work
+
+- **Fixed Lot Sizing Limitation:** The current backtester uses static lot sizes. The resulting equity curve grows linearly, not exponentially. A future refactor is required to implement dynamic fractional risk sizing (e.g., sizing based on current equity and stop-loss distance) to capture true compounding growth.
+- **OOS Window Truncation:** Independent WFV windows force-close open trades at boundaries. This introduces a minor relative error affecting approximately 4% of total trades. This noise is currently accepted as negligible for WFV diagnostics and does not materially distort the headline CAGR.
+
 ## Roadmap & Current Status
 See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 
