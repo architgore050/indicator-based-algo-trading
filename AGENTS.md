@@ -249,6 +249,16 @@ Function signatures are preserved for consumer scripts.
 - `best_manual_params_vm.json` (formerly `backtesting_params_vm.json`) is a **developer reference only** — it stores the parameter set that performed best through manual experimentation. No Python scripts read this file. All scripts load `config.json` exclusively.
 - `calibration_results_trend.json` is produced by the trend strategy calibrator.
 
+## Walk-Forward Validation (WFV) Temporal Architecture Guardrail
+
+### WFV Temporal Architecture Guardrail
+The current Walk-Forward Validation (WFV) window sizing is mathematically optimized for 1-minute XAUUSD data and **must not be reduced** without overwhelming, mathematically proven burden of proof.
+
+- **OOS Window:** 15 days (21,600 bars). This yields a median of ~18 trades per window, which is the absolute minimum viable threshold for calculating semi-reliable expectancy and win rates in a WFV step. Reducing this to 1 week (~9 trades) introduces catastrophic statistical noise, causing parameter selection to be driven by single-trade luck rather than robust edge.
+- **Monthly IS Window:** 3 months (129,600 bars). This provides sufficient data depth to adapt to recent conditions without overfitting to micro-structure noise. Extending this to 6 months is strictly prohibited, as 1-minute XAUUSD is highly non-stationary; a 6-month window forces the optimizer to find "mushy" compromise parameters that average out contradictory regimes, guaranteeing underperformance.
+- **Annual IS Window:** 1 trading year (362,880 bars).
+- **Statistical Power Source:** The robustness of this system is derived from the aggregation of ~185 independent windows (totaling ~4,794 trades in the baseline), not from shrinking individual windows to capture "intraday regime shifts."
+
 ## Roadmap & Current Status
 See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 
