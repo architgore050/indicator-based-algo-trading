@@ -23,15 +23,11 @@ from optuna.samplers import QMCSampler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-from definitions import (
-    calculate_bbbo,
-    calculate_cyclic_rsi,
-    calculate_donchian_rsi_bands,
-    calculate_el_rsi_cross,
-    calculate_rsi_8_21,
-    calculate_tdi,
-    calculate_tdi_loxx
-)
+# P0-8: the canonical TV signal path lives in the CLI generator module.
+# The calibrator imports it so calibration and production share one code
+# path by construction (the old private generate_tv_signals_local duplicate
+# — the one with the divergent exit signal strings — is deleted).
+from generate_tv_strategy1_signals import compute_signals_df
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 import cudf
 from gpu_io import load_csv
@@ -45,19 +41,9 @@ _GPU_DATA_CACHE = None
 # ---------------------------------------------------------------------------
 # Helpers (Native)
 # ---------------------------------------------------------------------------
-
-def crossed_above(left: pd.Series, right: pd.Series) -> pd.Series:
-    return (left.shift(1) <= right.shift(1)) & (left > right)
-
-def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
-    return (left.shift(1) >= right.shift(1)) & (left < right)
-
-def clean_bool(series: pd.Series) -> pd.Series:
-    """Ensures a series is boolean and fills NaNs with False."""
-    if hasattr(series, 'dtype'):
-        if str(series.dtype) in ('bool', 'boolean', 'bool_'):
-            return series.fillna(False)
-    return series.fillna(False).astype(bool)
+# P0-8: the crossed_above/crossed_below/clean_bool helpers were only used by
+# the deleted private signal generator; the canonical helpers now live in the
+# imported generator module.
 
 # We import run_backtest and score_results directly from the backtest script to ensure parity
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
@@ -100,120 +86,14 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
     return gpu_df
 
 # ---------------------------------------------------------------------------
-# Signal Generation (TV Strategy Wrapper)
+# Signal Generation (TV Strategy Wrapper) — P0-8
 # ---------------------------------------------------------------------------
-
-def generate_tv_signals_local(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
-    p = {**TV_DEFAULTS, **params}
-    
-    tdi = calculate_tdi(data, rsi_period=p["tdi_rsi_period"], band_length=p["tdi_band_length"], 
-                        fast_ma_len=p["tdi_fast_ma_len"], slow_ma_len=p["tdi_slow_ma_len"], mult=p["tdi_mult"])
-    
-    el_cross = calculate_el_rsi_cross(data, smooth_k=p["el_smooth_k"], rsi2_len=p["el_rsi2_len"], 
-                                      rsi3_len=p["el_rsi3_len"], rsi_norm=p["el_rsi_norm"], 
-                                      macd_fast=p["el_macd_fast"], macd_slow=p["el_macd_slow"], 
-                                      macd_signal=p["el_macd_signal"])
-    
-    cyclic_rsi = calculate_cyclic_rsi(data, dom_cycle=p["crsi_dom_cycle"], vibration=p["crsi_vibration"], 
-                                      leveling=p["crsi_leveling"])
-    
-    rsi_8_21 = calculate_rsi_8_21(data, rsi_len=p["rsi_8_21_rsi_len"], ma8_len=p["rsi_8_21_ma8_len"], 
-                                  ma21_len=p["rsi_8_21_ma21_len"])
-    
-    bbbo = calculate_bbbo(data, len1=p["bbbo_len1"], len2=p["bbbo_len2"], 
-                          mult_upper=p["bbbo_mult_upper"], mult_lower=p["bbbo_mult_lower"])
-    
-    loxx = calculate_tdi_loxx(data, rsi_period=p["loxx_rsi_period"], price_line_period=p["loxx_price_line_period"], 
-                              signal_line_period=p["loxx_signal_line_period"], vol_band_period=p["loxx_vol_band_period"], 
-                              vol_band_mult=p["loxx_vol_band_mult"])
-    
-    donchian = calculate_donchian_rsi_bands(data, rsi_len=p["donchian_rsi_len"], bb_len=p["donchian_bb_len"], 
-                                            bb_mult_inner=p["donchian_bb_mult_inner"], bb_mult_outer=p["donchian_bb_mult_outer"], 
-                                            dc_len=p["donchian_dc_len"])
-
-    tdi_lower_touch = tdi["RSI_PL"] <= (tdi["BB_Lower"] + p["tdi_touch_tolerance"])
-    tdi_lower_reclaim = crossed_above(tdi["RSI_PL"], tdi["BB_Lower"])
-    tdi_upper_touch = tdi["RSI_PL"] >= (tdi["BB_Upper"] - p["tdi_touch_tolerance"])
-    tdi_upper_reject = crossed_below(tdi["RSI_PL"], tdi["BB_Upper"])
-
-    tdi_bull = crossed_above(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] > tdi["Signal"])
-    el_bull = (
-        crossed_above(el_cross["RSI2"], el_cross["Signal_K"])
-        | crossed_above(el_cross["RSI2"], el_cross["RSI3"])
-        | ((el_cross["RSI2"] > el_cross["Signal_K"]) & (el_cross["RSI2"] > el_cross["RSI3"]))
-    )
-    crsi_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | crossed_above(
-        cyclic_rsi["CRSI"], cyclic_rsi["Lower_Band"]
-    )
-    rsi_8_21_bull = crossed_above(rsi_8_21["MA8_RSI"], rsi_8_21["MA21_RSI"]) | (
-        rsi_8_21["MA8_RSI"] > rsi_8_21["MA21_RSI"]
-    )
-    bbbo_bull = (bbbo["Oscillator"] <= bbbo["Lower"]) | crossed_above(
-        bbbo["Oscillator"], bbbo["Lower"]
-    )
-
-    tdi_bear = crossed_below(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] < tdi["Signal"])
-    loxx_upper_touch = loxx["RSI_PL"] >= loxx["Band_Up"]
-    loxx_lower_touch = loxx["RSI_PL"] <= loxx["Band_Dn"]
-    loxx_bear = loxx_upper_touch | crossed_below(loxx["RSI_PL"], loxx["RSI_SL"]) | (loxx["Trend"] < 0)
-    donchian_upper_touch = (donchian["RSI"] >= donchian["BB_Upper_Outer"]) | (
-        donchian["RSI"] >= donchian["DC_Upper"]
-    )
-    donchian_lower_touch = (donchian["RSI"] <= donchian["BB_Lower_Outer"]) | (
-        donchian["RSI"] <= donchian["DC_Lower"]
-    )
-    donchian_bear = donchian_upper_touch | crossed_below(donchian["RSI"], donchian["BB_Upper_Inner"])
-
-    buy_checks = [tdi_bull, el_bull, crsi_bull, rsi_8_21_bull, bbbo_bull]
-    sell_checks = [tdi_bear, loxx_bear, donchian_bear]
-
-    buy_confirmation_count = sum(clean_bool(v).astype(int) for v in buy_checks)
-    sell_confirmation_count = sum(clean_bool(v).astype(int) for v in sell_checks)
-
-    buy_setup_raw = (tdi_lower_touch | tdi_lower_reclaim) & (buy_confirmation_count >= p["min_buy_confirmations"])
-    sell_setup_raw = (tdi_upper_touch | tdi_upper_reject) & (sell_confirmation_count >= p["min_sell_confirmations"])
-    
-    buy_setup = buy_setup_raw & (~buy_setup_raw.shift(1).fillna(False))
-    sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
-
-    long_exit = tdi_upper_touch | tdi_upper_reject | loxx_upper_touch | donchian_upper_touch
-    short_exit = tdi_lower_touch | tdi_lower_reclaim | loxx_lower_touch | donchian_lower_touch
-
-    # Convert to pandas/numpy for the state machine loop (inherently sequential)
-    data_pd = data.to_arrow().to_pandas()
-    buy_setup_pd = buy_setup.to_arrow().to_pandas()
-    sell_setup_pd = sell_setup.to_arrow().to_pandas()
-    long_exit_pd = long_exit.to_arrow().to_pandas()
-    short_exit_pd = short_exit.to_arrow().to_pandas()
-
-    rows = []
-    position = 0
-    timestamps = data_pd["timestamp"].to_numpy()
-    
-    buy_arr = np.asarray(buy_setup_pd, dtype=bool)
-    sell_arr = np.asarray(sell_setup_pd, dtype=bool)
-    lx_arr = np.asarray(long_exit_pd, dtype=bool)
-    sx_arr = np.asarray(short_exit_pd, dtype=bool)
-
-    # Sparse event iteration — only visit bars where something happens
-    all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
-
-    for i in all_event_indices:
-        sig, act = None, None
-        if position == 0:
-            if buy_arr[i]:
-                sig, act, position = "BUY", "ENTER_LONG", 1
-            elif sell_arr[i]:
-                sig, act, position = "SELL", "ENTER_SHORT", -1
-        elif position == 1 and lx_arr[i]:
-            sig, act, position = "SELLBACK", "EXIT_LONG", 0
-        elif position == -1 and sx_arr[i]:
-            sig, act, position = "BUYBACK", "EXIT_SHORT", 0
-        
-        if sig:
-            rows.append({"timestamp": timestamps[i], "signal": sig, "action": act})
-
-    return pd.DataFrame(rows)
+# The private generate_tv_signals_local duplicate has been DELETED. It
+# used non-canonical exit signal strings while the CLI generator used
+# signal="EXIT" — the silent divergence flagged by the external review
+# (see docs/P0-8_signal_parity_refactor.md). The calibrator now calls
+# compute_signals_df imported from generate_tv_strategy1_signals.py
+# (parity by construction).
 
 # ---------------------------------------------------------------------------
 # Objective Function
@@ -228,8 +108,9 @@ def objective_wrapper(params: dict, data: pd.DataFrame) -> float:
         if key in params:
             cfg[key] = params[key]
     
-    # 1. Generate Signals
-    signals = generate_tv_signals_local(data, params)
+    # 1. Generate Signals (P0-8: shared canonical path with the CLI generator;
+    #    zero-copy handoff — `signals` is passed straight to run_backtest)
+    signals = compute_signals_df(data, params)
     if signals.empty:
         return -9999.0
     

@@ -23,14 +23,14 @@ from optuna.samplers import QMCSampler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-from definitions import (
-    calculate_cyclic_rsi, 
-    calculate_multi_rsi_plus, 
-    calculate_stochastic_macd
-)
 import cudf
 from gpu_io import load_csv
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
+# P0-8: the canonical VM signal path lives in the CLI generator module.
+# The calibrator imports it so calibration and production share one code
+# path by construction (the old private generate_vm_signals_local duplicate
+# is deleted).
+from generate_vm_automation_logic_signals import compute_signals_df
 from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
 
 suppress_pandas_warnings()
@@ -41,25 +41,9 @@ _GPU_DATA_CACHE = None
 # ---------------------------------------------------------------------------
 # Helpers (Native)
 # ---------------------------------------------------------------------------
-
-def crossed_above(left: pd.Series, right: pd.Series) -> pd.Series:
-    """Returns True if the 'left' series crossed above the 'right' series on the current bar."""
-    return (left.shift(1) <= right.shift(1)) & (left > right)
-
-def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
-    """Returns True if the 'left' series crossed below the 'right' series on the current bar."""
-    return (left.shift(1) >= right.shift(1)) & (left < right)
-
-def clean_bool(series: pd.Series) -> pd.Series:
-    """Ensures a series is boolean and fills NaNs with False."""
-    if hasattr(series, 'dtype'):
-        if str(series.dtype) in ('bool', 'boolean', 'bool_'):
-            return series.fillna(False)
-    return series.fillna(False).astype(bool)
-
-def recent(series: pd.Series, bars: int) -> pd.Series:
-    """Returns True if any value in the lookback period is True."""
-    return clean_bool(series).rolling(max(1, int(bars)), min_periods=1).max().astype(bool)
+# P0-8: the crossed_above/crossed_below/clean_bool/recent helpers were only
+# used by the deleted private signal generator; the canonical helpers now
+# live in the imported generator module.
 
 def get_postgres_url() -> str:
     """Get PostgreSQL connection URL.
@@ -188,128 +172,12 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
     return gpu_df
 
 # ---------------------------------------------------------------------------
-# Signal Generation (VM Strategy Wrapper)
+# Signal Generation (VM Strategy Wrapper) — P0-8
 # ---------------------------------------------------------------------------
-
-def generate_vm_signals_local(data: cudf.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
-    p = {**VM_DEFAULTS, **params}
-
-    with tqdm(total=4, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
-        multi_rsi = calculate_multi_rsi_plus(
-            data, 
-            p1=p["multi_rsi_p1"], 
-            p2=p["multi_rsi_p2"], 
-            p3=p["multi_rsi_p3"], 
-            smal=p["multi_rsi_smal"]
-        )
-        pbar.update()
-        
-        cyclic_rsi = calculate_cyclic_rsi(
-            data, 
-            dom_cycle=p["crsi_dom_cycle"], 
-            vibration=p["crsi_vibration"], 
-            leveling=p["crsi_leveling"]
-        )
-        pbar.update()
-        
-        stoch_macd = calculate_stochastic_macd(
-            data, 
-            fast_len=p["stoch_macd_fast_len"], 
-            slow_len=p["stoch_macd_slow_len"], 
-            signal_len=p["stoch_macd_signal_len"], 
-            lookback=p["stoch_macd_lookback"],
-            fast_len_xd=p["stoch_macd_fast_len_xd"],
-            slow_len_xd=p["stoch_macd_slow_len_xd"],
-            signal_len_xd=p["stoch_macd_signal_len_xd"],
-            lookback_xd=p["stoch_macd_lookback_xd"]
-        )
-        pbar.update()
-
-        # Stochastic MACD Bullish: crossover(Slow_MACD, Slow_Signal)
-        stoch_bull_raw = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        stoch_bull = recent(stoch_bull_raw, int(p["confirmation_lookback_bars"]))
-        
-        # Multi RSI Bullish: RSI1 in the Buy Area (lower zone)
-        multi_bull = multi_rsi["R1MAVW"] < 40
-        
-        # Cyclic RSI Bullish: CRSI reclaiming Lower_Band or just > 50
-        cyclic_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | (cyclic_rsi["CRSI"] > 50)
-
-        buy_setup_raw = multi_bull & stoch_bull & cyclic_bull
-        buy_setup = buy_setup_raw & (~buy_setup_raw.shift(1).fillna(False))
-
-        # Sell Setup
-        stoch_bear_raw = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        stoch_bear = recent(stoch_bear_raw, int(p["confirmation_lookback_bars"]))
-        multi_bear = multi_rsi["R1MAVW"] > 60
-        cyclic_bear = (cyclic_rsi["CRSI"] >= cyclic_rsi["Upper_Band"]) | (cyclic_rsi["CRSI"] < 50)
-
-        sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
-        sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
-
-        # Exit Logic — Fast exit on Fast MACD cross, Slow exit on Slow MACD cross
-        # When both are True, exit on EITHER condition (parallel triggers, first to fire wins)
-        if p["use_fast_stoch_exit"]:
-            fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
-            fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
-        else:
-            fast_long_exit = cudf.Series(False, index=data.index)
-            fast_short_exit = cudf.Series(False, index=data.index)
-
-        if p["use_slow_stoch_exit"]:
-            slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-            slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        else:
-            slow_long_exit = cudf.Series(False, index=data.index)
-            slow_short_exit = cudf.Series(False, index=data.index)
-
-        long_exit = fast_long_exit | slow_long_exit
-        short_exit = fast_short_exit | slow_short_exit
-        pbar.update()
-
-        # Convert to pandas/numpy for the state machine loop (inherently sequential)
-        data_pd = data.to_arrow().to_pandas()
-        buy_setup_pd = buy_setup.to_arrow().to_pandas()
-        sell_setup_pd = sell_setup.to_arrow().to_pandas()
-        long_exit_pd = long_exit.to_arrow().to_pandas()
-        short_exit_pd = short_exit.to_arrow().to_pandas()
-        
-        rows = []
-        position = 0
-        timestamps = data_pd["timestamp"].to_numpy()
-        
-        buy_arr = clean_bool(buy_setup_pd).to_numpy()
-        sell_arr = clean_bool(sell_setup_pd).to_numpy()
-        lx_arr = clean_bool(long_exit_pd).to_numpy()
-        sx_arr = clean_bool(short_exit_pd).to_numpy()
-
-        # Sparse event iteration — only visit bars where something happens
-        all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
-
-        for i in all_event_indices:
-            sig, act = None, None
-            if position == 0:
-                if buy_arr[i]:
-                    sig, act, position = "BUY", "ENTER_LONG", 1
-                elif sell_arr[i]:
-                    sig, act, position = "SELL", "ENTER_SHORT", -1
-            elif position == 1:
-                if lx_arr[i]:
-                    sig, act, position = "EXIT", "EXIT_LONG", 0
-                elif sell_arr[i]:
-                    sig, act, position = "SELL", "ENTER_SHORT", -1
-            elif position == -1:
-                if sx_arr[i]:
-                    sig, act, position = "EXIT", "EXIT_SHORT", 0
-                elif buy_arr[i]:
-                    sig, act, position = "BUY", "ENTER_LONG", 1
-            
-            if sig:
-                rows.append({"timestamp": timestamps[i], "signal": sig, "action": act})
-
-        pbar.update()
-
-    return pd.DataFrame(rows)
+# The private generate_vm_signals_local duplicate has been DELETED.
+# The calibrator now calls compute_signals_df imported from
+# generate_vm_automation_logic_signals.py — the exact function the CLI
+# generator uses to write OOS signal CSVs (parity by construction).
 
 # ---------------------------------------------------------------------------
 # Objective Function
@@ -324,8 +192,9 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
         if key in params:
             cfg[key] = params[key]
     
-    # 1. Generate Signals
-    signals = generate_vm_signals_local(data, params, trial_id=trial_id)
+    # 1. Generate Signals (P0-8: shared canonical path with the CLI generator;
+    #    zero-copy handoff — `signals` is passed straight to run_backtest)
+    signals = compute_signals_df(data, params)
     if signals.empty:
         return -9999.0
     

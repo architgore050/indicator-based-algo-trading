@@ -1,5 +1,9 @@
 # Optuna Calibration Scripts — Optimization Guide
 
+> **Historical document.** The calibrator-local signal generators described here were deleted by
+> **P0-8** (2026-10-21); signal generation now lives solely in the CLI generators via
+> `compute_signals_df`. See `docs/P0-8_signal_parity_refactor.md`.
+
 **Target files:** `v6/optuna_calibrate_vm.py`, `v6/optuna_calibrate_tv.py`  
 **Goal:** Reduce per-trial wall-clock time, increase parallel throughput, and improve search efficiency.  
 **Constraint:** Results must remain identical to baseline (within tolerance). Parity is non-negotiable.

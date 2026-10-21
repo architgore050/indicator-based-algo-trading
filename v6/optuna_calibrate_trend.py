@@ -23,11 +23,11 @@ from optuna.samplers import QMCSampler
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-from definitions import (
-    calculate_breakout_channel,
-    calculate_efficiency_ratio,
-    calculate_time_series_momentum,
-)
+# P0-8: the canonical Trend signal path lives in the CLI generator module.
+# The calibrator imports it so calibration and production share one code
+# path by construction (the old private generate_trend_signals_local
+# duplicate is deleted).
+from generate_trend_following_signals import compute_signals_df
 import cudf
 from gpu_io import load_csv
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
@@ -41,19 +41,9 @@ _GPU_DATA_CACHE = None
 # ---------------------------------------------------------------------------
 # Helpers (Native)
 # ---------------------------------------------------------------------------
-
-def crossed_above(left: pd.Series, right: pd.Series) -> pd.Series:
-    return (left.shift(1) <= right.shift(1)) & (left > right)
-
-def crossed_below(left: pd.Series, right: pd.Series) -> pd.Series:
-    return (left.shift(1) >= right.shift(1)) & (left < right)
-
-def clean_bool(series: pd.Series) -> pd.Series:
-    """Ensures a series is boolean and fills NaNs with False."""
-    if hasattr(series, 'dtype'):
-        if str(series.dtype) in ('bool', 'boolean', 'bool_'):
-            return series.fillna(False)
-    return series.fillna(False).astype(bool)
+# P0-8: the crossed_above/crossed_below/clean_bool helpers were only used by
+# the deleted private signal generator; the canonical helpers now live in the
+# imported generator module.
 
 
 # ---------------------------------------------------------------------------
@@ -183,103 +173,12 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
 
 
 # ---------------------------------------------------------------------------
-# Signal Generation (Trend Strategy Wrapper)
+# Signal Generation (Trend Strategy Wrapper) — P0-8
 # ---------------------------------------------------------------------------
-
-def generate_trend_signals_local(data: cudf.DataFrame, params: dict, trial_id: str = "trial") -> pd.DataFrame:
-    p = {**TREND_DEFAULTS, **params}
-
-    with tqdm(total=3, desc=f"Trial {trial_id} indicators", unit="step", leave=False) as pbar:
-        tsm = calculate_time_series_momentum(
-            data,
-            fast_lb=p["tsm_fast_lb"],
-            med_lb=p["tsm_med_lb"],
-            slow_lb=p["tsm_slow_lb"],
-            vol_lb=p["tsm_vol_lb"],
-            vol_z_entry=p["tsm_vol_z_entry"],
-        )
-        pbar.update()
-
-        breakout = calculate_breakout_channel(
-            data,
-            donchian_lb=p["bo_donchian_lb"],
-            ema_fast_lb=p["bo_ema_fast_lb"],
-            ema_slow_lb=p["bo_ema_slow_lb"],
-            atr_lb=p["bo_atr_lb"],
-        )
-        pbar.update()
-
-        er = calculate_efficiency_ratio(
-            data,
-            er_lb=p["er_lb"],
-        )
-        pbar.update()
-
-    composite = tsm["Composite"]
-    tsm_bull = composite > p["tsm_entry_threshold"]
-    ema_bull = breakout["EMA_Trend"] > 0
-    bo_bull = breakout["Break_Up"]
-    er_bull = er["ER"] >= p["er_min_threshold"]
-    vol_regime_ok = (tsm["Realized_Vol"] >= p["min_realized_vol"]).fillna(False)
-    bo_confirmed = bo_bull & tsm_bull
-
-    buy_setup_raw = bo_confirmed & ema_bull & er_bull & vol_regime_ok
-    buy_setup = buy_setup_raw & (~buy_setup_raw.shift(1).fillna(False))
-
-    tsm_bear = composite < -p["tsm_entry_threshold"]
-    ema_bear = breakout["EMA_Trend"] < 0
-    bo_bear = breakout["Break_Dn"]
-    er_bear = er["ER"] >= p["er_min_threshold"]
-    bo_bear_confirmed = bo_bear & tsm_bear
-
-    sell_setup_raw = bo_bear_confirmed & ema_bear & er_bear & vol_regime_ok
-    sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
-
-    long_exit = crossed_below(composite, cudf.Series(0.0, index=data.index)) | (breakout["EMA_Trend"] < 0)
-    short_exit = crossed_above(composite, cudf.Series(0.0, index=data.index)) | (breakout["EMA_Trend"] > 0)
-
-    # Convert to pandas/numpy for the state machine loop (inherently sequential)
-    data_pd = data.to_arrow().to_pandas()
-    buy_setup_pd = buy_setup.to_arrow().to_pandas()
-    sell_setup_pd = sell_setup.to_arrow().to_pandas()
-    long_exit_pd = long_exit.to_arrow().to_pandas()
-    short_exit_pd = short_exit.to_arrow().to_pandas()
-
-    rows = []
-    position = 0
-    timestamps = data_pd["timestamp"].to_numpy()
-
-    buy_arr = np.asarray(clean_bool(buy_setup_pd), dtype=bool)
-    sell_arr = np.asarray(clean_bool(sell_setup_pd), dtype=bool)
-    lx_arr = np.asarray(clean_bool(long_exit_pd), dtype=bool)
-    sx_arr = np.asarray(clean_bool(short_exit_pd), dtype=bool)
-
-    # Sparse event iteration — only visit bars where something happens
-    all_event_indices = np.where(buy_arr | sell_arr | lx_arr | sx_arr)[0]
-
-    for i in all_event_indices:
-        sig, act = None, None
-        if position == 0:
-            if buy_arr[i]:
-                sig, act, position = "BUY", "ENTER_LONG", 1
-            elif sell_arr[i]:
-                sig, act, position = "SELL", "ENTER_SHORT", -1
-        elif position == 1:
-            if lx_arr[i]:
-                sig, act, position = "EXIT", "EXIT_LONG", 0
-            elif sell_arr[i]:
-                sig, act, position = "SELL", "ENTER_SHORT", -1
-        elif position == -1:
-            if sx_arr[i]:
-                sig, act, position = "EXIT", "EXIT_SHORT", 0
-            elif buy_arr[i]:
-                sig, act, position = "BUY", "ENTER_LONG", 1
-
-        if sig:
-            rows.append({"timestamp": timestamps[i], "signal": sig, "action": act})
-
-    return pd.DataFrame(rows)
-
+# The private generate_trend_signals_local duplicate has been DELETED.
+# The calibrator now calls compute_signals_df imported from
+# generate_trend_following_signals.py — the exact function the CLI
+# generator uses to write OOS signal CSVs (parity by construction).
 
 # ---------------------------------------------------------------------------
 # Objective Function
@@ -294,8 +193,9 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
         if key in params:
             cfg[key] = params[key]
 
-    # 1. Generate Signals
-    signals = generate_trend_signals_local(data, params, trial_id=trial_id)
+    # 1. Generate Signals (P0-8: shared canonical path with the CLI generator;
+    #    zero-copy handoff — `signals` is passed straight to run_backtest)
+    signals = compute_signals_df(data, params)
     if signals.empty:
         return -9999.0
 

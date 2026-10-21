@@ -1,5 +1,9 @@
 # Optuna Calibration — Temporary Optimizations
 
+> **Historical document.** The calibrator-local signal generators described here were deleted by
+> **P0-8** (2026-10-21); signal generation now lives solely in the CLI generators via
+> `compute_signals_df`. See `docs/P0-8_signal_parity_refactor.md`.
+
 **Target files:** `v6/optuna_calibrate_vm.py`, `v6/optuna_calibrate_tv.py`  
 **Goal:** Quick, low-risk implementation improvements that reduce per-trial wall-clock time without changing search behavior, calibration logic, or design decisions.  
 **Constraint:** Results must remain identical to baseline (within tolerance). Parity is non-negotiable.  
@@ -72,6 +76,8 @@ for i in all_event_indices:
 ### TV-specific (`optuna_calibrate_tv.py`)
 - Lines 212-226: Same pattern.
 - TV uses `"SELLBACK"` and `"BUYBACK"` as signal strings — preserve these exactly.
+  **[SUPERSEDED by P0-8, 2026-10-21]** The calibrator-local signal generators were deleted; the CLI
+  generator is the single source of truth and emits `EXIT` exit strings. See `docs/P0-8_signal_parity_refactor.md`.
 - No outer `tqdm(total=5)` in TV script, but the inner loop still needs the sparse treatment.
 
 ### Verification

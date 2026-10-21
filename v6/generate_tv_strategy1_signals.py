@@ -144,8 +144,13 @@ def load_data(
 
 def _to_numpy(series):
     """Convert cudf or pandas Series to numpy array.
-    Uses cupy for cudf Series to avoid numba/cudf context bugs."""
+    Uses cupy for cudf Series to avoid numba/cudf context bugs.
+    datetime64 columns go through the arrow bridge — cupy must never hold
+    datetime arrays (see AGENTS.md; the calibrator path passes datetime64
+    timestamps, the CLI path passes int64 epoch ms)."""
     if hasattr(series, 'to_pandas'):
+        if "datetime" in str(getattr(series, "dtype", "")):
+            return series.to_arrow().to_pandas().to_numpy()
         return cp.asnumpy(cp.asarray(series))
     return series.to_numpy()
 
@@ -281,6 +286,130 @@ def build_signal_rows(
     return pd.DataFrame(rows)
 
 
+def compute_signals_df(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
+    """Compute TV Strategy 1 signal rows from OHLCV data and strategy params.
+
+    P0-8: the single canonical TV signal path. The CLI flow below and the
+    Optuna calibrator (optuna_calibrate_tv.py) both call this function, so
+    calibration-to-production parity holds by construction. Pure: no CSV I/O,
+    no progress bars, no side effects. Returns the DataFrame directly —
+    zero-copy handoff, no .copy() on the return.
+
+    Signal strings: exits use signal="EXIT" with action="EXIT_LONG"/
+    "EXIT_SHORT" (the backtester keys exits on `action`). The calibrator's
+    old private generator used divergent exit signal strings here — that
+    divergence is eliminated by this shared function (see
+    docs/P0-8_signal_parity_refactor.md).
+
+    `params` may be partial (Optuna trial params); missing keys fall back to
+    the config.json tv_strategy_params defaults, matching the old calibrator
+    wrapper's {**TV_DEFAULTS, **params} merge.
+    """
+    p = {**CONF["tv_strategy_params"], **params}
+
+    tdi = calculate_tdi(data, rsi_period=p["tdi_rsi_period"], band_length=p["tdi_band_length"],
+                        fast_ma_len=p["tdi_fast_ma_len"], slow_ma_len=p["tdi_slow_ma_len"], mult=p["tdi_mult"])
+
+    el_cross = calculate_el_rsi_cross(data, smooth_k=p["el_smooth_k"], rsi2_len=p["el_rsi2_len"],
+                                      rsi3_len=p["el_rsi3_len"], rsi_norm=p["el_rsi_norm"],
+                                      macd_fast=p["el_macd_fast"], macd_slow=p["el_macd_slow"],
+                                      macd_signal=p["el_macd_signal"])
+
+    cyclic_rsi = calculate_cyclic_rsi(data, dom_cycle=p["crsi_dom_cycle"], vibration=p["crsi_vibration"],
+                                      leveling=p["crsi_leveling"])
+
+    rsi_8_21 = calculate_rsi_8_21(data, rsi_len=p["rsi_8_21_rsi_len"], ma8_len=p["rsi_8_21_ma8_len"],
+                                  ma21_len=p["rsi_8_21_ma21_len"])
+
+    bbbo = calculate_bbbo(data, len1=p["bbbo_len1"], len2=p["bbbo_len2"],
+                          mult_upper=p["bbbo_mult_upper"], mult_lower=p["bbbo_mult_lower"])
+
+    loxx = calculate_tdi_loxx(data, rsi_period=p["loxx_rsi_period"], price_line_period=p["loxx_price_line_period"],
+                              signal_line_period=p["loxx_signal_line_period"], vol_band_period=p["loxx_vol_band_period"],
+                              vol_band_mult=p["loxx_vol_band_mult"])
+
+    donchian = calculate_donchian_rsi_bands(data, rsi_len=p["donchian_rsi_len"], bb_len=p["donchian_bb_len"],
+                                            bb_mult_inner=p["donchian_bb_mult_inner"], bb_mult_outer=p["donchian_bb_mult_outer"],
+                                            dc_len=p["donchian_dc_len"])
+
+    # --- Signal condition logic (all vectorized, works on cudf) ---
+
+    tdi_lower_touch = tdi["RSI_PL"] <= (tdi["BB_Lower"] + p["tdi_touch_tolerance"])
+    tdi_lower_reclaim = crossed_above(tdi["RSI_PL"], tdi["BB_Lower"])
+    tdi_upper_touch = tdi["RSI_PL"] >= (tdi["BB_Upper"] - p["tdi_touch_tolerance"])
+    tdi_upper_reject = crossed_below(tdi["RSI_PL"], tdi["BB_Upper"])
+
+    tdi_bull = crossed_above(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] > tdi["Signal"])
+    el_bull = (
+        crossed_above(el_cross["RSI2"], el_cross["Signal_K"])
+        | crossed_above(el_cross["RSI2"], el_cross["RSI3"])
+        | ((el_cross["RSI2"] > el_cross["Signal_K"]) & (el_cross["RSI2"] > el_cross["RSI3"]))
+    )
+    crsi_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | crossed_above(
+        cyclic_rsi["CRSI"], cyclic_rsi["Lower_Band"]
+    )
+    rsi_8_21_bull = crossed_above(rsi_8_21["MA8_RSI"], rsi_8_21["MA21_RSI"]) | (
+        rsi_8_21["MA8_RSI"] > rsi_8_21["MA21_RSI"]
+    )
+    bbbo_bull = (bbbo["Oscillator"] <= bbbo["Lower"]) | crossed_above(
+        bbbo["Oscillator"], bbbo["Lower"]
+    )
+
+    tdi_bear = crossed_below(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] < tdi["Signal"])
+    loxx_upper_touch = loxx["RSI_PL"] >= loxx["Band_Up"]
+    loxx_lower_touch = loxx["RSI_PL"] <= loxx["Band_Dn"]
+    loxx_bear = loxx_upper_touch | crossed_below(loxx["RSI_PL"], loxx["RSI_SL"]) | (loxx["Trend"] < 0)
+    donchian_upper_touch = (donchian["RSI"] >= donchian["BB_Upper_Outer"]) | (
+        donchian["RSI"] >= donchian["DC_Upper"]
+    )
+    donchian_lower_touch = (donchian["RSI"] <= donchian["BB_Lower_Outer"]) | (
+        donchian["RSI"] <= donchian["DC_Lower"]
+    )
+    donchian_bear = donchian_upper_touch | crossed_below(donchian["RSI"], donchian["BB_Upper_Inner"])
+
+    buy_checks = [
+        ("TDI bullish cross", tdi_bull),
+        ("EL RSI bullish", el_bull),
+        ("CRSI lower-band buy", crsi_bull),
+        ("RSI 8-21 bullish", rsi_8_21_bull),
+        ("BBBO lower-band buy", bbbo_bull),
+    ]
+    sell_checks = [
+        ("TDI bearish cross", tdi_bear),
+        ("Loxx upper-band sell", loxx_bear),
+        ("Donchian upper-band sell", donchian_bear),
+    ]
+
+    # Confirmation counts — sum works on both pandas and cudf Series
+    buy_confirmation_count = sum(clean_bool(values).astype(int) for _, values in buy_checks)
+    sell_confirmation_count = sum(clean_bool(values).astype(int) for _, values in sell_checks)
+
+    buy_setup_raw = (tdi_lower_touch | tdi_lower_reclaim) & (buy_confirmation_count >= p["min_buy_confirmations"])
+    sell_setup_raw = (tdi_upper_touch | tdi_upper_reject) & (sell_confirmation_count >= p["min_sell_confirmations"])
+
+    # Leading-edge detection
+    buy_setup = buy_setup_raw & (~buy_setup_raw.shift(1).fillna(False))
+    sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
+
+    long_exit = tdi_upper_touch | tdi_upper_reject | loxx_upper_touch | donchian_upper_touch
+    short_exit = tdi_lower_touch | tdi_lower_reclaim | loxx_lower_touch | donchian_lower_touch
+
+    return build_signal_rows(
+        data=data,
+        tdi=tdi,
+        loxx=loxx,
+        donchian=donchian,
+        buy_setup=buy_setup,
+        sell_setup=sell_setup,
+        long_exit=long_exit,
+        short_exit=short_exit,
+        buy_checks=buy_checks,
+        sell_checks=sell_checks,
+        buy_confirmation_count=buy_confirmation_count,
+        sell_confirmation_count=sell_confirmation_count,
+    )
+
+
 def generate_signals(
     mode: str,
     start_row: int = 0,
@@ -288,126 +417,26 @@ def generate_signals(
     data_csv_path: str = None,
     output_dir: str = None,
     oos_start_row_in_slice: int = None,
+    params: dict = None,
 ) -> Path:
     base_csv = OUTPUT_CSV
     if output_dir:
         base_csv = Path(output_dir) / base_csv.name
     output_csv = with_mode_suffix(base_csv, mode)
 
-    with tqdm(total=10, desc="TV Strategy 1", unit="step") as pbar:
+    # CLI default: module-level PARAMS (config.json + calibration override,
+    # reloaded by main() when --calibration is given). Callers may pass an
+    # explicit params dict (parity tests).
+    effective_params = PARAMS if params is None else params
+
+    with tqdm(total=3, desc="TV Strategy 1", unit="step") as pbar:
         data = load_data(mode, start_row=start_row, end_row=end_row, data_csv_path=data_csv_path)
         pbar.set_postfix_str(f"rows={len(data):,}")
         pbar.update()
 
-        tdi = calculate_tdi(data, rsi_period=PARAMS["tdi_rsi_period"], band_length=PARAMS["tdi_band_length"],
-                            fast_ma_len=PARAMS["tdi_fast_ma_len"], slow_ma_len=PARAMS["tdi_slow_ma_len"], mult=PARAMS["tdi_mult"])
+        signals = compute_signals_df(data, effective_params)
+        pbar.set_postfix_str(f"signals={len(signals):,}")
         pbar.update()
-
-        el_cross = calculate_el_rsi_cross(data, smooth_k=PARAMS["el_smooth_k"], rsi2_len=PARAMS["el_rsi2_len"],
-                                          rsi3_len=PARAMS["el_rsi3_len"], rsi_norm=PARAMS["el_rsi_norm"],
-                                          macd_fast=PARAMS["el_macd_fast"], macd_slow=PARAMS["el_macd_slow"],
-                                          macd_signal=PARAMS["el_macd_signal"])
-        pbar.update()
-
-        cyclic_rsi = calculate_cyclic_rsi(data, dom_cycle=PARAMS["crsi_dom_cycle"], vibration=PARAMS["crsi_vibration"],
-                                          leveling=PARAMS["crsi_leveling"])
-        pbar.update()
-
-        rsi_8_21 = calculate_rsi_8_21(data, rsi_len=PARAMS["rsi_8_21_rsi_len"], ma8_len=PARAMS["rsi_8_21_ma8_len"],
-                                      ma21_len=PARAMS["rsi_8_21_ma21_len"])
-        pbar.update()
-
-        bbbo = calculate_bbbo(data, len1=PARAMS["bbbo_len1"], len2=PARAMS["bbbo_len2"],
-                              mult_upper=PARAMS["bbbo_mult_upper"], mult_lower=PARAMS["bbbo_mult_lower"])
-        pbar.update()
-
-        loxx = calculate_tdi_loxx(data, rsi_period=PARAMS["loxx_rsi_period"], price_line_period=PARAMS["loxx_price_line_period"],
-                                  signal_line_period=PARAMS["loxx_signal_line_period"], vol_band_period=PARAMS["loxx_vol_band_period"],
-                                  vol_band_mult=PARAMS["loxx_vol_band_mult"])
-        pbar.update()
-
-        donchian = calculate_donchian_rsi_bands(data, rsi_len=PARAMS["donchian_rsi_len"], bb_len=PARAMS["donchian_bb_len"],
-                                                bb_mult_inner=PARAMS["donchian_bb_mult_inner"], bb_mult_outer=PARAMS["donchian_bb_mult_outer"],
-                                                dc_len=PARAMS["donchian_dc_len"])
-        pbar.update()
-
-        # --- Signal condition logic (all vectorized, works on cudf) ---
-
-        tdi_lower_touch = tdi["RSI_PL"] <= (tdi["BB_Lower"] + PARAMS["tdi_touch_tolerance"])
-        tdi_lower_reclaim = crossed_above(tdi["RSI_PL"], tdi["BB_Lower"])
-        tdi_upper_touch = tdi["RSI_PL"] >= (tdi["BB_Upper"] - PARAMS["tdi_touch_tolerance"])
-        tdi_upper_reject = crossed_below(tdi["RSI_PL"], tdi["BB_Upper"])
-
-        tdi_bull = crossed_above(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] > tdi["Signal"])
-        el_bull = (
-            crossed_above(el_cross["RSI2"], el_cross["Signal_K"])
-            | crossed_above(el_cross["RSI2"], el_cross["RSI3"])
-            | ((el_cross["RSI2"] > el_cross["Signal_K"]) & (el_cross["RSI2"] > el_cross["RSI3"]))
-        )
-        crsi_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | crossed_above(
-            cyclic_rsi["CRSI"], cyclic_rsi["Lower_Band"]
-        )
-        rsi_8_21_bull = crossed_above(rsi_8_21["MA8_RSI"], rsi_8_21["MA21_RSI"]) | (
-            rsi_8_21["MA8_RSI"] > rsi_8_21["MA21_RSI"]
-        )
-        bbbo_bull = (bbbo["Oscillator"] <= bbbo["Lower"]) | crossed_above(
-            bbbo["Oscillator"], bbbo["Lower"]
-        )
-
-        tdi_bear = crossed_below(tdi["RSI_PL"], tdi["Signal"]) | (tdi["RSI_PL"] < tdi["Signal"])
-        loxx_upper_touch = loxx["RSI_PL"] >= loxx["Band_Up"]
-        loxx_lower_touch = loxx["RSI_PL"] <= loxx["Band_Dn"]
-        loxx_bear = loxx_upper_touch | crossed_below(loxx["RSI_PL"], loxx["RSI_SL"]) | (loxx["Trend"] < 0)
-        donchian_upper_touch = (donchian["RSI"] >= donchian["BB_Upper_Outer"]) | (
-            donchian["RSI"] >= donchian["DC_Upper"]
-        )
-        donchian_lower_touch = (donchian["RSI"] <= donchian["BB_Lower_Outer"]) | (
-            donchian["RSI"] <= donchian["DC_Lower"]
-        )
-        donchian_bear = donchian_upper_touch | crossed_below(donchian["RSI"], donchian["BB_Upper_Inner"])
-
-        buy_checks = [
-            ("TDI bullish cross", tdi_bull),
-            ("EL RSI bullish", el_bull),
-            ("CRSI lower-band buy", crsi_bull),
-            ("RSI 8-21 bullish", rsi_8_21_bull),
-            ("BBBO lower-band buy", bbbo_bull),
-        ]
-        sell_checks = [
-            ("TDI bearish cross", tdi_bear),
-            ("Loxx upper-band sell", loxx_bear),
-            ("Donchian upper-band sell", donchian_bear),
-        ]
-
-        # Confirmation counts — sum works on both pandas and cudf Series
-        buy_confirmation_count = sum(clean_bool(values).astype(int) for _, values in buy_checks)
-        sell_confirmation_count = sum(clean_bool(values).astype(int) for _, values in sell_checks)
-
-        buy_setup_raw = (tdi_lower_touch | tdi_lower_reclaim) & (buy_confirmation_count >= PARAMS["min_buy_confirmations"])
-        sell_setup_raw = (tdi_upper_touch | tdi_upper_reject) & (sell_confirmation_count >= PARAMS["min_sell_confirmations"])
-
-        # Leading-edge detection
-        buy_setup = buy_setup_raw & (~buy_setup_raw.shift(1).fillna(False))
-        sell_setup = sell_setup_raw & (~sell_setup_raw.shift(1).fillna(False))
-
-        long_exit = tdi_upper_touch | tdi_upper_reject | loxx_upper_touch | donchian_upper_touch
-        short_exit = tdi_lower_touch | tdi_lower_reclaim | loxx_lower_touch | donchian_lower_touch
-        pbar.update()
-
-        signals = build_signal_rows(
-            data=data,
-            tdi=tdi,
-            loxx=loxx,
-            donchian=donchian,
-            buy_setup=buy_setup,
-            sell_setup=sell_setup,
-            long_exit=long_exit,
-            short_exit=short_exit,
-            buy_checks=buy_checks,
-            sell_checks=sell_checks,
-            buy_confirmation_count=buy_confirmation_count,
-            sell_confirmation_count=sell_confirmation_count,
-        )
 
         # P0-6: when the slice carries pre-roll history before the OOS boundary,
         # discard every signal generated before the first OOS bar (timestamps are

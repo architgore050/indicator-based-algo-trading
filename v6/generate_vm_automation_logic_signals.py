@@ -161,8 +161,13 @@ def _precompute_reasons(check_arrs: list[tuple[str, np.ndarray]], indices: np.nd
 
 def _to_numpy(series):
     """Convert cudf or pandas Series to numpy array.
-    Uses cupy for cudf Series to avoid numba/cudf context bugs."""
+    Uses cupy for cudf Series to avoid numba/cudf context bugs.
+    datetime64 columns go through the arrow bridge — cupy must never hold
+    datetime arrays (see AGENTS.md; the calibrator path passes datetime64
+    timestamps, the CLI path passes int64 epoch ms)."""
     if hasattr(series, 'to_pandas'):
+        if "datetime" in str(getattr(series, "dtype", "")):
+            return series.to_arrow().to_pandas().to_numpy()
         return cp.asnumpy(cp.asarray(series))
     return series.to_numpy()
 
@@ -273,6 +278,109 @@ def build_signal_rows(
     return pd.DataFrame(rows)
 
 
+def compute_signals_df(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
+    """Compute VM signal rows from OHLCV data and strategy params.
+
+    P0-8: the single canonical VM signal path. The CLI flow below and the
+    Optuna calibrator (optuna_calibrate_vm.py) both call this function, so
+    calibration-to-production parity holds by construction. Pure: no CSV I/O,
+    no progress bars, no side effects. Returns the DataFrame directly —
+    zero-copy handoff, no .copy() on the return.
+
+    `params` may be partial (Optuna trial params); missing keys fall back to
+    the config.json vm_strategy_params defaults, matching the old calibrator
+    wrapper's {**VM_DEFAULTS, **params} merge.
+    """
+    p = {**CONF["vm_strategy_params"], **params}
+
+    multi_rsi = calculate_multi_rsi_plus(
+        data, 
+        p1=p["multi_rsi_p1"], 
+        p2=p["multi_rsi_p2"], 
+        p3=p["multi_rsi_p3"], 
+        smal=p["multi_rsi_smal"]
+    )
+
+    cyclic_rsi = calculate_cyclic_rsi(
+        data, 
+        dom_cycle=p["crsi_dom_cycle"], 
+        vibration=p["crsi_vibration"], 
+        leveling=p["crsi_leveling"]
+    )
+
+    stoch_macd = calculate_stochastic_macd(
+        data, 
+        fast_len=p["stoch_macd_fast_len"], 
+        slow_len=p["stoch_macd_slow_len"], 
+        signal_len=p["stoch_macd_signal_len"], 
+        lookback=p["stoch_macd_lookback"],
+        fast_len_xd=p["stoch_macd_fast_len_xd"],
+        slow_len_xd=p["stoch_macd_slow_len_xd"],
+        signal_len_xd=p["stoch_macd_signal_len_xd"],
+        lookback_xd=p["stoch_macd_lookback_xd"]
+    )
+
+    # Stochastic MACD Bullish: crossover(Slow_MACD, Slow_Signal)
+    stoch_bull_raw = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+    stoch_bull = recent(stoch_bull_raw, p["confirmation_lookback_bars"])
+    
+    # Multi RSI Bullish: RSI1 in the Buy Area (lower zone)
+    multi_bull = multi_rsi["R1MAVW"] < 40
+    
+    # Cyclic RSI Bullish: CRSI reclaiming Lower_Band or just > 50
+    cyclic_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | (cyclic_rsi["CRSI"] > 50)
+
+    buy_setup_raw = multi_bull & stoch_bull & cyclic_bull
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
+        buy_fill = buy_setup_raw.shift(1).fillna(False).astype(bool)
+    buy_setup = buy_setup_raw & (~buy_fill)
+
+    # Sell Setup
+    stoch_bear_raw = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+    stoch_bear = recent(stoch_bear_raw, p["confirmation_lookback_bars"])
+    multi_bear = multi_rsi["R1MAVW"] > 60
+    cyclic_bear = (cyclic_rsi["CRSI"] >= cyclic_rsi["Upper_Band"]) | (cyclic_rsi["CRSI"] < 50)
+
+    sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
+        sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
+    sell_setup = sell_setup_raw & (~sell_fill)
+
+    # Exit Logic — Fast exit on Fast MACD cross, Slow exit on Slow MACD cross
+    # When both are True, exit on EITHER condition (parallel triggers, first to fire wins)
+    if p["use_fast_stoch_exit"]:
+        fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
+        fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
+    else:
+        fast_long_exit = cudf.Series(False, index=data.index)
+        fast_short_exit = cudf.Series(False, index=data.index)
+
+    if p["use_slow_stoch_exit"]:
+        slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+        slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
+    else:
+        slow_long_exit = cudf.Series(False, index=data.index)
+        slow_short_exit = cudf.Series(False, index=data.index)
+
+    long_exit = fast_long_exit | slow_long_exit
+    short_exit = fast_short_exit | slow_short_exit
+
+    return build_signal_rows(
+        data=data,
+        multi_rsi=multi_rsi,
+        cyclic_rsi=cyclic_rsi,
+        stoch_macd=stoch_macd,
+        buy_setup=buy_setup,
+        sell_setup=sell_setup,
+        long_exit=long_exit,
+        short_exit=short_exit,
+        buy_checks=[("multi_bull", multi_bull), ("stoch_bull", stoch_bull), ("cyclic_bull", cyclic_bull)],
+        sell_checks=[("multi_bear", multi_bear), ("stoch_bear", stoch_bear), ("cyclic_bear", cyclic_bear)],
+    )
+
+
 def generate_signals(
     params: dict,
     mode: str,
@@ -287,100 +395,14 @@ def generate_signals(
         base_csv = Path(output_dir) / base_csv.name
     output_csv = with_mode_suffix(base_csv, mode)
 
-    with tqdm(total=5, desc="VM Automation Logic", unit="step") as pbar:
+    with tqdm(total=3, desc="VM Automation Logic", unit="step") as pbar:
         data_gdf = load_data(mode, start_row, end_row, data_csv_path=data_csv_path)
         pbar.set_postfix_str(f"rows={len(data_gdf):,}")
         pbar.update()
 
-        multi_rsi = calculate_multi_rsi_plus(
-            data_gdf, 
-            p1=params["multi_rsi_p1"], 
-            p2=params["multi_rsi_p2"], 
-            p3=params["multi_rsi_p3"], 
-            smal=params["multi_rsi_smal"]
-        )
+        signals = compute_signals_df(data_gdf, params)
+        pbar.set_postfix_str(f"signals={len(signals):,}")
         pbar.update()
-
-        cyclic_rsi = calculate_cyclic_rsi(
-            data_gdf, 
-            dom_cycle=params["crsi_dom_cycle"], 
-            vibration=params["crsi_vibration"], 
-            leveling=params["crsi_leveling"]
-        )
-        pbar.update()
-
-        stoch_macd = calculate_stochastic_macd(
-            data_gdf, 
-            fast_len=params["stoch_macd_fast_len"], 
-            slow_len=params["stoch_macd_slow_len"], 
-            signal_len=params["stoch_macd_signal_len"], 
-            lookback=params["stoch_macd_lookback"],
-            fast_len_xd=params["stoch_macd_fast_len_xd"],
-            slow_len_xd=params["stoch_macd_slow_len_xd"],
-            signal_len_xd=params["stoch_macd_signal_len_xd"],
-            lookback_xd=params["stoch_macd_lookback_xd"]
-        )
-        pbar.update()
-
-        # Stochastic MACD Bullish: crossover(Slow_MACD, Slow_Signal)
-        stoch_bull_raw = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        stoch_bull = recent(stoch_bull_raw, params["confirmation_lookback_bars"])
-        
-        # Multi RSI Bullish: RSI1 in the Buy Area (lower zone)
-        multi_bull = multi_rsi["R1MAVW"] < 40
-        
-        # Cyclic RSI Bullish: CRSI reclaiming Lower_Band or just > 50
-        cyclic_bull = (cyclic_rsi["CRSI"] <= cyclic_rsi["Lower_Band"]) | (cyclic_rsi["CRSI"] > 50)
-
-        buy_setup_raw = multi_bull & stoch_bull & cyclic_bull
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
-            buy_fill = buy_setup_raw.shift(1).fillna(False).astype(bool)
-        buy_setup = buy_setup_raw & (~buy_fill)
-
-        # Sell Setup
-        stoch_bear_raw = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        stoch_bear = recent(stoch_bear_raw, params["confirmation_lookback_bars"])
-        multi_bear = multi_rsi["R1MAVW"] > 60
-        cyclic_bear = (cyclic_rsi["CRSI"] >= cyclic_rsi["Upper_Band"]) | (cyclic_rsi["CRSI"] < 50)
-
-        sell_setup_raw = multi_bear & stoch_bear & cyclic_bear
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
-            sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
-        sell_setup = sell_setup_raw & (~sell_fill)
-
-        # Exit Logic — Fast exit on Fast MACD cross, Slow exit on Slow MACD cross
-        # When both are True, exit on EITHER condition (parallel triggers, first to fire wins)
-        if params["use_fast_stoch_exit"]:
-            fast_long_exit = crossed_below(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
-            fast_short_exit = crossed_above(stoch_macd["Fast_MACD"], stoch_macd["Fast_Signal"])
-        else:
-            fast_long_exit = cudf.Series(False, index=data_gdf.index)
-            fast_short_exit = cudf.Series(False, index=data_gdf.index)
-
-        if params["use_slow_stoch_exit"]:
-            slow_long_exit = crossed_below(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-            slow_short_exit = crossed_above(stoch_macd["Slow_MACD"], stoch_macd["Slow_Signal"])
-        else:
-            slow_long_exit = cudf.Series(False, index=data_gdf.index)
-            slow_short_exit = cudf.Series(False, index=data_gdf.index)
-
-        long_exit = fast_long_exit | slow_long_exit
-        short_exit = fast_short_exit | slow_short_exit
-
-        signals = build_signal_rows(
-            data=data_gdf,
-            multi_rsi=multi_rsi,
-            cyclic_rsi=cyclic_rsi,
-            stoch_macd=stoch_macd,
-            buy_setup=buy_setup,
-            sell_setup=sell_setup,
-            long_exit=long_exit,
-            short_exit=short_exit,
-            buy_checks=[("multi_bull", multi_bull), ("stoch_bull", stoch_bull), ("cyclic_bull", cyclic_bull)],
-            sell_checks=[("multi_bear", multi_bear), ("stoch_bear", stoch_bear), ("cyclic_bear", cyclic_bear)],
-        )
 
         # P0-6: when the slice carries pre-roll history before the OOS boundary,
         # discard every signal generated before the first OOS bar (timestamps are

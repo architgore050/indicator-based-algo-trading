@@ -144,8 +144,13 @@ def _to_numpy(series):
     """Convert cudf or pandas Series to numpy array.
 
     Uses cupy for cudf Series to avoid numba/cudf context bugs.
+    datetime64 columns go through the arrow bridge — cupy must never hold
+    datetime arrays (see AGENTS.md; the calibrator path passes datetime64
+    timestamps, the CLI path passes int64 epoch ms).
     """
     if hasattr(series, "to_pandas"):
+        if "datetime" in str(getattr(series, "dtype", "")):
+            return series.to_arrow().to_pandas().to_numpy()
         return cp.asnumpy(cp.asarray(series))
     return series.to_numpy()
 
@@ -258,6 +263,107 @@ def build_signal_rows(
     return pd.DataFrame(rows)
 
 
+def compute_signals_df(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
+    """Compute Trend Following / TSM signal rows from OHLCV data and params.
+
+    P0-8: the single canonical Trend signal path. The CLI flow below and the
+    Optuna calibrator (optuna_calibrate_trend.py) both call this function, so
+    calibration-to-production parity holds by construction. Pure: no CSV I/O,
+    no progress bars, no side effects. Returns the DataFrame directly —
+    zero-copy handoff, no .copy() on the return.
+
+    `params` may be partial (Optuna trial params); missing keys fall back to
+    the config.json trend_strategy_params defaults, matching the old
+    calibrator wrapper's {**TREND_DEFAULTS, **params} merge.
+    """
+    p = {**CONF["trend_strategy_params"], **params}
+
+    tsm = calculate_time_series_momentum(
+        data,
+        fast_lb=p["tsm_fast_lb"],
+        med_lb=p["tsm_med_lb"],
+        slow_lb=p["tsm_slow_lb"],
+        vol_lb=p["tsm_vol_lb"],
+        vol_z_entry=p["tsm_vol_z_entry"],
+    )
+
+    breakout = calculate_breakout_channel(
+        data,
+        donchian_lb=p["bo_donchian_lb"],
+        ema_fast_lb=p["bo_ema_fast_lb"],
+        ema_slow_lb=p["bo_ema_slow_lb"],
+        atr_lb=p["bo_atr_lb"],
+    )
+
+    er = calculate_efficiency_ratio(
+        data,
+        er_lb=p["er_lb"],
+    )
+
+    # ----- BUY SETUP -----
+    # Trend direction: composite momentum positive (any horizon flips on)
+    composite = tsm["Composite"]
+    tsm_bull = composite > p["tsm_entry_threshold"]
+    # EMA trend alignment
+    ema_bull = breakout["EMA_Trend"] > 0
+    # Donchian breakout: close above prior N-bar high
+    bo_bull = breakout["Break_Up"]
+    # Efficiency filter: require market to be trending (ER above threshold)
+    er_bull = er["ER"] >= p["er_min_threshold"]
+    # Volatility regime: avoid very low-vol regimes (z-score filter).
+    # Realized vol is positive; we just need it above a small floor.
+    vol_regime_ok = (tsm["Realized_Vol"] >= p["min_realized_vol"]).fillna(False)
+    # Optional confirmation: breakout must coincide with positive composite.
+    bo_confirmed = bo_bull & tsm_bull
+
+    buy_setup_raw = bo_confirmed & ema_bull & er_bull & vol_regime_ok
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
+        buy_fill = buy_setup_raw.shift(1).fillna(False).astype(bool)
+    buy_setup = buy_setup_raw & (~buy_fill)
+
+    # ----- SELL SETUP -----
+    tsm_bear = composite < -p["tsm_entry_threshold"]
+    ema_bear = breakout["EMA_Trend"] < 0
+    bo_bear = breakout["Break_Dn"]
+    er_bear = er["ER"] >= p["er_min_threshold"]
+    bo_bear_confirmed = bo_bear & tsm_bear
+
+    sell_setup_raw = bo_bear_confirmed & ema_bear & er_bear & vol_regime_ok
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
+        sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
+    sell_setup = sell_setup_raw & (~sell_fill)
+
+    # ----- EXITS -----
+    # Trend reversal exits: composite momentum crosses zero, OR EMA trend flips.
+    zero = cudf.Series(0.0, index=data.index)
+    long_exit = crossed_below(composite, zero) | (breakout["EMA_Trend"] < 0)
+    short_exit = crossed_above(composite, zero) | (breakout["EMA_Trend"] > 0)
+
+    return build_signal_rows(
+        data=data,
+        buy_setup=buy_setup,
+        sell_setup=sell_setup,
+        long_exit=long_exit,
+        short_exit=short_exit,
+        buy_checks=[
+            ("tsm_bull", tsm_bull),
+            ("ema_bull", ema_bull),
+            ("bo_bull", bo_bull),
+            ("er_bull", er_bull),
+            ("vol_regime_ok", vol_regime_ok),
+        ],
+        sell_checks=[
+            ("tsm_bear", tsm_bear),
+            ("ema_bear", ema_bear),
+            ("bo_bear", bo_bear),
+            ("er_bear", er_bear),
+            ("vol_regime_ok", vol_regime_ok),
+        ],
+    )
+
+
 def generate_signals(
     params: dict,
     mode: str,
@@ -272,98 +378,14 @@ def generate_signals(
         base_csv = Path(output_dir) / base_csv.name
     output_csv = with_mode_suffix(base_csv, mode)
 
-    with tqdm(total=5, desc="Trend Following", unit="step") as pbar:
+    with tqdm(total=3, desc="Trend Following", unit="step") as pbar:
         data_gdf = load_data(mode, start_row, end_row, data_csv_path=data_csv_path)
         pbar.set_postfix_str(f"rows={len(data_gdf):,}")
         pbar.update()
 
-        tsm = calculate_time_series_momentum(
-            data_gdf,
-            fast_lb=params["tsm_fast_lb"],
-            med_lb=params["tsm_med_lb"],
-            slow_lb=params["tsm_slow_lb"],
-            vol_lb=params["tsm_vol_lb"],
-            vol_z_entry=params["tsm_vol_z_entry"],
-        )
+        signals = compute_signals_df(data_gdf, params)
+        pbar.set_postfix_str(f"signals={len(signals):,}")
         pbar.update()
-
-        breakout = calculate_breakout_channel(
-            data_gdf,
-            donchian_lb=params["bo_donchian_lb"],
-            ema_fast_lb=params["bo_ema_fast_lb"],
-            ema_slow_lb=params["bo_ema_slow_lb"],
-            atr_lb=params["bo_atr_lb"],
-        )
-        pbar.update()
-
-        er = calculate_efficiency_ratio(
-            data_gdf,
-            er_lb=params["er_lb"],
-        )
-        pbar.update()
-
-        # ----- BUY SETUP -----
-        # Trend direction: composite momentum positive (any horizon flips on)
-        composite = tsm["Composite"]
-        tsm_bull = composite > params["tsm_entry_threshold"]
-        # EMA trend alignment
-        ema_bull = breakout["EMA_Trend"] > 0
-        # Donchian breakout: close above prior N-bar high
-        bo_bull = breakout["Break_Up"]
-        # Efficiency filter: require market to be trending (ER above threshold)
-        er_bull = er["ER"] >= params["er_min_threshold"]
-        # Volatility regime: avoid very low-vol regimes (z-score filter).
-        # Realized vol is positive; we just need it above a small floor.
-        vol_regime_ok = (tsm["Realized_Vol"] >= params["min_realized_vol"]).fillna(False)
-        # Optional confirmation: breakout must coincide with positive composite.
-        bo_confirmed = bo_bull & tsm_bull
-
-        buy_setup_raw = bo_confirmed & ema_bull & er_bull & vol_regime_ok
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
-            buy_fill = buy_setup_raw.shift(1).fillna(False).astype(bool)
-        buy_setup = buy_setup_raw & (~buy_fill)
-
-        # ----- SELL SETUP -----
-        tsm_bear = composite < -params["tsm_entry_threshold"]
-        ema_bear = breakout["EMA_Trend"] < 0
-        bo_bear = breakout["Break_Dn"]
-        er_bear = er["ER"] >= params["er_min_threshold"]
-        bo_bear_confirmed = bo_bear & tsm_bear
-
-        sell_setup_raw = bo_bear_confirmed & ema_bear & er_bear & vol_regime_ok
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
-            sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
-        sell_setup = sell_setup_raw & (~sell_fill)
-
-        # ----- EXITS -----
-        # Trend reversal exits: composite momentum crosses zero, OR EMA trend flips.
-        zero = cudf.Series(0.0, index=data_gdf.index)
-        long_exit = crossed_below(composite, zero) | (breakout["EMA_Trend"] < 0)
-        short_exit = crossed_above(composite, zero) | (breakout["EMA_Trend"] > 0)
-
-        signals = build_signal_rows(
-            data=data_gdf,
-            buy_setup=buy_setup,
-            sell_setup=sell_setup,
-            long_exit=long_exit,
-            short_exit=short_exit,
-            buy_checks=[
-                ("tsm_bull", tsm_bull),
-                ("ema_bull", ema_bull),
-                ("bo_bull", bo_bull),
-                ("er_bull", er_bull),
-                ("vol_regime_ok", vol_regime_ok),
-            ],
-            sell_checks=[
-                ("tsm_bear", tsm_bear),
-                ("ema_bear", ema_bear),
-                ("bo_bear", bo_bear),
-                ("er_bear", er_bear),
-                ("vol_regime_ok", vol_regime_ok),
-            ],
-        )
 
         # P0-6: when the slice carries pre-roll history before the OOS boundary,
         # discard every signal generated before the first OOS bar (timestamps are

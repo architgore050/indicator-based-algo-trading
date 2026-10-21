@@ -90,7 +90,9 @@ def test_vm_strategy(data: pd.DataFrame, compare_backup: bool = False):
     Backup comparison is handled externally after all GPU tests complete.
     """
     import cudf
-    from optuna_calibrate_vm import generate_vm_signals_local
+    # P0-8: generate_vm_signals_local was deleted from the calibrator; the
+    # canonical VM signal path is compute_signals_df in the CLI generator module.
+    from generate_vm_automation_logic_signals import compute_signals_df
 
     vm_params = {
         "multi_rsi_p1": 14,
@@ -118,11 +120,11 @@ def test_vm_strategy(data: pd.DataFrame, compare_backup: bool = False):
 
     # Run modified code twice (determinism check)
     t0 = time.perf_counter()
-    signals1 = generate_vm_signals_local(gdf, vm_params, trial_id="parity_1")
+    signals1 = compute_signals_df(gdf, vm_params)
     t1 = time.perf_counter()
 
     t2 = time.perf_counter()
-    signals2 = generate_vm_signals_local(gdf, vm_params, trial_id="parity_2")
+    signals2 = compute_signals_df(gdf, vm_params)
     t3 = time.perf_counter()
 
     print(f"\n=== VM Strategy Parity Test ===")
@@ -204,7 +206,9 @@ def test_vm_strategy_compare_backup(data: pd.DataFrame, vm_signals_current: pd.D
 def test_vm_strategy_slow_exit(data: pd.DataFrame):
     """Test that use_slow_stoch_exit=True produces different signals than use_slow_stoch_exit=False."""
     import cudf
-    from optuna_calibrate_vm import generate_vm_signals_local
+    # P0-8: generate_vm_signals_local was deleted from the calibrator; the
+    # canonical VM signal path is compute_signals_df in the CLI generator module.
+    from generate_vm_automation_logic_signals import compute_signals_df
 
     base_params = {
         "multi_rsi_p1": 14,
@@ -231,9 +235,9 @@ def test_vm_strategy_slow_exit(data: pd.DataFrame):
     both_params = {**base_params, "use_slow_stoch_exit": True}
 
     gdf = cudf.from_pandas(data)
-    signals_neither = generate_vm_signals_local(gdf, base_params, trial_id="slow_exit_off")
-    signals_slow = generate_vm_signals_local(gdf, slow_params, trial_id="slow_exit_on")
-    signals_both = generate_vm_signals_local(gdf, both_params, trial_id="both_exits_on")
+    signals_neither = compute_signals_df(gdf, base_params)
+    signals_slow = compute_signals_df(gdf, slow_params)
+    signals_both = compute_signals_df(gdf, both_params)
 
     print(f"\n=== VM Slow Exit Test ===")
     print(f"Fast-only exits:  {len(signals_neither)} signals")
@@ -260,7 +264,7 @@ def test_vm_strategy_slow_exit(data: pd.DataFrame):
             passed = False
 
         # Determinism check
-        signals_both2 = generate_vm_signals_local(gdf, both_params, trial_id="both_exits_on_2")
+        signals_both2 = compute_signals_df(gdf, both_params)
         if len(signals_both) == len(signals_both2):
             print("PASS: Both-exits determinism check passed")
         else:
@@ -277,7 +281,9 @@ def test_tv_strategy(data: pd.DataFrame, compare_backup: bool = False):
     Backup comparison is handled externally after all GPU tests complete.
     """
     import cudf
-    from optuna_calibrate_tv import generate_tv_signals_local
+    # P0-8: canonical TV signal path (the calibrator's divergent-exit-string
+    # duplicate is gone; exits use signal="EXIT" here now).
+    from generate_tv_strategy1_signals import compute_signals_df
 
     tv_params = {
         "tdi_rsi_period": 14,
@@ -321,11 +327,11 @@ def test_tv_strategy(data: pd.DataFrame, compare_backup: bool = False):
     gdf = cudf.from_pandas(data)
 
     t0 = time.perf_counter()
-    signals1 = generate_tv_signals_local(gdf, tv_params)
+    signals1 = compute_signals_df(gdf, tv_params)
     t1 = time.perf_counter()
 
     t2 = time.perf_counter()
-    signals2 = generate_tv_signals_local(gdf, tv_params)
+    signals2 = compute_signals_df(gdf, tv_params)
     t3 = time.perf_counter()
 
     print(f"\n=== TV Strategy Parity Test ===")
@@ -418,7 +424,7 @@ def test_tv_strategy_compare_backup(data: pd.DataFrame, tv_signals_current: pd.D
 def test_vm_objective_wrapper(data: pd.DataFrame):
     """Smoke test the objective wrapper — verify scoring and pruning work."""
     import cudf
-    from optuna_calibrate_vm import generate_vm_signals_local, objective_wrapper
+    from optuna_calibrate_vm import objective_wrapper
     import optuna
 
     vm_params = {
@@ -573,7 +579,7 @@ def main():
         data_sizes_tv = [50_000, 200_000, 500_000]
 
         if args.strategy in ("vm", "both"):
-            from optuna_calibrate_vm import generate_vm_signals_local as vm_run
+            from generate_vm_automation_logic_signals import compute_signals_df as vm_run
             vm_params = {
                 "multi_rsi_p1": 14, "multi_rsi_p2": 28, "multi_rsi_p3": 7, "multi_rsi_smal": 5,
                 "crsi_dom_cycle": 50, "crsi_vibration": 21, "crsi_leveling": 8,
@@ -585,7 +591,7 @@ def main():
             benchmark_strategy("VM", load_data, vm_run, lambda: vm_params, data_sizes_vm, n_runs=args.n_runs)
 
         if args.strategy in ("tv", "both"):
-            from optuna_calibrate_tv import generate_tv_signals_local as tv_run
+            from generate_tv_strategy1_signals import compute_signals_df as tv_run
             tv_params = {
                 "tdi_rsi_period": 14, "tdi_band_length": 34, "tdi_fast_ma_len": 5, "tdi_slow_ma_len": 13,
                 "tdi_mult": 2.0, "el_smooth_k": 3, "el_rsi2_len": 14, "el_rsi3_len": 7, "el_rsi_norm": 100,
