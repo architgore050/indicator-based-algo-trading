@@ -105,7 +105,15 @@ def load_data(
     end_row: int = None,
     data_csv_path: str = None,
 ):
-    """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps."""
+    """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps.
+
+    Row selection uses the shared load_csv interface with its skiprows/nrows
+    arguments. Ranges are half-open [start_row, end_row) per P0-5:
+    skiprows=start_row, nrows=end_row - start_row. When a pre-sliced
+    --data-csv chunk is supplied (WFV orchestrator path) it is loaded whole,
+    because the chunk already IS the requested window. This is the reference
+    loader: VM and TV (P1-2) now match it exactly.
+    """
     source = data_csv_path if data_csv_path else DATA_CSV
     end_row = end_row if end_row is not None else DATA_CONF["total_rows"]
 
@@ -125,6 +133,11 @@ def load_data(
             )
         else:
             gpu_df = load_csv(str(source))
+
+    logger.info(
+        "Loaded %d rows from %s (mode=%s, start_row=%d, end_row=%d)",
+        len(gpu_df), source, mode, start_row, end_row,
+    )
 
     if "timestamp" in gpu_df.columns:
         ts_col = gpu_df["timestamp"]
@@ -406,6 +419,9 @@ def generate_signals(
             if ts_col.dtype in ("int64", "int32"):
                 signals["timestamp"] = pd.to_datetime(ts_col, unit="ms", utc=True)
 
+        # P1-2: auto-create the --output-dir tree (OSError otherwise when the
+        # orchestrator/CLI points at a directory that does not exist yet).
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
         signals.to_csv(output_csv, index=False)
         pbar.set_postfix_str(f"signals={len(signals):,}")
         pbar.update()

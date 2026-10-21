@@ -111,21 +111,38 @@ def load_data(
     end_row: int = None,
     data_csv_path: str = None,
 ):
-    """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps."""
+    """Load CSV data via cudf. Returns cudf DataFrame with int64 epoch ms timestamps.
+
+    Row selection uses the shared load_csv interface with its skiprows/nrows
+    arguments (P1-2). Ranges are half-open [start_row, end_row) per P0-5:
+    skiprows=start_row, nrows=end_row - start_row. When a pre-sliced
+    --data-csv chunk is supplied (WFV orchestrator path) it is loaded whole,
+    because the chunk already IS the requested window. Semantics are identical
+    to generate_trend_following_signals.load_data.
+    """
     source = data_csv_path if data_csv_path else DATA_CSV
     end_row = end_row if end_row is not None else DATA_CONF["total_rows"]
-    read_kwargs = {"parse_dates": ["timestamp"]}
 
-    if start_row != 0 or end_row != DATA_CONF["total_rows"]:
-        read_kwargs["skiprows"] = range(1, start_row + 1)
-        read_kwargs["nrows"] = end_row - start_row
+    if data_csv_path:
+        # Pre-sliced chunk from the orchestrator: load it whole.
+        gpu_df = load_csv(str(source))
+    elif start_row != 0 or end_row != DATA_CONF["total_rows"]:
+        gpu_df = load_csv(str(source), skiprows=start_row, nrows=end_row - start_row)
     elif mode == "smoke":
-        read_kwargs["nrows"] = 50_000
+        gpu_df = load_csv(str(source), nrows=50_000)
     elif mode == "test":
-        read_kwargs["skiprows"] = range(1, DATA_CONF["wfv_start_row"] + 1)
-        read_kwargs["nrows"] = DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"]
+        gpu_df = load_csv(
+            str(source),
+            skiprows=DATA_CONF["wfv_start_row"],
+            nrows=DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"],
+        )
+    else:
+        gpu_df = load_csv(str(source))
 
-    gpu_df = load_csv(str(source))
+    logger.info(
+        "Loaded %d rows from %s (mode=%s, start_row=%d, end_row=%d)",
+        len(gpu_df), source, mode, start_row, end_row,
+    )
 
     # Convert timestamp to int64 epoch ms on-GPU
     if "timestamp" in gpu_df.columns:
@@ -452,6 +469,9 @@ def generate_signals(
             if ts_col.dtype in ("int64", "int32"):
                 signals["timestamp"] = pd.to_datetime(ts_col, unit="ms", utc=True)
 
+        # P1-2: auto-create the --output-dir tree (OSError otherwise when the
+        # orchestrator/CLI points at a directory that does not exist yet).
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
         signals.to_csv(output_csv, index=False)
         pbar.set_postfix_str(f"signals={len(signals):,}")
         pbar.update()
@@ -463,7 +483,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate TV Strategy 1 signal CSV.")
     parser.add_argument("--mode", type=str, choices=["smoke", "test", "full"], default="full", help="Execution mode.")
     parser.add_argument("--start-row", type=int, default=0)
-    parser.add_argument("--end-row", type=int, default=4000000)
+    parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
