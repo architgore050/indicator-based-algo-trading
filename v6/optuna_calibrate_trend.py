@@ -4,6 +4,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import json
+import hashlib
 import logging
 import argparse
 from datetime import datetime
@@ -31,7 +32,7 @@ from generate_trend_following_signals import compute_signals_df
 import cudf
 from gpu_io import load_csv
 from backtest_xauusd_signal_csv import run_backtest, compute_summary
-from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
+from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger, get_audit_logger
 
 suppress_pandas_warnings()
 
@@ -184,7 +185,7 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
 # Objective Function
 # ---------------------------------------------------------------------------
 
-def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial") -> float:
+def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial", components_out: dict = None) -> float:
     # Per-trial immutable backtest config: copy module BP and apply sampled exit
     # overrides to the COPY. Module BP is never mutated (trial-reachable code must
     # not touch module globals — concurrent trials share this module).
@@ -235,22 +236,51 @@ def objective_wrapper(params: dict, data: pd.DataFrame, trial_id: str = "trial")
 
     # Use trend-specific constraints (lower tpd threshold, softer Sharpe/Calmar)
     penalty = 0.0
+    penalty_trades = 0.0
+    penalty_cagr = 0.0
+    penalty_drawdown = 0.0
     if trades_per_day < TREND_CONSTRAINTS["min_trades_per_day"]:
-        penalty += (TREND_CONSTRAINTS["min_trades_per_day"] - trades_per_day) * TREND_CONSTRAINTS["penalty_weight_trades"]
+        penalty_trades = (TREND_CONSTRAINTS["min_trades_per_day"] - trades_per_day) * TREND_CONSTRAINTS["penalty_weight_trades"]
     elif trades_per_day > TREND_CONSTRAINTS["max_trades_per_day"]:
-        penalty += (trades_per_day - TREND_CONSTRAINTS["max_trades_per_day"]) * (TREND_CONSTRAINTS["penalty_weight_trades"] / 2.0)
+        penalty_trades = (trades_per_day - TREND_CONSTRAINTS["max_trades_per_day"]) * (TREND_CONSTRAINTS["penalty_weight_trades"] / 2.0)
+    penalty += penalty_trades
 
     if cagr < TREND_CONSTRAINTS["min_cagr_pct"]:
-        penalty += (TREND_CONSTRAINTS["min_cagr_pct"] - cagr) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        penalty_cagr = (TREND_CONSTRAINTS["min_cagr_pct"] - cagr) * TREND_CONSTRAINTS["penalty_weight_risk"]
+    penalty += penalty_cagr
     if max_dd > TREND_CONSTRAINTS["max_max_drawdown_pct"]:
-        penalty += (max_dd - TREND_CONSTRAINTS["max_max_drawdown_pct"]) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        penalty_drawdown = (max_dd - TREND_CONSTRAINTS["max_max_drawdown_pct"]) * TREND_CONSTRAINTS["penalty_weight_risk"]
+    penalty += penalty_drawdown
 
     objective_score = cagr
+    penalty_sharpe = 0.0
+    penalty_calmar = 0.0
     if sharpe < TREND_CONSTRAINTS["min_sharpe"]:
-        objective_score -= (TREND_CONSTRAINTS["min_sharpe"] - sharpe) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        penalty_sharpe = (TREND_CONSTRAINTS["min_sharpe"] - sharpe) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        objective_score -= penalty_sharpe
     if calmar < TREND_CONSTRAINTS["min_calmar"]:
-        objective_score -= (TREND_CONSTRAINTS["min_calmar"] - calmar) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        penalty_calmar = (TREND_CONSTRAINTS["min_calmar"] - calmar) * TREND_CONSTRAINTS["penalty_weight_risk"]
+        objective_score -= penalty_calmar
     objective_score -= penalty
+
+    # P1-5: optional score-component capture for the survival audit record.
+    # Same arithmetic as before (named terms are just the accumulated pieces);
+    # no extra backtest evaluation is run.
+    if components_out is not None:
+        components_out.update({
+            "cagr_pct": float(cagr),
+            "sharpe_ratio": float(sharpe),
+            "calmar_ratio": float(calmar),
+            "max_drawdown_pct": float(max_dd),
+            "trades_per_day": float(trades_per_day),
+            "penalty_trades": float(penalty_trades),
+            "penalty_cagr": float(penalty_cagr),
+            "penalty_drawdown": float(penalty_drawdown),
+            "penalty_sharpe": float(penalty_sharpe),
+            "penalty_calmar": float(penalty_calmar),
+            "penalty_total": float(penalty),
+            "objective_score": float(objective_score),
+        })
     return float(objective_score)
 
 
@@ -428,7 +458,14 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
                 else:
                     trial_params[k] = trial.suggest_float(k, v[0], v[1])
 
-        return objective_wrapper(trial_params, data, trial_id=str(trial.number))
+        # P1-5: collect score components into trial user_attrs so the
+        # survival audit record can read them back from study.best_trial
+        # without re-running any evaluation.
+        comps = {}
+        score = objective_wrapper(trial_params, data, trial_id=str(trial.number), components_out=comps)
+        if comps:
+            trial.set_user_attr("score_components", comps)
+        return score
 
     n_jobs = get_optimal_n_jobs()
     study = sqlite_retry_optimize(study, objective, n_trials, n_jobs, sampler=sampler)
@@ -438,6 +475,46 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
 # ---------------------------------------------------------------------------
 # Main Execution
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Survival Decision Classification (P1-5 audit record)
+# ---------------------------------------------------------------------------
+
+def classify_survival_decision(baseline_score: float, refined_score: float,
+                               final_params: dict, baseline_params: dict) -> tuple:
+    """Classify the survival-of-the-fittest outcome into the three-value enum.
+
+    REFINED_WINS     — a refined trial strictly beats the baseline score.
+    TIE_KEEP_PARENT  — a refined trial ties the baseline exactly; the strict
+                       `>` revert test keeps the parent (post-P0-4 the
+                       enqueued baseline trial is the study's best trial, so
+                       the parent params are what gets written).
+    BASELINE_WINS    — the strict `>` revert branch fired (baseline strictly
+                       better). Structurally unreachable in single-objective
+                       WFV post-P0-4 (P1-3 F1: the baseline is enqueued as a
+                       Phase-3 trial, so best_score >= baseline_score always);
+                       reachable via the TV/Trend empty-study fallback or a
+                       stale-baseline key-mismatch scenario.
+
+    incumbent_selected — True when the parent annual params are the params
+    finally written to RESULTS_PATH (dict equality vs the filtered baseline).
+
+    This function only CLASSIFIES the outcome; the keep/revert behavior in
+    main() (strict `>` semantics) is unchanged.
+
+    MOO WARNING (P1-6/P1-7): this enum is defined against the SCALAR
+    objective score. Once selection becomes Pareto-based (study.best_trials,
+    CPCV metric sets), a scalar `>` comparison cannot express dominance vs
+    incomparability — the enum and incumbent_selected must be re-derived
+    against the MOO representation at that point.
+    """
+    incumbent_selected = dict(final_params) == dict(baseline_params)
+    if baseline_score > refined_score:
+        return "BASELINE_WINS", incumbent_selected
+    if refined_score == baseline_score:
+        return "TIE_KEEP_PARENT", incumbent_selected
+    return "REFINED_WINS", incumbent_selected
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -459,6 +536,10 @@ def main():
     else:
         RESULTS_PATH = PROJECT_DIR / "calibration_results_trend.json"
 
+    # P1-5: structured survival-decision audit record lands in this window's
+    # output directory (RESULTS_PATH.parent — the orchestrator's --output dir).
+    audit_logger = get_audit_logger(__name__, log_dir=str(RESULTS_PATH.parent))
+
     end_row = args.end_row
     trial_rows = 1000 if args.smoke else CALIB_PARAMS["calibration_rows_per_trial"]
 
@@ -471,6 +552,7 @@ def main():
     current_best = None
     baseline_annual_params = None
     baseline_annual_score = -np.inf
+    baseline_components = {}
     distribution_prior = None
 
     # Load Baseline from Annual results if provided
@@ -481,7 +563,8 @@ def main():
                 annual_res = json.load(f)
                 baseline_annual_params = {k: v for k, v in annual_res["best_parameters"].items() if k in CALIB_PARAMS["trend_ranges"]}
                 logger.info("Evaluating annual baseline performance on current IS window...")
-                baseline_annual_score = objective_wrapper(baseline_annual_params, data, trial_id="annual_baseline")
+                baseline_components = {}
+                baseline_annual_score = objective_wrapper(baseline_annual_params, data, trial_id="annual_baseline", components_out=baseline_components)
                 logger.info(f"Annual Baseline IS Score: {baseline_annual_score:.4f}")
 
     # Load distribution prior from parent annual (monthly windows only)
@@ -607,12 +690,79 @@ def main():
         best_score = -9999.0
         best_params = {}
 
+    # P1-5: capture the pre-decision refined candidate for the audit record
+    # (the keep/revert behavior below is unchanged — strict `>` semantics).
+    refined_score = best_score
+    refined_params = dict(best_params)
+
     if args.annual_baseline and baseline_annual_score > best_score:
         logger.info(f"Survival Check: Refined params ({best_score:.4f}) FAILED to beat annual baseline ({baseline_annual_score:.4f}). Reverting to annual params.")
         best_params = baseline_annual_params
         best_score = baseline_annual_score
     elif args.annual_baseline:
         logger.info(f"Survival Check: Refined params ({best_score:.4f}) beat annual baseline ({baseline_annual_score:.4f}). Adopting refined params.")
+
+    # P1-5: structured survival-decision record (additive audit trail; the
+    # console lines above are kept for operators). Written only when a parent
+    # baseline was actually loaded and evaluated.
+    if args.annual_baseline and baseline_annual_params is not None:
+        decision, incumbent_selected = classify_survival_decision(
+            baseline_annual_score, refined_score, best_params, baseline_annual_params
+        )
+        refined_components = {}
+        try:
+            refined_components = dict(study.best_trial.user_attrs.get("score_components") or {})
+        except (ValueError, AttributeError):
+            refined_components = {}
+        parent_digest = hashlib.sha256(
+            json.dumps(baseline_annual_params, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if decision == "BASELINE_WINS":
+            reason = (f"refined ({refined_score:.4f}) < baseline ({baseline_annual_score:.4f}): "
+                      f"reverted to parent annual params")
+        elif decision == "TIE_KEEP_PARENT":
+            reason = (f"refined ({refined_score:.4f}) == baseline ({baseline_annual_score:.4f}): "
+                      f"strict > comparison keeps parent params")
+        else:
+            reason = (f"refined ({refined_score:.4f}) > baseline ({baseline_annual_score:.4f}): "
+                      f"refined trial adopted")
+        # oos_seed mirrors the orchestrator's OOS backtest seed formula
+        # (CONFIG["backtesting_params"]["random_seed"] + window_index, see
+        # orchestrate_calibration.py:544 with --window-index i). The calibrator
+        # is never told the OOS seed explicitly — this duplicated formula is a
+        # KNOWN COUPLING/FRAGILITY, flagged for P2-2 to pass the seed explicitly.
+        audit_record = {
+            "event": "survival_decision",
+            "strategy": "trend",
+            "window_index": int(args.window_index),
+            "start_row": int(args.start_row),
+            "end_row": int(args.end_row),
+            "rows_used": int(trial_rows),
+            "phase3_only": bool(args.phase3_only),
+            "is_seed": int(BP["random_seed"]),
+            "oos_seed": int(BP["random_seed"] + args.window_index),
+            "baseline_score": float(baseline_annual_score),
+            "refined_score": float(refined_score),
+            "decision": decision,
+            "incumbent_selected": incumbent_selected,
+            "reason": reason,
+            "baseline_params": baseline_annual_params,
+            "refined_params": refined_params,
+            "parent_digest": parent_digest,
+            # Reviewer tightening: components that could not be captured
+            # (sentinel return / pre-scoring exception) are recorded as an
+            # explicit null with an availability flag — never as an ambiguous
+            # empty dict. A present dict always carries the full component set.
+            "baseline_components": baseline_components or None,
+            "refined_components": refined_components or None,
+            "baseline_components_available": bool(baseline_components),
+            "refined_components_available": bool(refined_components),
+        }
+        audit_logger.info(audit_record)
+        logger.info(
+            f"Survival Decision (audit): {decision} | incumbent_selected={incumbent_selected} | "
+            f"parent_digest={parent_digest[:16]} | record: {RESULTS_PATH.parent / 'wfv_decision.json'}"
+        )
 
     # Final Results
     results = {

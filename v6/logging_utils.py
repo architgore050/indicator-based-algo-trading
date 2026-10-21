@@ -18,6 +18,7 @@ Usage:
     logger.info("Starting calibration...")
 """
 
+import json
 import logging
 import warnings
 import os
@@ -118,4 +119,61 @@ def get_logger(name, log_dir=None, worker_id=None):
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Structured audit logging (P1-5: survival-decision records)
+# ---------------------------------------------------------------------------
+
+class JSONFormatter(logging.Formatter):
+    """Format a log record as one JSON object per line (JSONL by content).
+
+    If the record message is a dict it is emitted as-is with the
+    timestamp/level/logger fields appended. A non-dict message is parsed as
+    JSON when possible, otherwise wrapped in a ``{"message": ...}`` envelope.
+    """
+
+    def format(self, record):
+        if isinstance(record.msg, dict):
+            log_record = record.msg
+        else:
+            try:
+                log_record = json.loads(record.msg)
+            except (json.JSONDecodeError, TypeError):
+                log_record = {"message": str(record.msg)}
+        log_record["timestamp"] = self.formatTime(record, self.datefmt)
+        log_record["level"] = record.levelname
+        log_record["logger"] = record.name
+        return json.dumps(log_record)
+
+
+def get_audit_logger(name: str, log_dir: str) -> logging.Logger:
+    """Return a structured audit logger writing to ``<log_dir>/wfv_decision.json``.
+
+    NOTE ON FORMAT: despite the ``.json`` extension the file is JSONL by
+    content — one JSON object per line (the spec pins the ``.json`` name and
+    the file lives beside the other per-window JSON artifacts; the collator
+    consumes it as JSONL).
+
+    mode="w": each calibration process starts a fresh audit file for its own
+    window directory (an orchestrator retry overwrites the failed attempt).
+    propagate=False: audit records never leak into the human-readable worker
+    logs. Handler-guarded: repeated calls in one process reuse one handler.
+
+    P2-2 DESIGN NOTE: this factory is scheduled to be upgraded into the
+    per-window ``lifecycle.jsonl`` system (append-mode FileHandler, run_id
+    scoping, multiple event types). Keep this factory small and event-
+    agnostic so that upgrade does not foreclose or rework call sites.
+    """
+    logger = logging.getLogger(f"{name}.audit")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_path / "wfv_decision.json"
+        file_handler = logging.FileHandler(log_file, mode="w")
+        file_handler.setFormatter(JSONFormatter())
+        logger.addHandler(file_handler)
     return logger

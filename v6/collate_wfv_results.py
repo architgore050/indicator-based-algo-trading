@@ -157,6 +157,64 @@ def _extract_window_info(window_dir):
     return window_idx, regime, recal_idx
 
 
+def aggregate_audit_logs(wfv_dir, output_dir):
+    """Aggregate per-window survival-decision audit records into one JSONL file (P1-5).
+
+    Each monthly calibration writes ``wfv_decision.json`` in its window
+    directory via the logging_utils audit logger. Despite the ``.json`` name
+    the file is JSONL by content: one JSON object per line. This walks the
+    window directories in window-index order and concatenates every valid
+    record into ``<output_dir>/collated_wfv_decisions.jsonl``.
+
+    DEVIATION from the review spec's literal CWD-relative
+    ``Path("collated_wfv_decisions.jsonl")``: the master file lands in the
+    collator's established --output-dir convention (default
+    ``collated_wfv_results_<strategy>``), like every other collated artifact.
+
+    Tolerated by design: missing audit files (annual windows have no survival
+    decision), empty audit files, and malformed lines (a warning naming the
+    path is logged; collation never crashes).
+    """
+    wfv_path = Path(wfv_dir)
+    master_path = os.path.join(output_dir, 'collated_wfv_decisions.jsonl')
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if not wfv_path.exists():
+        print(f"[audit] WFV directory not found: {wfv_dir}; no decision records aggregated.")
+        with open(master_path, 'w'):
+            pass
+        return master_path, 0
+
+    windows = sorted(
+        [d for d in wfv_path.iterdir() if d.is_dir() and 'window_' in d.name],
+        key=lambda x: int(x.name.split('_')[1])
+    )
+
+    records = 0
+    with open(master_path, 'w') as master_f:
+        for window_dir in windows:
+            audit_file = window_dir / 'wfv_decision.json'
+            if not audit_file.exists():
+                continue  # annual windows have no survival decision
+            try:
+                content = audit_file.read_text()
+            except OSError as e:
+                print(f"[audit] WARNING: could not read audit file {audit_file}: {e}")
+                continue
+            for line_no, line in enumerate(content.splitlines(), start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    json.loads(line)  # validate JSONL-by-content before copying
+                except json.JSONDecodeError:
+                    print(f"[audit] WARNING: malformed audit record in {audit_file} (line {line_no}); skipped")
+                    continue
+                master_f.write(line + "\n")
+                records += 1
+    print(f"[audit] Aggregated {records} survival decision record(s) -> {master_path}")
+    return master_path, records
+
+
 def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
     if output_dir is None:
         output_dir = f'collated_wfv_results_{strategy}'
@@ -289,6 +347,11 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
                     container.append(pd.read_csv(csv_path))
                 except pd.errors.EmptyDataError:
                     pass
+
+    # --- Aggregate per-window survival-decision audit records (P1-5) ---
+    # Runs even if equity reconstruction below fails, and never crashes on
+    # missing/empty/malformed audit files.
+    aggregate_audit_logs(wfv_dir, output_dir)
 
     # --- Extract MFE/MAE from combined trades ---
     mfe_mae_stats = {}
