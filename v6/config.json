@@ -139,8 +139,7 @@
       "phase3_trials": 100,
       "n_startup_trials": 30,
       "top_n_to_enqueue": 5,
-      "phase2_refinement_pct": 0.3,
-      "phase3_refinement_pct": 0.1
+      "phase2_refinement_pct": 0.3
     },
     "tv_ranges": {
       "tdi_rsi_period": [5, 80],
@@ -177,7 +176,7 @@
       "donchian_dc_len": [10, 300],
       "tdi_touch_tolerance": [-10.0, 10.0],
       "min_buy_confirmations": [1, 5],
-      "min_sell_confirmations": [1, 10],
+      "min_sell_confirmations": [1, 3],
       "stop_loss_usd_per_oz": [15.0, 50.0],
       "take_profit_usd_per_oz": [20.0, 80.0],
       "trailing_stop_usd_per_oz": [3.0, 20.0],
@@ -210,6 +209,7 @@
       "tsm_med_lb": [240, 1440],
       "tsm_slow_lb": [1440, 5760],
       "tsm_vol_lb": [120, 960],
+      "tsm_vol_z_entry": [0.0, 2.0],
       "tsm_entry_threshold": [0.001, 0.08],
       "bo_donchian_lb": [60, 480],
       "bo_ema_fast_lb": [20, 240],

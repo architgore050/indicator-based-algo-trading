@@ -384,10 +384,12 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
         trial.set_user_attr("phase", phase)
         trial_params = {}
         for k, v in ranges.items():
-            if k in ("use_fast_stoch_exit", "use_slow_stoch_exit"):
-                # Binary params: force integer suggestion (0 or 1) → proper bool
-                trial_params[k] = bool(trial.suggest_int(k, int(v[0]), int(v[1])))
-            elif isinstance(v[0], int) and isinstance(v[1], int):
+            # P1-1: the dead special-handling branch that forced 0/1 suggestions
+            # for use_fast_stoch_exit / use_slow_stoch_exit has been DELETED.
+            # Both flags are statically True via config.json vm_strategy_params
+            # (the base dict merged into every params dict by compute_signals_df)
+            # and are intentionally absent from vm_ranges, so they are never sampled.
+            if isinstance(v[0], int) and isinstance(v[1], int):
                 if distribution_prior and phase == 3 and k in distribution_prior:
                     # Use inherited distribution bounds (no narrowing)
                     low, high = distribution_prior[k]

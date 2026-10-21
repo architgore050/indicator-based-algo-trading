@@ -613,13 +613,23 @@ def calculate_time_series_momentum(
     med_lb: int = 240,
     slow_lb: int = 1440,
     vol_lb: int = 240,
-    vol_z_entry: float = 0.5,
+    vol_z_entry: float = 0.0,
     source_col: str = "close",
 ) -> cudf.DataFrame:
     """Time-Series Momentum (Moskowitz/Ooi/Pedersen 2012).
 
     Computes past-N-bar returns over multiple horizons, plus a volatility
     regime filter (annualised vol z-score vs trailing realised vol).
+
+    `vol_z_entry` (config key: tsm_vol_z_entry) gates entries via the
+    Volatility Z-score Entry Filter (P1-1 alpha enhancement): a short-window
+    (20-bar) realised-vol z-scored against its own 60-bar rolling mean/std.
+    When > 0.0, only bars with entry vol_z >= vol_z_entry may open trades,
+    blocking low-volatility chop where Donchian whipsaws dominate. The gate
+    is returned as the boolean column ``Vol_Entry_OK`` (the setups are built
+    by the consumer, so the AND is applied there — see
+    generate_trend_following_signals.compute_signals_df). At vol_z_entry <= 0.0
+    the gate is inert: every bar passes (backward compatible).
 
     Returns
     -------
@@ -630,6 +640,8 @@ def calculate_time_series_momentum(
             Composite  - average of available horizon returns
             Realized_Vol - stdev of bar-to-bar returns over vol_lb (annualised via sqrt(bar frequency proxy))
             Vol_Z      - z-score of Realized_Vol relative to a slow vol baseline
+            Vol_Entry_OK - bool gate from the Volatility Z-score Entry Filter
+                           (non-nullable; NaN warm-up bars closed to False)
     """
     src = data[source_col]
 
@@ -656,6 +668,29 @@ def calculate_time_series_momentum(
     vol_std = realized_vol.rolling(vol_lb * 4, min_periods=vol_lb).std(ddof=0)
     vol_z = (realized_vol - vol_baseline) / vol_std.where(vol_std != 0, float("nan"))
 
+    # ------------------------------------------------------------------
+    # Volatility Z-score Entry Filter (P1-1 alpha enhancement)
+    # Short-window realised vol: rolling 20-bar std of close pct-changes,
+    # z-scored against its own 60-bar rolling mean/std (+1e-8 guard).
+    # If vol_z_entry > 0.0, only bars with entry_vol_z >= vol_z_entry pass.
+    # NaN semantics: entry_vol_z is NaN during warm-up (first 79 bars). In this
+    # cudf version a comparison against NaN yields NA in a nullable-bool series,
+    # so the gate is explicitly closed with fillna(False).astype(bool): warm-up
+    # bars become False (blocked, False-safe — never NA-poisoned, never spurious
+    # True) and Vol_Entry_OK is always a non-nullable bool column. At
+    # vol_z_entry <= 0.0 the gate is a constant-True series: fully inert /
+    # backward compatible.
+    # ------------------------------------------------------------------
+    if vol_z_entry > 0.0:
+        entry_returns = src.pct_change()
+        entry_vol = entry_returns.rolling(window=20).std()
+        entry_vol_mean = entry_vol.rolling(window=60).mean()
+        entry_vol_std = entry_vol.rolling(window=60).std()
+        entry_vol_z = (entry_vol - entry_vol_mean) / (entry_vol_std + 1e-8)
+        vol_entry_ok = (entry_vol_z >= vol_z_entry).fillna(False).astype(bool)
+    else:
+        vol_entry_ok = cudf.Series(True, index=data.index, dtype=bool)
+
     return cudf.DataFrame(
         {
             "Fast_Ret": fast_ret,
@@ -664,6 +699,7 @@ def calculate_time_series_momentum(
             "Composite": composite,
             "Realized_Vol": realized_vol_ann,
             "Vol_Z": vol_z,
+            "Vol_Entry_OK": vol_entry_ok,
         },
         index=data.index,
     )

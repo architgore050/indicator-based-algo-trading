@@ -313,10 +313,16 @@ def compute_signals_df(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
     # Volatility regime: avoid very low-vol regimes (z-score filter).
     # Realized vol is positive; we just need it above a small floor.
     vol_regime_ok = (tsm["Realized_Vol"] >= p["min_realized_vol"]).fillna(False)
+    # P1-1: Volatility Z-score Entry Filter gate from calculate_time_series_momentum
+    # (tsm_vol_z_entry). Inert (all True) when tsm_vol_z_entry <= 0.0. Joined into
+    # the setup conjunction BEFORE edge detection so entries resume as soon as the
+    # combined setup re-edges (the review spec's "buy_setup" corresponds to the
+    # raw conjunction here; edge-dedup semantics are preserved).
+    vol_entry_ok = tsm["Vol_Entry_OK"]
     # Optional confirmation: breakout must coincide with positive composite.
     bo_confirmed = bo_bull & tsm_bull
 
-    buy_setup_raw = bo_confirmed & ema_bull & er_bull & vol_regime_ok
+    buy_setup_raw = bo_confirmed & ema_bull & er_bull & vol_regime_ok & vol_entry_ok
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
         buy_fill = buy_setup_raw.shift(1).fillna(False).astype(bool)
@@ -329,7 +335,7 @@ def compute_signals_df(data: cudf.DataFrame, params: dict) -> pd.DataFrame:
     er_bear = er["ER"] >= p["er_min_threshold"]
     bo_bear_confirmed = bo_bear & tsm_bear
 
-    sell_setup_raw = bo_bear_confirmed & ema_bear & er_bear & vol_regime_ok
+    sell_setup_raw = bo_bear_confirmed & ema_bear & er_bear & vol_regime_ok & vol_entry_ok
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, message=".*Downcasting.*")
         sell_fill = sell_setup_raw.shift(1).fillna(False).astype(bool)
