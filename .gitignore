@@ -19,6 +19,7 @@ output_*.txt
 collated_wfv_results*/
 backtest_report_*/
 v6/v6/
+v6/tmp/
 
 # IDE
 .vscode/

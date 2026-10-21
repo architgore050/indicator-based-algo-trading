@@ -12,7 +12,7 @@ This is an XAUUSD (Gold) high-performance algorithmic trading system (v6 — onl
 - **CAGR is king.** Sharpe (>1.0) and Calmar (>0.5) are hard constraint penalties, not primary objectives.
 
 ## Hardware Context
-The system runs natively on Ubuntu 24.04 (dual-boot — the old WSL setup is retired) on an MSI Vector 16 HX: RTX 5080 Laptop GPU (MSI Anti-Thermal), NVIDIA driver 580 (CUDA 13.0-capable; RAPIDS runs the CUDA 12.9 wheel stack), Intel Core Ultra 9 275HX (24 cores), 32 GB DDR5 RAM, NVMe SSD storage. The project lives on the mounted NTFS partition (`/media/archit-gore/Windows/...`); the Python venv lives on native ext4 (`~/venvs/rapids`).
+The system runs natively on Ubuntu 24.04 (dual-boot — the old WSL setup is retired) on an MSI Vector 16 HX: RTX 5080 Laptop GPU (MSI Anti-Thermal), NVIDIA driver 580 (CUDA 13.0-capable; RAPIDS runs the CUDA 12.9 wheel stack), Intel Core Ultra 9 275HX (24 cores), 32 GB DDR5 RAM, NVMe SSD storage. The project lives on native ext4 (`/home/archit-gore/projects/indicator-based-algo-trading`); the Python venv also lives on native ext4 (`~/venvs/rapids`). (The old mounted-NTFS project location was retired 2026-10-21 — git/IO lockups on the NTFS mount; see `docs/MIGRATION_native_ext4.md`.)
 
 Key characteristics that influence design decisions:
 - **Sustained boost clocks** — the cooling system does not thermal throttle, so long WFV runs can push hardware continuously without degradation concerns.
@@ -108,7 +108,7 @@ When running any script:
 ### Correct Execution Format
 
 ```bash
-cd "/media/archit-gore/Windows/Users/gorea/Desktop/indicator based algo trading/indicator based algo trading/v6"
+cd "/home/archit-gore/projects/indicator-based-algo-trading/v6"
 source ~/venvs/rapids/bin/activate && unset PYTHONPATH
 python your_script.py
 ```
@@ -257,7 +257,7 @@ See `PLAN.md` for the detailed, up-to-date roadmap and task tracker.
 - **Phase 2 (Speed Shift):** COMPLETE — VRAM-based worker limits, pre-sliced per-window CSVs, atomic writes, structured logging.
 - **Phase 3 (Validation & Cleanup):** COMPLETE — parity tests passed, logging integrated, dead state removed.
 - **Phase 4 (Algorithmic Optimization):** COMPLETE — Signal generators refactored with sparse event loops (100x fewer iterations) + pre-computed reasons. Backtester numeric arrays converted to cupy (M09), 305-820% speedup. All dual-path code removed (~560 lines). GPU migration complete (M14). Backtesting loop-breaking and Optuna search space reduction remain as next targets.
-- **Environment (2026-10):** Migrated from WSL+conda to native Ubuntu 24.04 dual-boot — RAPIDS via pip wheels in `~/venvs/rapids` (ext4), project on mounted NTFS, Optuna storage on PostgreSQL (`optuna_db`), ROS `PYTHONPATH` must be unset before runs.
+- **Environment (2026-10):** Migrated from WSL+conda to native Ubuntu 24.04 dual-boot — RAPIDS via pip wheels in `~/venvs/rapids` (ext4), project on native ext4 (`/home/archit-gore/projects/indicator-based-algo-trading`, moved off the mounted NTFS partition 2026-10-21 due to git/IO lockups — see `docs/MIGRATION_native_ext4.md`), Optuna storage on PostgreSQL (`optuna_db`), ROS `PYTHONPATH` must be unset before runs.
 
 ## Active Issues from External Review
 
@@ -428,3 +428,4 @@ This section captures lessons learned from actual implementation experience. It 
 
 ---
 *Last updated: 2026-10-20 — Linux environment migration docs completed (WSL/conda references retired, venv + PostgreSQL execution documented, skills index refreshed, analytics dashboard added to architecture table).*
+*Last updated: 2026-10-21 — project path references updated to native ext4 location `/home/archit-gore/projects/indicator-based-algo-trading` (NTFS mount retired due to git/IO lockups; path-only AGENTS.md updates, see `docs/MIGRATION_native_ext4.md`).*
