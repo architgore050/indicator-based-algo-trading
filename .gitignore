@@ -21,6 +21,11 @@ backtest_report_*/
 v6/v6/
 v6/tmp/
 
+# Retired smoke-log target: orchestrator/calibration run logs now go under
+# v6/tmp/ (above). This guard prevents a stale muscle-memory redirect
+# (`> docs/test.txt`) from ever staging a run log again.
+docs/test.txt
+
 # P1-4: per-window calibration diagnostic copies published at v6 root by the
 # orchestrator (calibration_results_<strategy>_<window_label>.json). Explicit
 # label patterns only — must NOT match the tracked calibration_results_{vm,tv,

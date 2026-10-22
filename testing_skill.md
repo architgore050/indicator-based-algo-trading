@@ -48,20 +48,20 @@ exit status 1 | exit status 2
 ### How to Search
 
 ```powershell
-# After running a script, save output to docs/test.txt:
-wsl bash -c 'cd /mnt/c/... && python script.py' > docs/test.txt 2>&1
+# After running a script, save output under `v6/tmp/` (gitignored — never a tracked path):
+wsl bash -c 'cd /mnt/c/... && python script.py' > v6/tmp/<name>.txt 2>&1
 ```
 
 ⚠️ **CRITICAL: UTF-16 Encoding Trap**
 
 PowerShell captures WSL output as UTF-16 LE. `grep`/`findstr` will fail to match patterns in the captured file even when errors are present. This has caused tracebacks to slip through multiple audit cycles.
 
-**Always convert test.txt to UTF-8 before searching:**
+**Always convert the captured log to UTF-8 before searching** (this trap only applies to the retired PowerShell→WSL capture path; native Linux `bash` redirects already write UTF-8):
 ```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/docs/test.txt > /tmp/test_utf8.txt'
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6/tmp/<name>.txt > /tmp/test_utf8.txt'
 ```
 
-Then search `/tmp/test_utf8.txt` instead of `docs/test.txt`.
+Then search `/tmp/test_utf8.txt` instead of the raw captured log.
 
 ⚠️ **Tracebacks Embedded in Log Lines**
 
@@ -77,7 +77,7 @@ grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 ```
 
 ### Verification Steps
-1. Save output to `docs/test.txt` or `/tmp/test_output.txt`
+1. Save output to `v6/tmp/<name>.txt` (gitignored) or `/tmp/test_output.txt`
 2. **Convert to UTF-8** before searching (see warning above)
 3. Search for all error patterns listed above — including embedded tracebacks in log lines
 4. Verify output file has content (`wc -l > 0` or check file size)
@@ -87,17 +87,19 @@ grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 
 ### Path Note
 
-The project folder on disk is named **"algo"** (not "ago"): `indicator based algo trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `./docs/test.txt` work fine.
+The project folder on disk is named **"algo"** (not "ago"): `indicator based algo trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `v6/tmp/<name>.txt` work fine. (The old `docs/test.txt` capture target is retired — it is no longer tracked and is gitignored; write run logs under `v6/tmp/`.)
 
 ---
 
 ## 3. Smoke Test Requirements
 
-### Data Volume
-**Smoke tests must use ≥1 year of data.** Tiny smoke windows (e.g., 50K rows) can produce 0 trades, which means parity tests pass trivially without verifying any trading logic. Use at least 1 year of data (525,600+ bars for 1-minute data) to ensure meaningful test coverage.
+### Smoke vs. Validation: two different jobs
+**Smoke mode is plumbing proof, not performance evidence.** Smoke runs are intentionally super short (tiny IS slices; CPCV folds carry ~1-30 trades) and exist only to prove the pipeline runs end-to-end without crashing. In smoke, the CPCV fold-count floor drops to `min_usable_folds=1` — collapsing the metric distribution to a point estimate — and the Sharpe/Calmar constraint floors are disabled with a loud warning. Smoke objectives (PSR / MaxDD / Profit Factor / CAGR), trade counts, and scores must **never** be quoted as performance claims.
+
+**Parity and validation tests are the ones that need statistically meaningful data depth.** Wherever the strategy must actually trade, use at least 1 year of data (525,600+ bars for 1-minute data). Tiny validation windows (e.g., 50K rows) can produce 0 trades, which means parity tests pass trivially without verifying any trading logic.
 
 ### Smoke Mode Default
-Default to `--smoke` mode for all tasks unless explicitly told otherwise (small data slices, fast feedback).
+Default to `--smoke` mode for all tasks unless explicitly told otherwise — for fast end-to-end "it did not crash" feedback only. When a result needs to be believed, run the corresponding parity/validation test with real data depth.
 
 ### Standard Smoke Test Commands
 Run from the `v6/` directory:
@@ -171,11 +173,11 @@ When the orchestrator is already running inside WSL with rapids activated, subpr
 
 ## 6. Output Capture Convention
 
-When running smoke tests or any script, capture and save output to `docs/test.txt` for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal.
+When running smoke tests or any script, capture and save output under `v6/tmp/` (gitignored) for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal — and without rewriting a tracked file. The old `docs/test.txt` target is retired: it is no longer tracked, is gitignored, and must not be recreated.
 
 ```powershell
 # Always use 2>&1 to capture both stdout and stderr
-wsl bash -c 'cd /mnt/c/... && python script.py' > docs/test.txt 2>&1
+wsl bash -c 'cd /mnt/c/... && python script.py' > v6/tmp/<name>.txt 2>&1
 ```
 
 **WSL output capture must use `2>&1`.** Without it, errors go to stderr and the captured file appears clean while the script actually failed.
@@ -192,7 +194,7 @@ wsl bash -c 'cd /mnt/c/... && python script.py' > docs/test.txt 2>&1
 1. Identify bug (error pattern match, wrong output, zero trades, etc.)
 2. Fix the code
 3. Run syntax check
-4. Run smoke test with full data (≥1 year)
+4. Run the verification test with statistically meaningful data (≥1 year where the strategy must actually trade); a smoke run alone only proves the code did not crash
 5. Search output for ALL error patterns
 6. Run parity tests if applicable
 7. Verify output files exist and contain data
@@ -257,7 +259,7 @@ Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs
 
 After every testing session:
 
-1. **Clear test output files:** Remove or archive `docs/test.txt` if no longer needed for debugging
+1. **Clear test output files:** Remove or archive the run logs under `v6/tmp/` if no longer needed for debugging (`v6/tmp/` is gitignored, so leftovers are harmless but should not accumulate)
 2. **Remove stray test files:** Clean up any `*test*.py` or `*_bak.py` files that ended up in the v6 root (they belong in `v6/parity_maintenance/`)
 3. **Preserve protected files:** Do NOT delete `*test*.py`, `*_signals_test.csv`, `.bak`/`.backup` files — these are required for parity testing
 4. **Verify no temp files left:** Check for any `.tmp`, `.bak`, or temporary output files in unexpected locations
@@ -291,26 +293,26 @@ wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indic
 
 ### Capturing Output
 ```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && python script.py' > docs/test.txt 2>&1
+wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && python script.py' > v6/tmp/<name>.txt 2>&1
 ```
 
-### Converting to UTF-8 (CRITICAL — Never Skip)
-PowerShell captures WSL output as UTF-16 LE. grep/findstr will fail to match patterns even when errors are present. **Always convert before searching:**
+### Converting to UTF-8 (retired PowerShell-capture path only)
+PowerShell captured WSL output as UTF-16 LE, so grep/findstr failed to match patterns even when errors were present. **Native Linux bash redirects write UTF-8 — this step is no longer needed on the current environment:**
 ```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/docs/test.txt > /tmp/test_utf8.txt'
+wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6/tmp/<name>.txt > /tmp/test_utf8.txt'
 ```
 
 ### Reading Output Files
 ```powershell
 # Read top of file (use relative path from workspace root)
-read ./docs/test.txt
+read ./v6/tmp/<name>.txt
 
 # Read bottom of file (for completion messages)
-read ./docs/test.txt -Offset <last_lines> -Limit 50
+read ./v6/tmp/<name>.txt -Offset <last_lines> -Limit 50
 ```
 
 ### Error Searching
-⚠️ **Search `/tmp/test_utf8.txt`, NOT `docs/test.txt`** — the UTF-16 encoded file will not match patterns.
+⚠️ **Search the UTF-8 copy (`/tmp/test_utf8.txt`), NOT the raw UTF-16 capture** — the UTF-16 encoded file will not match patterns.
 
 ```powershell
 # Search for error keywords (in UTF-8 converted file)
@@ -331,10 +333,10 @@ grep -A3 "Trial.*failed" /tmp/test_utf8.txt
 ### File Verification
 ```powershell
 # Check file has content
-powershell -Command "(Get-Item ./docs/test.txt).Length -gt 0"
+powershell -Command "(Get-Item ./v6/tmp/<name>.txt).Length -gt 0"
 
 # Count lines
-powershell -Command "(Get-Content ./docs/test.txt).Count"
+powershell -Command "(Get-Content ./v6/tmp/<name>.txt).Count"
 ```
 
 ### Code Changes
@@ -346,8 +348,8 @@ powershell -Command "(Get-Content ./docs/test.txt).Count"
 
 ### Cleanup
 ```powershell
-# Remove temp files
-Remove-Item docs\test.txt -ErrorAction SilentlyContinue
+# Remove temp files (run logs live under v6/tmp/, which is gitignored)
+Remove-Item v6\tmp\<name>.txt -ErrorAction SilentlyContinue
 Remove-Item *.tmp -ErrorAction SilentlyContinue
 ```
 
@@ -366,3 +368,4 @@ Remove-Item *.tmp -ErrorAction SilentlyContinue
 ---
 
 *Last updated: 2026-08-20 — Extracted from orchestration_skill.md and AGENTS.md. Consolidated testing rules into standalone skill document.*
+*Last updated: 2026-10-22 — smoke-mode intent corrected (smoke = fast end-to-end/no-crash proof on tiny slices; its objectives are never performance evidence — the ≥1-year data-depth rule now applies to parity/validation tests), and run-log capture moved from `docs/test.txt` to `v6/tmp/` (gitignored). The WSL/PowerShell command examples in this file are historical and predate the native-Ubuntu migration.*

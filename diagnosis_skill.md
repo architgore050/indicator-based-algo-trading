@@ -268,7 +268,7 @@ When a bug is found, classify it. This determines the fix strategy:
 
 ### Step 1: Reproduce the Symptom
 
-Run the pipeline (or the relevant stage) and confirm the symptom exists. Don't diagnose a ghost. Save output to `docs/test.txt` with `2>&1`.
+Run the pipeline (or the relevant stage) and confirm the symptom exists. Don't diagnose a ghost. Save output to `v6/tmp/<name>.txt` (gitignored) with `2>&1`.
 
 ### Step 2: Trace the Cascade
 
