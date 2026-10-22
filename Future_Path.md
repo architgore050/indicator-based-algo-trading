@@ -8,7 +8,7 @@
 
 ## Current Status
 
-All P0 (critical bugs) and P1 (trust issues) items are resolved. The pipeline produces reliable, reproducible results. P2 items are nearly complete. What remains are **infrastructural upgrades** — each one is a substantial project that would touch multiple components of the pipeline and require its own design, implementation, and validation cycle.
+The P0/P1/P2 external-review program is still in progress on the `fix/wfv-correctness-external-review` branch (see `docs/PLAN.md`): P0 and P1 items are largely resolved, P2 items are in progress. Calibration reproducibility is an **open investigation item** (§7) — the pipeline is bit-reproducible only under the current `n_jobs = 1` pin, and no permanent reproducibility policy has been chosen yet. What remains are **infrastructural upgrades** — each one is a substantial project that would touch multiple components of the pipeline and require its own design, implementation, and validation cycle.
 
 ---
 
@@ -186,6 +186,28 @@ Blocked pending a successful clean full run. Deciding the import variant require
 
 ---
 
+## 7. Calibration Reproducibility Policy (Optuna NSGA-II ask/tell interleaving)
+
+### Problem
+Optuna's NSGA-II ask/tell interleaving reseeds samplers per parallel worker, so calibration is **not bit-reproducible when Optuna trials run with `n_jobs > 1`**: identical code with identical seeds can produce different sampled parameters and scores. Measured evidence (pre-P1-6, `n_jobs=20` scratch runs — `docs/P1-5_survival_audit_record.md` §R5.2): two runs of the same window produced different Phase-3 trial-1 params and scores (`multi_rsi_p1=24` → score −35.2797 vs `multi_rsi_p1=23` → −29.5543), and a monthly window's survival outcome flipped `TIE_KEEP_PARENT` → `REFINED_WINS` between two runs of the same orchestrator smoke. At `n_jobs > 1` the survival decision value itself is run-dependent.
+
+### What would change
+- Choose a permanent reproducibility policy. Candidate options considered, none selected: (a) pin calibration permanently to `n_jobs = 1`; (b) accept non-reproducibility and document it; (c) add an explicit determinism switch (e.g. `--deterministic` default-on with a `--parallel-calibration` opt-out).
+- Current mitigation (already in place): P1-6 pins `n_jobs = 1` inside `run_study` — bit-reproducible (verified by `test_p0_2_sampler_determinism.py`; the P1-6 reviewer's two independent smoke runs produced bit-identical final objectives for all windows). WFV parallelism stays at the orchestrator worker level either way.
+- If parallel calibration is ever accepted, downstream invariants must assert record validity/consistency rather than fixed decision outcomes (`docs/P1-5_survival_audit_record.md` §R6).
+
+### Structural impact
+- `optuna_calibrate_*.py`: `run_study` concurrency handling (currently pinned `n_jobs = 1`); option (c) would add a CLI determinism switch to all three calibrators.
+- `orchestrate_calibration.py`: unaffected — worker-level WFV parallelism is orthogonal to per-window trial concurrency.
+- Tests/invariants: e2e invariants need the run-dependence tolerance documented in P1-5 §R6 if option (b) or the option (c) opt-out is chosen.
+
+### Why deferred
+Open item — needs deeper investigation, no policy chosen yet; decision deferred to the developer. The `n_jobs = 1` pin already restores reproducibility at the cost of per-window calibration speed; whether that cost is permanent is a research-integrity-vs-speed tradeoff. Why it matters: WFV research integrity — if IS calibration results are not reproducible, run-to-run comparisons and published parameter selections cannot be reproduced.
+
+**Cross-reference:** the same open item is recorded as **Task 4.8** in `docs/PLAN.md` — one problem tracked in two places, not two separate issues.
+
+---
+
 ## Execution Order
 
 These upgrades should be tackled in this order:
@@ -209,4 +231,4 @@ These upgrades should be tackled in this order:
 
 ---
 
-*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Review and update after each baseline WFV run.*
+*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Updated 2026-10-22 with new §7 Calibration Reproducibility Policy (open item — mirrors `docs/PLAN.md` Task 4.8) and a corrected Current Status paragraph. Review and update after each baseline WFV run.*
