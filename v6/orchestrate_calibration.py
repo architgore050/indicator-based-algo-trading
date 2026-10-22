@@ -10,6 +10,7 @@ import sys
 import tempfile
 import math
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
@@ -461,6 +462,114 @@ def _compute_distribution_prior(wfv_dir, window_index, full_recal_interval):
 
 
 # ---------------------------------------------------------------------------
+# P1-7: NO_ADMISSIBLE_TRIAL Manifest / Skip Handling
+# ---------------------------------------------------------------------------
+
+NO_ADMISSIBLE_TRIAL_STATUS = "NO_ADMISSIBLE_TRIAL"
+CAPTURED_OUTPUT_TAIL_LINES = 40  # per stream, per calibration attempt
+
+
+def _parent_annual_dir(wfv_dir, window_index: int, full_recal_interval: int):
+    """Directory of the parent annual window for a monthly window (P1-7).
+
+    Same index formula as _resolve_parent_path; returns None for annual windows.
+    """
+    if ((window_index - 1) % full_recal_interval) == 0:
+        return None
+    parent_idx = 1 + ((window_index - 2) // full_recal_interval) * full_recal_interval
+    return wfv_dir / f"window_{parent_idx}_annual_recal_{parent_idx}", parent_idx
+
+
+def _read_inadmissible_manifest(wfv_dir, window_index: int, full_recal_interval: int):
+    """Return (parent_dir_name, manifest) if the parent annual window carries an
+    explicit NO_ADMISSIBLE_TRIAL manifest (P1-7), else None.
+
+    A parent that CRASHED (no results file and no manifest) is NOT covered here —
+    _resolve_parent_path keeps its retry-then-ABORT behavior for genuine crashes.
+    Only an explicitly-handled inadmissible parent triggers the cascade skip.
+    """
+    res = _parent_annual_dir(wfv_dir, window_index, full_recal_interval)
+    if res is None:
+        return None
+    parent_dir, parent_idx = res
+    manifest_path = parent_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            f"Window {window_index}: parent manifest {manifest_path} unreadable "
+            f"({e}); treating parent as not-explicitly-skipped (resolve/abort path)."
+        )
+        return None
+    if manifest.get("status") == NO_ADMISSIBLE_TRIAL_STATUS:
+        return parent_dir.name, manifest, parent_idx
+    return None
+
+
+def _write_skip_manifest(current_dir, window_index: int, window_label: str,
+                        strategy: str, error: str, ranges: tuple) -> Path:
+    """Write the P1-7 NO_ADMISSIBLE_TRIAL manifest for a window.
+
+    Atomic (temp file + os.replace) per the AGENTS.md parallel-writes lesson.
+    The manifest is the machine-readable record consumed by the collator and
+    (later) the P1-8 integrity validator: a window with this manifest is an
+    EXPLICITLY HANDLED skip — no signals, no backtest, no default-parameter
+    substitution anywhere downstream.
+    """
+    is_start, is_end, oos_start, oos_end = ranges
+    manifest = {
+        "window_index": int(window_index),
+        "window_label": window_label,
+        "strategy": strategy,
+        "status": NO_ADMISSIBLE_TRIAL_STATUS,
+        "error": error,
+        "is_start_row": int(is_start),
+        "is_end_row": int(is_end),
+        "oos_start_row": int(oos_start),
+        "oos_end_row": int(oos_end),
+        "recorded_at": datetime.now().isoformat(),
+    }
+    manifest_path = current_dir / "manifest.json"
+    tmp_path = current_dir / "manifest.json.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, manifest_path)
+    return manifest_path
+
+
+def _log_captured_output(worker_logger, proc, max_lines: int = CAPTURED_OUTPUT_TAIL_LINES) -> None:
+    """P1-7: subprocess.run(capture_output=True) stops streaming the calibrator's
+    console output into the worker console/log. Preserve diagnostics: write the
+    captured tails (stdout AND stderr) into the worker log on BOTH success and
+    failure, so hangs/failures stay observable and the run log convention holds.
+    """
+    for stream_name in ("stdout", "stderr"):
+        text = getattr(proc, stream_name, None) or ""
+        text = text.strip()
+        if not text:
+            continue
+        lines = text.splitlines()
+        omitted = max(0, len(lines) - max_lines)
+        if omitted:
+            worker_logger.info(
+                f"[calib {stream_name}] ... {omitted} earlier line(s) omitted, tail follows ...")
+            lines = lines[-max_lines:]
+        for line in lines:
+            worker_logger.info(f"[calib {stream_name}] {line}")
+
+
+def _extract_error_line(captured_text: str) -> str:
+    """Pull the most informative NO_ADMISSIBLE_TRIAL line out of captured output."""
+    lines = [l.strip() for l in (captured_text or "").splitlines() if "NO_ADMISSIBLE_TRIAL" in l]
+    if lines:
+        return lines[-1][:500]
+    return "Calibration failed to find any valid, non-pruned, constraint-feasible trials."
+
+
+# ---------------------------------------------------------------------------
 # Window Processing Logic (The Worker)
 # ---------------------------------------------------------------------------
 
@@ -487,12 +596,36 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
     # 3. Resolve parent annual path (file-based, with retry)
+    # P1-7 cascade rule: if the parent annual was explicitly marked
+    # NO_ADMISSIBLE_TRIAL, this monthly window has no baseline to inherit and
+    # must NOT silently calibrate against config defaults. Mark it with its own
+    # manifest and skip it too (handled skip, not a crash).
+    parent_skip = _read_inadmissible_manifest(wfv_dir, i, full_recal_interval)
+    if parent_skip is not None:
+        parent_name, parent_manifest, parent_idx = parent_skip
+        worker_logger.warning(
+            f"Window {i}: parent annual {parent_name} is marked NO_ADMISSIBLE_TRIAL. "
+            "Cascading the explicit skip to this monthly window (no baseline to "
+            "inherit; config-default calibration is forbidden)."
+        )
+        _write_skip_manifest(
+            current_dir, i, window_label, strategy,
+            error=(f"CASCADE_SKIP: parent annual window {parent_idx} "
+                   f"({parent_name}) was NO_ADMISSIBLE_TRIAL: "
+                   f"{parent_manifest.get('error', 'no recorded error')}"),
+            ranges=(is_start, is_end, oos_start, oos_end),
+        )
+        worker_logger.info(f"--- Skipped Window {i} (NO_ADMISSIBLE_TRIAL cascade) ---")
+        return NO_ADMISSIBLE_TRIAL_STATUS
+
     yearly_best_path = _resolve_parent_path(wfv_dir, i, full_recal_interval, strategy)
 
     worker_logger.info(f"Decision: {window_label} - always recalibrate.")
 
     # 4. Calibration (with retry)
     cal_success = False
+    cal_inadmissible = False
+    inadmissible_error = ""
     for attempt in range(1, MAX_WINDOW_RETRIES + 1):
         window_cal_output = str(current_dir / f"calibration_results_{strategy}.json")
         cal_cmd = [
@@ -517,13 +650,53 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         cal_cmd_str = shlex.join(cal_cmd)
         worker_logger.info(f"Calibration Command: {cal_cmd_str}")
         try:
-            subprocess.run(cal_cmd_str, shell=True, check=True)
+            # P1-7: capture_output=True lets the orchestrator detect the explicit
+            # NO_ADMISSIBLE_TRIAL failure mode. Diagnostics are preserved by
+            # _log_captured_output(): the captured tails land in the worker log on
+            # success AND failure, so console streaming loss never hides a hang.
+            proc = subprocess.run(cal_cmd_str, shell=True, check=True,
+                                  capture_output=True, text=True)
+            _log_captured_output(worker_logger, proc)
             cal_success = True
             break
-        except Exception as e:
+        except subprocess.CalledProcessError as e:
+            captured = (e.stdout or "") + "\n" + (e.stderr or "")
+            _log_captured_output(worker_logger, e)
+            if "NO_ADMISSIBLE_TRIAL" in captured:
+                # Deterministic per-phase sampler seeds make retrying an
+                # all-infeasible window futile (AGENTS.md lesson): break after
+                # ONE attempt, record the manifest, and let the WFV run continue.
+                worker_logger.warning(
+                    f"Window {i} calibration returned NO_ADMISSIBLE_TRIAL. "
+                    "Recording manifest and skipping the window (retry is futile: "
+                    "per-phase seeds reproduce the same trial population).")
+                inadmissible_error = _extract_error_line(captured)
+                cal_inadmissible = True
+                break
             worker_logger.warning(f"Calibration attempt {attempt}/{MAX_WINDOW_RETRIES} failed for window {i}: {e}")
             if attempt < MAX_WINDOW_RETRIES:
                 worker_logger.info(f"Retrying calibration for window {i}...")
+        except Exception as e:
+            # Non-subprocess failures keep the historical retry behavior.
+            worker_logger.warning(f"Calibration attempt {attempt}/{MAX_WINDOW_RETRIES} failed for window {i}: {e}")
+            if attempt < MAX_WINDOW_RETRIES:
+                worker_logger.info(f"Retrying calibration for window {i}...")
+
+    if cal_inadmissible:
+        manifest_path = _write_skip_manifest(
+            current_dir, i, window_label, strategy,
+            error=inadmissible_error,
+            ranges=(is_start, is_end, oos_start, oos_end),
+        )
+        # Downstream skip semantics (P1-7): NO signal generation, NO OOS
+        # backtest, NO results copy for this window. A skipped window must never
+        # fall back to config-default parameters — that is the exact violation
+        # P1-7 condemns. The manifest is the explicit, machine-readable record.
+        worker_logger.warning(
+            f"Window {i} skipped: NO_ADMISSIBLE_TRIAL recorded at {manifest_path}. "
+            "Signal generation and OOS backtest are skipped for this window.")
+        worker_logger.info(f"--- Skipped Window {i} (NO_ADMISSIBLE_TRIAL) ---")
+        return NO_ADMISSIBLE_TRIAL_STATUS
 
     if not cal_success:
         worker_logger.error(f"Calibration failed after {MAX_WINDOW_RETRIES} attempts for window {i}")
@@ -602,7 +775,7 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         worker_logger.warning(f"Window {i} stats not found.")
 
     worker_logger.info(f"--- Completed Window {i} ---")
-    return True
+    return "OK"
 
 # ---------------------------------------------------------------------------
 # Main Orchestrator
@@ -717,6 +890,12 @@ def main():
 
     logger.info(f"Two-phase scheduling: {len(annual_indices)} annual windows, {len(monthly_indices)} monthly windows")
 
+    # P1-7: collect per-window statuses so explicit skips are visible in the
+    # run summary (a NO_ADMISSIBLE_TRIAL window is a HANDLED outcome, not a
+    # crash — the run completes with exit 0 and the skip is recorded per-window
+    # in manifest.json + here in the main log).
+    window_statuses = []
+
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         # Phase 1: All annual windows
         logger.info("--- Phase 1: Annual Windows ---")
@@ -731,7 +910,7 @@ def main():
 
         for f in tqdm(annual_futures, desc="Phase 1 — Annual Windows", unit="window"):
             try:
-                f.result()
+                window_statuses.append(f.result())
             except RuntimeError as e:
                 if "ABORT" in str(e):
                     logger.error(f"WFV run aborted: {e}")
@@ -754,7 +933,7 @@ def main():
 
         for f in tqdm(monthly_futures, desc="Phase 2 — Monthly Windows", unit="window"):
             try:
-                f.result()
+                window_statuses.append(f.result())
             except RuntimeError as e:
                 if "ABORT" in str(e):
                     logger.error(f"WFV run aborted: {e}")
@@ -764,6 +943,20 @@ def main():
                 logger.error(f"Monthly window failed: {e}")
                 raise
 
+    # P1-7 run summary: skipped windows are reported, never hidden.
+    skipped = [s for s in window_statuses if s == NO_ADMISSIBLE_TRIAL_STATUS]
+    completed = len(window_statuses) - len(skipped)
+    logger.info(
+        f"WFV run summary: {completed} window(s) completed, "
+        f"{len(skipped)} window(s) skipped as NO_ADMISSIBLE_TRIAL "
+        f"(manifest.json recorded per skipped window)."
+    )
+    if skipped:
+        logger.warning(
+            "Skipped windows carry NO signals/backtest results by design — they are "
+            "explicitly inadmissible windows, NOT default-parameter substitutions. "
+            "Collation (P1-8 integrity validation) must account for them."
+        )
     logger.info("WFV Pipeline Complete.")
 
 if __name__ == "__main__":

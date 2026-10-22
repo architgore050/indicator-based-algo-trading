@@ -91,6 +91,137 @@ def load_calibration_data(rows_to_load: int, end_at_row: int, data_csv_path: str
     return gpu_df
 
 # ---------------------------------------------------------------------------
+# P1-7: Pre-Study Data Validation
+# ---------------------------------------------------------------------------
+# The external review (docs/externalReview_pipeline_correctness.md, P1-7)
+# demands a fail-fast check that the loaded calibration slice can support any
+# admissible trial BEFORE an Optuna study is created. The review's literal
+# snippet compares the slice against `full_cal_rows` (362,880) — that threshold
+# is unusable as written: it would reject every smoke run (smoke IS slices are
+# 1,000 bars by design) and every monthly window (monthly IS is
+# rows_per_window x recalibration_windows = 129,600 bars). The mode-correct rule
+# implemented here has two explicit, logged tiers:
+#
+#   Tier A — viable warm-up floor (HARD in every mode, smoke included): the
+#     slice must cover the strategy's shortest viable signal chain at its range
+#     lower bounds (lower-bound mirror of the P0-6 compute_pre_roll_bars
+#     derivation in orchestrate_calibration.py) plus 50 bars of composite
+#     headroom. Below this floor every trial is guaranteed degenerate in every
+#     mode, so the calibrator raises NO_ADMISSIBLE_TRIAL before creating a
+#     study — in smoke too, with a loud warning first. The rule never silently
+#     disables itself in smoke.
+#
+#   Tier B — IS-depth floor (HARD in full mode, loud WARNING in smoke):
+#     full-mode annual runs must carry calibration_rows_per_trial bars
+#     (362,880); full-mode monthly (--phase3-only) runs must carry
+#     rows_per_window x recalibration_windows (129,600). In smoke the floor is
+#     the documented 1,000-bar smoke slice: a smoke slice below it is allowed
+#     (smoke proves plumbing, not statistics) but the waiver is logged loudly,
+#     never silently.
+#
+# See docs/P1-7_no_admissible_trial.md for the full design rationale.
+
+WARMUP_HEADROOM_BARS = 50  # mirrors the +50 composite headroom in P0-6 pre-roll
+
+
+def _min_viable_warmup_bars() -> int:
+    """Lowest indicator warm-up any TV trial can demand on the shortest chain
+    that can actually fire a signal (lower-bound mirror of P0-6's
+    compute_pre_roll_bars; see the block comment above)."""
+    ranges = CALIB_PARAMS["tv_ranges"]
+
+    def lb(name, default):
+        return int(ranges.get(name, [default])[0])
+
+    candidates = [
+        # TDI composite chain: RSI(rsi_period) -> SMA(band_length)
+        lb("tdi_rsi_period", 5) + lb("tdi_band_length", 10),
+        # EL MACD composite chain: EMA(macd_slow) -> EMA(macd_signal)
+        lb("el_macd_slow", 30) + lb("el_macd_signal", 5),
+        # Donchian channel
+        lb("donchian_dc_len", 10),
+        # Loxx volatility band
+        lb("loxx_vol_band_period", 10),
+        # Cyclic RSI dominant cycle
+        lb("crsi_dom_cycle", 4),
+        # RSI 8-21 confirmation leg (reviewer addition): RSI(rsi_len) then
+        # SMA(ma21_len) -> lb 5 + lb 5 - 1 = 9 bars (non-binding today, listed
+        # so a future config change cannot silently make it binding).
+        lb("rsi_8_21_rsi_len", 5) + lb("rsi_8_21_ma21_len", 5) - 1,
+        # BBBO confirmation leg (reviewer addition): oscillator EMA/SMA chain
+        # (~14 bars) then stdev(osc, len2) -> ~18 bars at range lower bounds
+        # (non-binding today, listed for robustness).
+        lb("bbbo_len1", 5) + 9 + lb("bbbo_len2", 5) - 1,
+    ]
+    return max(candidates)
+
+
+def validate_calibration_slice(data_len: int, *, smoke: bool, phase3_only: bool) -> dict:
+    """P1-7 pre-study validation. Returns the verdict dict (persisted into the
+    results JSON as `pre_study_validation` for machine-readable audit). Raises
+    RuntimeError("NO_ADMISSIBLE_TRIAL: ...") when the slice cannot support any
+    admissible trial — never a silent fallback."""
+    wfv = CALIB_PARAMS.get("wfv_config", {})
+    warmup_min = _min_viable_warmup_bars()
+    warmup_floor = warmup_min + WARMUP_HEADROOM_BARS
+    if smoke:
+        is_floor = 1000  # documented smoke IS slice (compute_window_ranges)
+    elif phase3_only:
+        is_floor = int(wfv.get("rows_per_window", 21600)) * int(wfv.get("recalibration_windows", 6))
+    else:
+        is_floor = int(CALIB_PARAMS["calibration_rows_per_trial"])
+    mode_label = "SMOKE" if smoke else "FULL"
+
+    if data_len < warmup_floor:
+        # Tier A: hard in EVERY mode (smoke included) — loud, explicit, never silent.
+        logger.warning(
+            f"P1-7 PRE-STUDY VALIDATION FAILED ({mode_label}): loaded slice has "
+            f"{data_len} bars, below the {warmup_floor}-bar viable warm-up floor. "
+            "Declaring the window explicitly inadmissible (NO_ADMISSIBLE_TRIAL)."
+        )
+        raise RuntimeError(
+            f"NO_ADMISSIBLE_TRIAL: pre-study validation failed — loaded slice has "
+            f"{data_len} bars, below the {warmup_floor}-bar minimum viable indicator "
+            f"warm-up ({warmup_min}-bar shortest viable signal chain at range lower "
+            f"bounds + {WARMUP_HEADROOM_BARS} bars composite headroom). Every trial "
+            f"would be degenerate in {mode_label} mode; refusing to create a study."
+        )
+
+    if data_len < is_floor:
+        if not smoke:
+            kind = "monthly (--phase3-only)" if phase3_only else "annual"
+            raise RuntimeError(
+                f"NO_ADMISSIBLE_TRIAL: pre-study validation failed — FULL-mode "
+                f"{kind} IS slice has {data_len} bars, below the configured IS-depth "
+                f"floor {is_floor} bars (calibration_rows_per_trial for annual; "
+                f"rows_per_window x recalibration_windows for monthly). Calibrating "
+                f"an undersized window corrupts WFV integrity."
+            )
+        logger.warning(
+            f"P1-7 PRE-STUDY VALIDATION ({mode_label}): slice has {data_len} bars, "
+            f"below the FULL-mode IS-depth floor {is_floor} bars. WAIVED WITH THIS "
+            f"LOUD WARNING by design — smoke proves plumbing only, not statistics "
+            f"(AGENTS.md smoke-mode intent). The {warmup_floor}-bar viable warm-up "
+            f"floor IS enforced in smoke."
+        )
+
+    verdict = {
+        "slice_bars": int(data_len),
+        "mode": mode_label,
+        "warmup_floor_bars": int(warmup_floor),
+        "is_floor_bars": int(is_floor),
+        "is_floor_enforced": not smoke,
+        "verdict": "PASS",
+    }
+    logger.info(
+        f"P1-7 pre-study validation: PASS — slice {data_len:,} bars | viable warm-up "
+        f"floor {warmup_floor} bars (enforced in {mode_label}) | IS-depth floor "
+        f"{is_floor:,} bars ({'enforced' if not smoke else 'waived-with-warning in smoke'}). "
+        f"Study creation proceeds."
+    )
+    return verdict
+
+# ---------------------------------------------------------------------------
 # Signal Generation (TV Strategy Wrapper) — P0-8
 # ---------------------------------------------------------------------------
 # The private generate_tv_signals_local duplicate has been DELETED. It
@@ -606,7 +737,8 @@ def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, c
 # ---------------------------------------------------------------------------
 
 def classify_survival_decision(baseline_objectives, refined_objectives,
-                               final_params: dict, baseline_params: dict) -> tuple:
+                               final_params: dict, baseline_params: dict,
+                               baseline_admissible: bool = True) -> tuple:
     """Classify the survival-of-the-fittest outcome into the three-value enum.
 
     P1-6 re-derivation (the scalar `>` enum warning in the old docstring is
@@ -623,10 +755,25 @@ def classify_survival_decision(baseline_objectives, refined_objectives,
     incumbent_selected — True when the parent annual params are the params
     finally written to RESULTS_PATH (dict equality vs the filtered baseline).
 
+    P1-7 rule (inadmissible annual baseline): when baseline_admissible is
+    False, the baseline carries the worst-case sentinel vector [0, 100, 0] —
+    it is NOT a valid incumbent measurement. An inadmissible baseline must
+    never block a legitimate refined adoption, so the decision is
+    REFINED_WINS whenever a refined candidate exists. The refined candidate
+    is admissible by construction (it comes from the constraint-feasible
+    Pareto front; an inadmissible refined candidate can never reach this
+    gate — the calibrator raises NO_ADMISSIBLE_TRIAL before that, and the
+    refined_objectives-is-None branch below keeps the incumbent baseline).
+    The dominance arithmetic is bypassed for the sentinel vector; the audit
+    record carries baseline_admissible=False so auditors can see why.
+
     This function only CLASSIFIES the outcome; main() applies the keep/revert
     behavior (adopt only on REFINED_WINS).
     """
     incumbent_selected = dict(final_params) == dict(baseline_params)
+    if not baseline_admissible and refined_objectives is not None:
+        # P1-7: sentinel baseline — never an incumbent, never a blocker.
+        return "REFINED_WINS", incumbent_selected
     if refined_objectives is None and baseline_objectives is None:
         # Neither side carries metrics: honest tie, incumbent decided by params.
         return "TIE_KEEP_PARENT", incumbent_selected
@@ -702,9 +849,16 @@ def main():
         )
     data = load_calibration_data(trial_rows, end_row, data_csv_path=args.data_csv)
 
+    # P1-7: pre-study data validation — fail fast (NO_ADMISSIBLE_TRIAL) before
+    # any baseline evaluation or study creation when the slice cannot support
+    # any admissible trial. Mode-correct tiers; see the section comment above.
+    pre_study_verdict = validate_calibration_slice(
+        len(data), smoke=args.smoke, phase3_only=args.phase3_only)
+
     current_best = None
     baseline_annual_params = None
     baseline_objectives = None
+    baseline_admissible = None
     baseline_components = {}
     distribution_prior = None
     
@@ -728,8 +882,9 @@ def main():
                         f"annual baseline hit early-fail checkpoint: {e}", cpcv_knobs)
                     baseline_components = dict(baseline_metrics["score_components"])
                 baseline_objectives = [float(v) for v in baseline_metrics["objectives"]]
+                baseline_admissible = bool(baseline_metrics["admissible"])
                 logger.info(f"Annual Baseline IS Objectives: {_fmt_objectives(baseline_objectives)} "
-                            f"(admissible={baseline_metrics['admissible']})")
+                            f"(admissible={baseline_admissible})")
 
     # Load distribution prior from parent annual (monthly windows only)
     if args.distribution_prior:
@@ -886,10 +1041,20 @@ def main():
     # Survival of the Fittest Check (P1-6 MOO dominance):
     # adopt refined ONLY when its objectives strictly dominate the baseline's;
     # baseline-dominates or incomparable (front tie) keeps the incumbent parent.
+    # P1-7: an INADMISSIBLE annual baseline (sentinel [0,100,0]) is never an
+    # incumbent and never blocks adoption — refined is adopted in that case.
     if args.annual_baseline and baseline_annual_params is not None and baseline_objectives is not None:
         decision, _ = classify_survival_decision(
-            baseline_objectives, refined_objectives, refined_params, baseline_annual_params)
-        if decision == "REFINED_WINS":
+            baseline_objectives, refined_objectives, refined_params, baseline_annual_params,
+            baseline_admissible=bool(baseline_admissible))
+        if decision == "REFINED_WINS" and not baseline_admissible:
+            logger.warning(
+                "Survival Check: annual baseline is INADMISSIBLE on the current IS window "
+                f"({(baseline_components or {}).get('inadmissible_reason') or 'no admissible CPCV folds'}). "
+                "An inadmissible baseline cannot block a legitimate refined adoption — adopting "
+                "the admissible refined candidate (P1-7 survival-gate rule)."
+            )
+        elif decision == "REFINED_WINS":
             logger.info(
                 f"Survival Check: refined objectives [{_fmt_objectives(refined_objectives)}] "
                 f"DOMINATE annual baseline [{_fmt_objectives(baseline_objectives)}]. Adopting refined params."
@@ -912,12 +1077,19 @@ def main():
     # objective = median PSR) for continuity with pre-P1-6 records.
     if args.annual_baseline and baseline_annual_params is not None and baseline_objectives is not None:
         decision, incumbent_selected = classify_survival_decision(
-            baseline_objectives, refined_objectives, best_params, baseline_annual_params
+            baseline_objectives, refined_objectives, best_params, baseline_annual_params,
+            baseline_admissible=bool(baseline_admissible)
         )
         parent_digest = hashlib.sha256(
             json.dumps(baseline_annual_params, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        if decision == "BASELINE_WINS":
+        if decision == "REFINED_WINS" and not baseline_admissible:
+            reason = (f"annual baseline inadmissible on current IS window "
+                      f"({(baseline_components or {}).get('inadmissible_reason') or 'no admissible CPCV folds'}; "
+                      f"sentinel objectives {_fmt_objectives(baseline_objectives)} are not a valid incumbent): "
+                      f"admissible refined candidate adopted — P1-7 rule: an inadmissible baseline "
+                      f"must never block a legitimate refined adoption")
+        elif decision == "BASELINE_WINS":
             reason = (f"baseline objectives dominate refined "
                       f"(baseline {_fmt_objectives(baseline_objectives)} vs refined {_fmt_objectives(refined_objectives)}): "
                       f"reverted to parent annual params")
@@ -963,6 +1135,12 @@ def main():
             "refined_components": refined_components or None,
             "baseline_components_available": bool(baseline_components),
             "refined_components_available": bool(refined_components),
+            # P1-7: explicit admissibility of the annual baseline evaluation on
+            # this window's IS slice. False => the baseline carries the
+            # worst-case sentinel vector and the survival gate adopted the
+            # admissible refined candidate through the P1-7 override rule
+            # (dominance arithmetic bypassed — see classify_survival_decision).
+            "baseline_admissible": bool(baseline_admissible),
         }
         audit_logger.info(audit_record)
         logger.info(
@@ -985,6 +1163,7 @@ def main():
         "cpcv_summary": cpcv_summary,
         "calibration_date": datetime.now().isoformat(),
         "dataset_info": {"rows_used": trial_rows, "strategy": "tv", "end_row": end_row},
+        "pre_study_validation": pre_study_verdict,
         "optimization_type": "optuna_nsga2_cpcv_moo"
     }
     

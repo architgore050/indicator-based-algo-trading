@@ -244,12 +244,40 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
     # Diagnostic containers
     window_diagnostics = []  # Per-window diagnostic dicts
     recalibration_points = {'annual': [], 'monthly': []}
-    
+    # P1-7: windows explicitly skipped as NO_ADMISSIBLE_TRIAL (manifest.json).
+    # They are recorded honestly — never fabricated, never silently dropped.
+    skipped_windows = []
+
     # Sort windows by index to ensure chronological order
     windows = sorted([d for d in Path(wfv_dir).iterdir() if d.is_dir() and 'window_' in d.name], 
                      key=lambda x: int(x.name.split('_')[1]))
     
     for window_dir in windows:
+        # P1-7: an explicit NO_ADMISSIBLE_TRIAL manifest marks a handled skip.
+        # Tolerate it (no crash), record it (visibility), and contribute nothing
+        # to the collated stats/equity/trade containers (no invented results).
+        manifest_path = window_dir / 'manifest.json'
+        if manifest_path.exists():
+            manifest = None
+            try:
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[P1-7] WARNING: unreadable manifest {manifest_path}: {e}")
+            if manifest and manifest.get('status') == 'NO_ADMISSIBLE_TRIAL':
+                window_idx, regime, recal_idx = _extract_window_info(window_dir)
+                skipped_windows.append({
+                    'window_idx': window_idx,
+                    'regime': regime,
+                    'recal_idx': recal_idx,
+                    'window_dir': window_dir.name,
+                    'status': 'NO_ADMISSIBLE_TRIAL',
+                    'error': manifest.get('error', ''),
+                })
+                print(f"[P1-7] Window {window_idx} ({window_dir.name}) is marked "
+                      f"NO_ADMISSIBLE_TRIAL — recorded as an explicit skip.")
+                continue
+
         backtest_dir = window_dir / 'backtest_results'
         if not backtest_dir.exists():
             continue
@@ -352,6 +380,15 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
     # Runs even if equity reconstruction below fails, and never crashes on
     # missing/empty/malformed audit files.
     aggregate_audit_logs(wfv_dir, output_dir)
+
+    # --- P1-7: persist explicitly-skipped windows (visibility, not fabrication) ---
+    # Written before any early return below so the skip ledger survives even if
+    # equity reconstruction finds nothing to collate.
+    if skipped_windows:
+        skipped_csv_path = os.path.join(output_dir, 'skipped_windows.csv')
+        pd.DataFrame(skipped_windows).to_csv(skipped_csv_path, index=False)
+        print(f"[P1-7] {len(skipped_windows)} window(s) skipped as NO_ADMISSIBLE_TRIAL; "
+              f"skip ledger written: {skipped_csv_path}")
 
     # --- Extract MFE/MAE from combined trades ---
     mfe_mae_stats = {}
@@ -525,7 +562,12 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
             'metadata': {
                 'generated_by': 'collate_wfv_results.py',
                 'windows_processed': len(window_diagnostics),
-                'regimes': list(set(d['regime'] for d in window_diagnostics))
+                'regimes': list(set(d['regime'] for d in window_diagnostics)),
+                # P1-7: explicit skip visibility — NO_ADMISSIBLE_TRIAL windows
+                # are handled skips, not missing data. P1-8 integrity validation
+                # must accept these as explicitly-handled windows.
+                'skipped_windows_count': len(skipped_windows),
+                'skipped_windows': skipped_windows,
             },
             'aggregates': aggregates,
             'per_window_diagnostics': window_diagnostics,
