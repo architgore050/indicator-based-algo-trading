@@ -28,6 +28,10 @@ Layers:
      - captured subprocess output lands in the worker logs.
   D. Collation tolerance: a manifest-marked window is recorded in the skip
      ledger without crashing and without inventing any stats/equity rows.
+     P1-8: the fixtures are ledger-consistent (explicit expected ledger +
+     fixture data.csv + provenance files) because collate_results now runs
+     validate_wfv_integrity first; D1b checks the integrity report metadata
+     and D3 proves the gate FAILS CLOSED on a missing expected window.
 
 Run inside ~/venvs/rapids (imports cudf; Layer B spawns real calibrators).
 Layer B's post-study case needs PostgreSQL (optuna_db) running.
@@ -513,29 +517,68 @@ def layer_c_orchestrator_harness() -> None:
 # ---------------------------------------------------------------------------
 # Layer D — collation tolerance for manifest-marked windows
 # ---------------------------------------------------------------------------
+# P1-8: collate_results now runs validate_wfv_integrity as its VERY FIRST
+# step, so the Layer D fixture must be a ledger-consistent tree: an explicit
+# expected ledger (tiny 3-row windows), a fixture data.csv whose rows the
+# healthy equity curve matches bar-for-bar, and provenance artifacts
+# (calibration results, signal_file prefix, survival-audit seeds) for the
+# successful window. The explicit ledger kwarg also demonstrates the P1-8
+# partial-run validation path.
+
+D_LEDGER = [
+    {"index": 1, "regime": "annual_recal", "is_start": 0, "is_end": 3,
+     "oos_start": 3, "oos_end": 6},
+    {"index": 2, "regime": "monthly_refine", "is_start": 3, "is_end": 6,
+     "oos_start": 6, "oos_end": 9},
+]
+D_DATA_TS = [
+    "2024-01-31 23:57:00", "2024-01-31 23:58:00", "2024-01-31 23:59:00",
+    "2024-02-01 00:00:00", "2024-02-01 00:01:00", "2024-02-01 00:02:00",
+    "2024-02-01 01:00:00", "2024-02-01 01:01:00", "2024-02-01 01:02:00",
+]
+
+
+def _write_d_data_csv(path: Path) -> None:
+    path.write_text("timestamp,open,high,low,close,volume\n" + "\n".join(
+        f"{ts},2000.0,2001.0,1999.0,2000.0,1.0" for ts in D_DATA_TS))
+
 
 def _write_min_backtest(window_dir: Path) -> None:
+    bp_seed = int(json.loads((V6_DIR / "config.json").read_text())
+                  ["backtesting_params"]["random_seed"])
     d = window_dir / "backtest_results"
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary_stats.json").write_text(json.dumps({
+        "signal_file": "vm_automation_logic_signals_test.csv",
         "cagr_pct": 4.2, "total_trades": 3, "win_rate_pct": 66.7,
         "profit_factor": 1.9, "sharpe_ratio": 1.1, "max_drawdown_pct": 2.0}))
+    # Equity bars == fixture data.csv rows 6..8 == the ledger OOS span of
+    # window 2 ([6,9)) — P1-8 requires bar-for-bar agreement.
     (d / "equity_curve.csv").write_text(
         "timestamp,equity_usd,position,close\n"
-        "2024-02-01 00:00:00,100000.0,0,2000.0\n"
-        "2024-02-01 00:01:00,100050.0,1,2000.5\n"
-        "2024-02-01 00:02:00,100100.0,0,2001.0\n")
+        "2024-02-01 01:00:00,100000.0,0,2000.0\n"
+        "2024-02-01 01:01:00,100050.0,1,2000.5\n"
+        "2024-02-01 01:02:00,100100.0,0,2001.0\n")
     (d / "trades.csv").write_text("entry_time,exit_time,pnl_usd\n"
-                                  "2024-02-01 00:01:00,2024-02-01 00:02:00,50.0\n")
+                                  "2024-02-01 01:01:00,2024-02-01 01:02:00,50.0\n")
+    # P1-8 provenance requirements for a successful window:
+    (window_dir / "calibration_results_vm.json").write_text(json.dumps({
+        "dataset_info": {"rows_used": 3, "strategy": "vm", "end_row": 6}}))
+    (window_dir / "wfv_decision.json").write_text(json.dumps({
+        "event": "survival_decision", "strategy": "vm", "window_index": 2,
+        "is_seed": bp_seed, "oos_seed": bp_seed + 2,
+        "decision": "REFINED_WINS"}) + "\n")
 
 
 def _write_manifest(window_dir: Path) -> None:
     window_dir.mkdir(parents=True, exist_ok=True)
+    entry = D_LEDGER[0]
     (window_dir / "manifest.json").write_text(json.dumps({
         "window_index": 1, "window_label": "annual_recal_1", "strategy": "vm",
         "status": "NO_ADMISSIBLE_TRIAL",
         "error": "NO_ADMISSIBLE_TRIAL: synthetic test manifest",
-        "is_start_row": 0, "is_end_row": 1000, "oos_start_row": 1000, "oos_end_row": 2000,
+        "is_start_row": entry["is_start"], "is_end_row": entry["is_end"],
+        "oos_start_row": entry["oos_start"], "oos_end_row": entry["oos_end"],
     }, indent=2))
 
 
@@ -549,18 +592,23 @@ def layer_d_collation_tolerance() -> None:
     work = TMP / "collate"
     if work.exists():
         shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
     wfv = work / "wfv"
     out = work / "out"
+    data_csv = work / "data.csv"
+    _write_d_data_csv(data_csv)
 
     # D1: one skipped window + one healthy window
     _write_manifest(wfv / "window_1_annual_recal_1")
-    _write_min_backtest(wfv / "window_2_annual_recal_2")
+    _write_min_backtest(wfv / "window_2_monthly_refine_2")
     try:
-        coll.collate_results(wfv_dir=str(wfv), output_dir=str(out), strategy="vm")
+        coll.collate_results(wfv_dir=str(wfv), output_dir=str(out), strategy="vm",
+                             expected_windows=D_LEDGER, data_csv=str(data_csv))
     except Exception as e:
         fail(f"D1: collation crashed on a manifest-marked window: {type(e).__name__}: {e}")
         return
-    ok("D1: collation completed with a manifest-marked window present (no crash)")
+    ok("D1: collation completed with a manifest-marked window present (no crash; "
+       "P1-8 integrity gate passed against the explicit expected ledger)")
 
     skip_csv = out / "skipped_windows.csv"
     if not skip_csv.exists():
@@ -601,12 +649,24 @@ def layer_d_collation_tolerance() -> None:
     else:
         ok("D1: collated equity curve contributes nothing from the skipped window")
 
+    # D1b: P1-8 integrity report is persisted in the diagnostics metadata.
+    integ = json.loads(diag_path.read_text()).get("metadata", {}).get("integrity", {})
+    if (integ.get("ledger_source") != "explicit_ledger"
+            or integ.get("skipped_window_indices") != [1]
+            or integ.get("expected_window_count") != 2
+            or integ.get("seed_verified_windows") != [2]):
+        fail(f"D1b: integrity metadata wrong: {integ}")
+    else:
+        ok("D1b: collated diagnostics carry the P1-8 integrity report "
+           "(ledger source, skip set, seed coverage)")
+
     # D2: ONLY a skipped window (no healthy windows) — must not crash, ledger still written
     wfv2 = work / "wfv_only_skip"
     out2 = work / "out_only_skip"
     _write_manifest(wfv2 / "window_1_annual_recal_1")
     try:
-        coll.collate_results(wfv_dir=str(wfv2), output_dir=str(out2), strategy="vm")
+        coll.collate_results(wfv_dir=str(wfv2), output_dir=str(out2), strategy="vm",
+                             expected_windows=[D_LEDGER[0]], data_csv=str(data_csv))
     except Exception as e:
         fail(f"D2: collation crashed when ALL windows were manifest-marked: {type(e).__name__}: {e}")
     else:
@@ -614,6 +674,24 @@ def layer_d_collation_tolerance() -> None:
             fail("D2: skip ledger missing in the all-skipped case")
         else:
             ok("D2: all-skipped WFV dir collates without crashing; skip ledger still written")
+
+    # D3 (P1-8 mutation guard): the integrity gate must REJECT a tree whose
+    # windows contradict the expected ledger — collation must fail closed.
+    wfv3 = work / "wfv_missing"
+    out3 = work / "out_missing"
+    shutil.copytree(wfv, wfv3)
+    shutil.rmtree(wfv3 / "window_2_monthly_refine_2")
+    try:
+        coll.collate_results(wfv_dir=str(wfv3), output_dir=str(out3), strategy="vm",
+                             expected_windows=D_LEDGER, data_csv=str(data_csv))
+    except RuntimeError as e:
+        if "Missing expected window 2" in str(e):
+            ok("D3: collation FAILS CLOSED on a missing window the ledger expects "
+               "(no plausible partial chart)")
+        else:
+            fail(f"D3: wrong failure message: {e}")
+    else:
+        fail("D3: collation completed despite a missing expected window — gate is vacuous!")
 
 
 # ---------------------------------------------------------------------------

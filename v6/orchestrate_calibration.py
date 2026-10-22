@@ -116,107 +116,26 @@ def compute_max_rows_per_window(args, full_cal_rows: int, rows_per_window: int, 
 # ---------------------------------------------------------------------------
 # Window Range Ledger (strict half-open [start, end) — P0-5)
 # ---------------------------------------------------------------------------
+# P1-8: the window arithmetic lives in wfv_ledger.py — the single source of
+# truth shared by the orchestrator and the collation integrity gate
+# (collate_wfv_results.validate_wfv_integrity). Duplicated ledger math is the
+# bug class P0-5/P0-6/P1-8 keep fixing, so it is imported here, not re-declared.
+# Public names and signatures are unchanged: existing consumers
+# (test_wfv_intervals, test_preroll_equivalence) keep importing them from this
+# module.
 
-def compute_window_ranges(i: int, oos_start_base: int, rows_per_window: int,
-                          full_recal_interval: int, recal_windows_count: int,
-                          full_cal_rows: int, smoke: bool) -> tuple:
-    """Half-open row ranges for WFV window i (1-based).
+from wfv_ledger import (  # noqa: E402
+    compute_window_ranges,
+    compute_signal_chunk_range,
+    compute_pre_roll_bars as _compute_pre_roll_bars,
+)
 
-    Returns (oos_start, oos_end, is_start, is_end). All intervals are
-    [start, end): OOS window i spans exactly rows_per_window bars, the IS
-    window ends exactly where the OOS window starts (is_end == oos_start), so
-    the first bar of a window's OOS is never part of its calibration data.
-
-    - Annual IS spans full_cal_rows bars (1000 in smoke). is_start is
-      guaranteed >= data_start_row >= 0 by main()'s derived oos_start_base and
-      its fail-fast validation, so no clamp is needed here.
-    - Monthly IS spans recal_windows_count windows. The fail-fast validation
-      does not guarantee a non-negative monthly start for every config, so the
-      max(0, ...) clamp is kept for monthly windows.
-    """
-    is_annual = ((i - 1) % full_recal_interval == 0)
-    oos_start = oos_start_base + (i - 1) * rows_per_window
-    oos_end = oos_start_base + i * rows_per_window
-    is_end = oos_start
-    if is_annual:
-        is_start = is_end - (1000 if smoke else full_cal_rows)
-    else:
-        is_start = max(0, is_end - (1000 if smoke else rows_per_window * recal_windows_count))
-    return oos_start, oos_end, is_start, is_end
-
-
-# ---------------------------------------------------------------------------
-# Pre-Roll Derivation (P0-6: indicator history for OOS windows)
-# ---------------------------------------------------------------------------
 
 def compute_pre_roll_bars() -> int:
-    """Derive the pre-roll bar count from the max lookback bounds in config.
-
-    P0-6: signal generation and backtesting receive a data slice extended
-    backwards from the OOS start so every indicator is warm (non-NaN) at the
-    first OOS bar. The pre-roll must cover the largest lookback any strategy
-    can sample from its search ranges, plus 50 bars of headroom for composite
-    / nested lookbacks (e.g. MACD slow + signal, RSI + smoothing).
-
-    Derivation (reviewer-hardened, 2026-10-21): instead of a hand-picked key
-    list, every lookback-suffix bound in every strategy range is scanned
-    (new tunable lookback keys are covered automatically), plus explicit
-    nested composite chains from definitions.py whose effective lookback
-    exceeds any single key:
-      - TSM Vol_Z: rolling(vol_lb*4, min_periods=vol_lb) over rolling(vol_lb)
-        -> 5 * tsm_vol_lb
-      - Stoch MACD: EMA(slow_len) -> stoch(lookback) -> EMA(signal_len)
-      - EL MACD: EMA(macd_slow) -> EMA(macd_signal)
-      - TDI: RSI(rsi_period) -> SMA(band_length)
-    With current config.json the dominant term is still tsm_slow_lb (5760)
-    and the derived value is unchanged (5810).
-
-    Deviation from the review doc snippet: the doc names
-    `trend_ranges.donchian_dc_len`, which does not exist in config.json — the
-    trend strategy's Donchian key is `bo_donchian_lb` (donchian_dc_len lives
-    in tv_ranges). Both actual keys are covered by the generic scan. See
-    docs/P0-6_oos_preroll_and_risk_bypass.md.
-    """
-    cal = CALIB_PARAMS
-
-    def ub(ranges_key, name, default):
-        return cal.get(ranges_key, {}).get(name, [default])[1]
-
-    # 1) Generic safety net: every lookback-suffix bound in every strategy range.
-    lookback_suffixes = ("_lb", "_len", "_length", "_lookback", "_period", "_cycle")
-    candidates = [
-        bounds[1]
-        for ranges_key in ("vm_ranges", "tv_ranges", "trend_ranges")
-        for name, bounds in cal.get(ranges_key, {}).items()
-        if name.endswith(lookback_suffixes)
-    ]
-
-    # 2) Explicit nested composite chains (effective lookback > any single key).
-    candidates.append(5 * ub("trend_ranges", "tsm_vol_lb", 240))
-    candidates.append(ub("vm_ranges", "stoch_macd_slow_len", 60)
-                      + ub("vm_ranges", "stoch_macd_lookback", 80)
-                      + ub("vm_ranges", "stoch_macd_signal_len", 20))
-    candidates.append(ub("tv_ranges", "el_macd_slow", 500) + ub("tv_ranges", "el_macd_signal", 100))
-    candidates.append(ub("tv_ranges", "tdi_rsi_period", 80) + ub("tv_ranges", "tdi_band_length", 150))
-
-    return max(candidates) + 50
-
-
-def compute_signal_chunk_range(oos_start: int, oos_end: int, pre_roll_bars: int) -> tuple:
-    """Half-open [signal_start, oos_end) chunk key for the signal/backtest slice.
-
-    P0-6: extends the slice backwards by pre_roll_bars (clamped at row 0).
-    Returns (signal_start, oos_end, oos_start_in_slice), where
-    oos_start_in_slice is the index of the first OOS bar inside the chunk.
-    Pre-roll bars are indicator history only — they are never eligible for OOS
-    signal output or OOS trade accounting (enforced by the signal generators'
-    --oos-start-row-in-slice filter and the backtester's accounting boundary).
-    Calibration IS chunks are unaffected: they stay [is_start, is_end) and
-    never include pre-roll bars.
-    """
-    signal_start = max(0, oos_start - pre_roll_bars)
-    oos_start_in_slice = oos_start - signal_start
-    return signal_start, oos_end, oos_start_in_slice
+    """Thin wrapper preserving the historical no-arg call site: derives the
+    P0-6 pre-roll from this module's loaded CALIB_PARAMS via the shared
+    wfv_ledger implementation."""
+    return _compute_pre_roll_bars(CALIB_PARAMS)
 
 
 # ---------------------------------------------------------------------------

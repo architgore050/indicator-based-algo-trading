@@ -11,6 +11,15 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import numpy as np
 
+from wfv_ledger import (
+    build_expected_ledger,
+    normalize_ledger,
+    derive_schedule_from_chunks,
+    parse_window_dir_name,
+    parse_chunk_file_name,
+    ledger_params,
+)
+
 
 def load_config():
     with open("config.json", "r") as f:
@@ -157,6 +166,591 @@ def _extract_window_info(window_dir):
     return window_idx, regime, recal_idx
 
 
+# ---------------------------------------------------------------------------
+# P1-8 — WFV integrity gate (fail closed)
+# ---------------------------------------------------------------------------
+# The defect (docs/externalReview_pipeline_correctness.md §P1-8): collation
+# used to discover `window_*` directories and concatenate whatever existed,
+# producing "plausible partial charts" that mask missing windows, duplicate
+# directories, overlapping/truncated equity curves, and config/seed drift.
+#
+# validate_wfv_integrity is called as the VERY FIRST step of collate_results.
+# Any violation raises RuntimeError and halts — no collated report is produced.
+#
+# Expected-ledger design (the crux — see docs/P1-8_collation_integrity.md):
+# the validator never derives its expectations from the window directories it
+# finds (the tautology the review condemns). The expected ledger comes from:
+#   1. an explicit spec (`expected_windows=` kwarg / --expected-windows N /
+#      a programmatic ledger list), or
+#   2. the orchestrator's `wfv/sliced_data/` chunk ledger — a SCHEDULING
+#      artifact written before any window is calibrated, matched against the
+#      shared wfv_ledger arithmetic, or
+#   3. nothing else: if neither is available the gate fails closed with
+#      instructions. The config full-run ledger (185 windows) is never applied
+#      implicitly, because smoke runs use 5 windows and partial runs arbitrary
+#      subsets — validating them against the full-run ledger would reject
+#      every legitimate partial run.
+
+SIGNAL_FILE_PREFIXES = {
+    "vm": "vm_automation_logic_signals",
+    "tv": "tv_strategy1_signals",
+    "trend": "trend_strategy_signals",
+}
+
+NO_ADMISSIBLE_TRIAL_STATUS = "NO_ADMISSIBLE_TRIAL"
+
+
+def _load_data_timestamps(data_csv: Path) -> np.ndarray:
+    """Naive-UTC datetime64 array of data.csv rows (index == 0-based data row).
+
+    Same normalization the collator's asset benchmark uses (utc=True then
+    strip tz) so equity-curve timestamps (written naive by the backtester)
+    compare exactly against data.csv rows (written with +00:00).
+    """
+    ts = pd.read_csv(data_csv, usecols=["timestamp"])["timestamp"]
+    ts = pd.to_datetime(ts, utc=True).dt.tz_localize(None)
+    return ts.to_numpy()
+
+
+def _parse_equity_timestamps(equity_path: Path) -> np.ndarray:
+    df = pd.read_csv(equity_path, usecols=["timestamp"])
+    ts = pd.to_datetime(df["timestamp"])
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_localize(None)
+    return ts.to_numpy()
+
+
+def _resolve_expected_ledger(wfv_path: Path, expected_windows, config: dict):
+    """Resolve the ledger the run under validation was SUPPOSED to produce.
+
+    Returns (ledger, source, mode). Never looks at window result directories.
+    """
+    sliced_dir = wfv_path / "sliced_data"
+    chunk_set = set()
+    if sliced_dir.is_dir():
+        for f in sorted(sliced_dir.iterdir()):
+            if not f.is_file():
+                continue
+            parsed = parse_chunk_file_name(f.name)
+            if parsed is None:
+                raise RuntimeError(
+                    f"Integrity Check Failed: unexpected file in sliced_data: {f.name} "
+                    f"(chunk files must be named rows_<start>_<end>.csv)"
+                )
+            chunk_set.add(parsed)
+
+    def _match_chunks(chunk_set, want_n=None):
+        if not chunk_set:
+            return []
+        return derive_schedule_from_chunks(chunk_set, config)
+
+    if isinstance(expected_windows, list):
+        # Fully explicit ledger (programmatic; used by tests and tooling).
+        ledger = normalize_ledger(expected_windows)
+        ledger.sort(key=lambda e: e["index"])
+        p = ledger_params(config)
+        modes = set()
+        for e in ledger:
+            annual = e["regime"] == "annual_recal"
+            smoke_is = e["oos_start"] - 1000
+            full_is = e["oos_start"] - (p["full_cal_rows"] if annual
+                                        else p["rows_per_window"] * p["recal_windows_count"])
+            if e["is_start"] == smoke_is:
+                modes.add("smoke")
+            elif e["is_start"] == max(0, full_is):
+                modes.add("full")
+        mode = modes.pop() if len(modes) == 1 else "unknown"
+        return ledger, "explicit_ledger", mode
+
+    if expected_windows is not None:
+        n = int(expected_windows)
+        if n < 1:
+            raise RuntimeError(
+                f"Integrity Check Failed: --expected-windows must be >= 1, got {n}")
+        if chunk_set:
+            matches = _match_chunks(chunk_set)
+            exact = [m for m in matches if m[1] == n]
+            if len(exact) == 1:
+                mode, _, ledger = exact[0]
+                return ledger, "sliced_data_chunks+cli", mode
+            found = sorted({m[1] for m in matches})
+            raise RuntimeError(
+                f"Integrity Check Failed: sliced_data schedule "
+                f"{found if found else 'matches no valid schedule'} contradicts "
+                f"--expected-windows {n}. Reconcile the run directory or drop one of the specs."
+            )
+        # No chunk ledger: build from config arithmetic in full mode, but keep
+        # the smoke-mode IS alternative for manifest range checks (OOS ranges
+        # are mode-invariant, so contiguity validation is unaffected).
+        full_ledger = build_expected_ledger(config, n, smoke=False)
+        smoke_ledger = build_expected_ledger(config, n, smoke=True)
+        for fe, se in zip(full_ledger, smoke_ledger):
+            fe["is_start_alt"] = se["is_start"]
+        return full_ledger, "cli_expected_windows", "unknown"
+
+    # No explicit spec: derive from the scheduling artifact (chunk ledger).
+    if chunk_set:
+        matches = _match_chunks(chunk_set)
+        if len(matches) == 1:
+            mode, n, ledger = matches[0]
+            return ledger, "sliced_data_chunks", mode
+        if not matches:
+            raise RuntimeError(
+                f"Integrity Check Failed: the sliced_data chunk ledger in {wfv_path} "
+                f"matches no valid WFV schedule under the shared window arithmetic "
+                f"({len(chunk_set)} chunk(s)). Either the chunks were tampered with or "
+                f"config.json changed since the run. Supply --expected-windows N to state "
+                f"the intended window count explicitly."
+            )
+        raise RuntimeError(
+            f"Integrity Check Failed: the sliced_data chunk ledger matches multiple "
+            f"valid schedules ({[(m[0], m[1]) for m in matches]}); supply "
+            f"--expected-windows N to disambiguate."
+        )
+
+    raise RuntimeError(
+        f"Integrity Check Failed: cannot determine the expected window ledger for "
+        f"{wfv_path}: no --expected-windows was given and no wfv/sliced_data chunk "
+        f"ledger exists. State the run's intended window count with --expected-windows N "
+        f"(full run: config total_wfv_rows // rows_per_window; smoke run: 5; partial run: "
+        f"the count that run was scheduled to produce). Refusing to infer the expectation "
+        f"from the window directories on disk — that is the tautology this gate exists to prevent."
+    )
+
+
+def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
+                           config=None, data_csv=None) -> dict:
+    """Fail-closed integrity gate for a WFV run tree (P1-8).
+
+    Checks, in order:
+      1. Expected ledger resolved WITHOUT looking at window results
+         (explicit spec or sliced_data scheduling ledger; else fail closed).
+      2. Completeness: every expected window index exists exactly once;
+         duplicates, foreign/extra directories, malformed names → RuntimeError.
+      3. Terminal state: each window is either successful (has
+         backtest_results/summary_stats.json) or manifest-marked
+         NO_ADMISSIBLE_TRIAL (plain or CASCADE_SKIP variant). Neither →
+         RuntimeError; both → RuntimeError (contradiction).
+      4. Manifest provenance: strategy, window_index, label/regime, and IS/OOS
+         ranges match the ledger (half-open boundaries, shared arithmetic).
+      5. Successful-window provenance: calibration_results_<strategy>.json
+         exists and records the collated strategy; summary_stats signal_file
+         matches the strategy; wfv_decision.json survival records (where
+         recorded) carry strategy/window_index/is_seed/oos_seed matching
+         config backtesting_params.random_seed + window_index. Windows where
+         the seed is NOT recorded anywhere are listed in the report as
+         seed_unverified (documented gap for P2-2 — not a fake check).
+      6. Equity/ledger integrity per successful window: no duplicate
+         timestamps; the equity curve matches data.csv rows
+         [oos_start, oos_end) bar-for-bar (P0-6: starts exactly at the OOS
+         boundary, covers the full window, no pre-roll rows, no internal gaps).
+      7. Cross-window contiguity: overlap (first_ts <= last_ts) → RuntimeError
+         naming both windows and timestamps; gaps are only legitimate when they
+         correspond exactly to manifest-marked skipped windows' OOS spans —
+         verified against the ledger and recorded as explicit reported gaps.
+
+    Returns an integrity report dict. Raises RuntimeError on any violation.
+    """
+    wfv_path = Path(wfv_dir)
+    if not wfv_path.exists():
+        raise RuntimeError(f"Integrity Check Failed: WFV directory not found: {wfv_dir}")
+    config = config if config is not None else CONF
+    if strategy not in SIGNAL_FILE_PREFIXES:
+        raise RuntimeError(f"Integrity Check Failed: unknown strategy {strategy!r}")
+    data_csv = Path(data_csv) if data_csv else Path(__file__).resolve().parent / "data.csv"
+    if not data_csv.exists():
+        raise RuntimeError(
+            f"Integrity Check Failed: data.csv not found at {data_csv} — the integrity "
+            f"gate maps equity-curve timestamps onto ledger rows and requires it."
+        )
+
+    # --- 1. Expected ledger (never inferred from window results) ---
+    ledger, ledger_source, mode = _resolve_expected_ledger(wfv_path, expected_windows, config)
+    by_index = {e["index"]: e for e in ledger}
+
+    # --- 2. Discover window directories and check completeness ---
+    dirs_by_index = {}
+    for d in sorted(wfv_path.iterdir()):
+        if not d.is_dir():
+            continue
+        parsed = parse_window_dir_name(d.name)
+        if parsed is None:
+            if d.name.startswith("window_"):
+                raise RuntimeError(
+                    f"Integrity Check Failed: malformed window directory name '{d.name}' "
+                    f"(expected window_<i>_<annual_recal|monthly_refine>_<i>)"
+                )
+            continue  # sliced_data and other non-window dirs
+        idx, regime, recal_idx = parsed
+        dirs_by_index.setdefault(idx, []).append(d)
+
+    for idx in sorted(by_index):
+        found = dirs_by_index.get(idx, [])
+        if not found:
+            raise RuntimeError(f"Integrity Check Failed: Missing expected window {idx}")
+        if len(found) > 1:
+            raise RuntimeError(
+                f"Integrity Check Failed: Duplicate directories for window {idx}: "
+                f"{[d.name for d in found]}"
+            )
+    extra = sorted(set(dirs_by_index) - set(by_index))
+    if extra:
+        raise RuntimeError(
+            f"Integrity Check Failed: unexpected window director{'y' if len(extra) == 1 else 'ies'} "
+            f"not in the expected ledger (stale or foreign run content): "
+            f"{[dirs_by_index[i][0].name for i in extra]}"
+        )
+    for idx, found in dirs_by_index.items():
+        entry = by_index[idx]
+        d = found[0]
+        parsed = parse_window_dir_name(d.name)
+        regime = parsed[1]
+        # Canonical-name guard: the regex tolerates variants like zero-padded
+        # indices (window_03_...); the orchestrator only ever writes the exact
+        # canonical name, so anything else is malformed run content.
+        canonical = f"window_{idx}_{regime}_{parsed[2]}"
+        if d.name != canonical:
+            raise RuntimeError(
+                f"Integrity Check Failed: malformed window directory name '{d.name}' "
+                f"(canonical form is '{canonical}'; zero-padded or altered index "
+                f"spellings are rejected)"
+            )
+        if regime != entry["regime"]:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} regime mismatch: directory "
+                f"'{d.name}' is {regime} but the ledger expects {entry['regime']} "
+                f"(windows_per_full_recalibration={ledger_params(config)['full_recal_interval']})"
+            )
+        if parsed[2] != idx:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} directory '{d.name}' carries "
+                f"recalibration index {parsed[2]} != window index {idx} "
+                f"(orchestrator convention: both are the window index)"
+            )
+
+    # --- 3./4./5. Terminal state, manifest provenance, successful-window provenance ---
+    bp_seed = int(config["backtesting_params"]["random_seed"])
+    skipped = {}          # idx -> manifest
+    successful = {}       # idx -> window dir
+    seed_verified = []
+    seed_unverified = []
+
+    for idx in sorted(by_index):
+        entry = by_index[idx]
+        window_dir = dirs_by_index[idx][0]
+        manifest_path = window_dir / "manifest.json"
+        backtest_dir = window_dir / "backtest_results"
+        stats_path = backtest_dir / "summary_stats.json"
+
+        manifest = None
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, "r") as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} manifest.json unreadable: {e}"
+                )
+            status = manifest.get("status")
+            if status == NO_ADMISSIBLE_TRIAL_STATUS:
+                # P1-7 terminal state: explicit handled skip (plain or CASCADE_SKIP).
+                if stats_path.exists():
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} carries both a "
+                        f"NO_ADMISSIBLE_TRIAL manifest and backtest results "
+                        f"({stats_path}) — a skipped window must have no results"
+                    )
+                if list((window_dir / f"calibration_results_{strategy}.json").parent.glob(
+                        f"calibration_results_*.json")):
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} is manifest-skipped but "
+                        f"carries calibration results — P1-7 forbids results files for "
+                        f"inadmissible windows (config-default substitution risk)"
+                    )
+                if manifest.get("strategy") != strategy:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest strategy "
+                        f"{manifest.get('strategy')!r} does not match collated strategy {strategy!r}"
+                    )
+                if int(manifest.get("window_index", -1)) != idx:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest window_index "
+                        f"{manifest.get('window_index')} does not match directory index {idx}"
+                    )
+                expected_label = f"{entry['regime']}_{idx}"
+                if manifest.get("window_label") != expected_label:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest window_label "
+                        f"{manifest.get('window_label')!r} != expected {expected_label!r}"
+                    )
+                if (int(manifest.get("oos_start_row", -1)) != entry["oos_start"]
+                        or int(manifest.get("oos_end_row", -1)) != entry["oos_end"]):
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest OOS range "
+                        f"[{manifest.get('oos_start_row')},{manifest.get('oos_end_row')}) does not "
+                        f"match ledger OOS range [{entry['oos_start']},{entry['oos_end']})"
+                    )
+                if int(manifest.get("is_end_row", -1)) != entry["oos_start"]:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest is_end_row "
+                        f"{manifest.get('is_end_row')} != oos_start_row {entry['oos_start']} "
+                        f"(P0-5: IS window must end exactly where OOS starts)"
+                    )
+                acceptable_is = {entry["is_start"]}
+                if "is_start_alt" in entry:
+                    acceptable_is.add(entry["is_start_alt"])
+                if int(manifest.get("is_start_row", -1)) not in acceptable_is:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: window {idx} manifest is_start_row "
+                        f"{manifest.get('is_start_row')} does not match ledger IS start "
+                        f"{sorted(acceptable_is)}"
+                    )
+                skipped[idx] = manifest
+                continue
+            if status is not None:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} manifest status {status!r} is not "
+                    f"a recognized terminal state (expected {NO_ADMISSIBLE_TRIAL_STATUS})"
+                )
+            # status missing → fall through: treated as not-explicitly-skipped.
+
+        # Successful window: must have backtest results.
+        if not stats_path.exists():
+            raise RuntimeError(
+                f"Integrity Check Failed: Window {idx} is missing summary_stats.json "
+                f"and is not marked {NO_ADMISSIBLE_TRIAL_STATUS}"
+            )
+        successful[idx] = window_dir
+
+        # Provenance: calibration results (strategy identity).
+        cal_path = window_dir / f"calibration_results_{strategy}.json"
+        if not cal_path.exists():
+            foreign = [p.name for p in window_dir.glob("calibration_results_*.json")]
+            if foreign:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} carries calibration results for "
+                    f"a different strategy ({foreign}) while collating strategy {strategy!r} — "
+                    f"foreign run content"
+                )
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} has backtest results but no "
+                f"calibration_results_{strategy}.json — strategy/seed provenance unverifiable"
+            )
+        try:
+            with open(cal_path, "r") as f:
+                cal = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} calibration results unreadable: {e}"
+            )
+        cal_strategy = (cal.get("dataset_info") or {}).get("strategy")
+        if cal_strategy != strategy:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} calibration results record strategy "
+                f"{cal_strategy!r} != collated strategy {strategy!r}"
+            )
+
+        # Provenance: summary_stats signal_file prefix.
+        try:
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} summary_stats.json unreadable: {e}"
+            )
+        sig_file = str(stats.get("signal_file", ""))
+        if not sig_file.startswith(SIGNAL_FILE_PREFIXES[strategy]):
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} summary_stats signal_file "
+                f"{sig_file!r} does not match strategy {strategy!r} "
+                f"(expected prefix {SIGNAL_FILE_PREFIXES[strategy]!r})"
+            )
+
+        # Provenance: OOS seed where recorded (monthly survival audit records;
+        # annual windows record no seed — documented gap for P2-2).
+        decision_path = window_dir / "wfv_decision.json"
+        records = []
+        if decision_path.exists():
+            try:
+                for line in decision_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("event") == "survival_decision":
+                        records.append(rec)
+            except (json.JSONDecodeError, OSError) as e:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} wfv_decision.json unreadable: {e}"
+                )
+        if records:
+            rec = records[-1]
+            if rec.get("strategy") != strategy:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} survival audit record strategy "
+                    f"{rec.get('strategy')!r} != collated strategy {strategy!r}"
+                )
+            if int(rec.get("window_index", -1)) != idx:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} survival audit record window_index "
+                    f"{rec.get('window_index')} != directory index {idx}"
+                )
+            if int(rec.get("is_seed", -1)) != bp_seed:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} survival audit is_seed "
+                    f"{rec.get('is_seed')} != config backtesting_params.random_seed {bp_seed}"
+                )
+            expected_oos_seed = bp_seed + idx
+            if int(rec.get("oos_seed", -1)) != expected_oos_seed:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} survival audit oos_seed "
+                    f"{rec.get('oos_seed')} != expected {bp_seed}+{idx} = {expected_oos_seed} "
+                    f"(orchestrator OOS seed formula)"
+                )
+            seed_verified.append(idx)
+        else:
+            # 0-byte wfv_decision.json (annual windows / failed audit logger) is a
+            # tolerated pre-existing artifact — but the seed is then unverifiable.
+            seed_unverified.append(idx)
+
+    # --- 6a. Load equity timestamps + duplicate check ---
+    data_ts = _load_data_timestamps(data_csv)
+    n_data_rows = len(data_ts)
+    equity_ts = {}
+    for idx in sorted(successful):
+        entry = by_index[idx]
+        window_dir = successful[idx]
+        equity_path = window_dir / "backtest_results" / "equity_curve.csv"
+        if not equity_path.exists():
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} has summary_stats.json but no "
+                f"equity_curve.csv — incomplete backtest artifacts"
+            )
+        if entry["oos_end"] > n_data_rows:
+            raise RuntimeError(
+                f"Integrity Check Failed: ledger OOS range [{entry['oos_start']},{entry['oos_end']}) "
+                f"for window {idx} exceeds data.csv ({n_data_rows} rows) — ledger/data mismatch"
+            )
+        ts = _parse_equity_timestamps(equity_path)
+        equity_ts[idx] = ts
+        uniq, counts = np.unique(ts, return_counts=True)
+        if len(uniq) < len(ts):
+            dup_vals = sorted(str(t) for t, c in zip(uniq, counts) if c > 1)[:5]
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} equity_curve.csv contains duplicate "
+                f"timestamps: {dup_vals}"
+            )
+
+    # --- 6b. Cross-window overlap (checked before the bar-for-bar comparison so
+    # an overlap reports BOTH windows and both timestamps, per the spec) ---
+    succ_sorted = sorted(successful)
+    for a, b in zip(succ_sorted, succ_sorted[1:]):
+        last_ts = equity_ts[a][-1]
+        first_ts = equity_ts[b][0]
+        if first_ts <= last_ts:
+            raise RuntimeError(
+                f"Integrity Check Failed: Timestamp overlap or invalid sequence between "
+                f"window {a} ({dirs_by_index[a][0].name}) (ends {last_ts}) and "
+                f"window {b} ({dirs_by_index[b][0].name}) (starts {first_ts})."
+            )
+
+    # --- 6c. Equity ↔ ledger bar-for-bar verification (P0-6 boundary rule:
+    # equity starts exactly at the OOS boundary, covers the full window, no
+    # pre-roll rows, no internal gaps, no truncation) ---
+    for idx in sorted(successful):
+        entry = by_index[idx]
+        ts = equity_ts[idx]
+        expected = data_ts[entry["oos_start"]:entry["oos_end"]]
+        if len(ts) != len(expected):
+            # Report the first divergence for an actionable message.
+            k = min(len(ts), len(expected))
+            mismatch = np.nonzero(ts[:k] != expected[:k])[0]
+            at = int(mismatch[0]) if len(mismatch) else k
+            got = str(ts[at]) if at < len(ts) else "<missing bar>"
+            exp = str(expected[at]) if at < len(expected) else "<beyond window>"
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} equity curve has {len(ts)} bars but the "
+                f"ledger OOS span [{entry['oos_start']},{entry['oos_end']}) has {len(expected)}; "
+                f"first divergence at bar {at}: expected data row {entry['oos_start'] + at} "
+                f"({exp}), found {got}"
+            )
+        mismatch = np.nonzero(ts != expected)[0]
+        if len(mismatch):
+            at = int(mismatch[0])
+            run = 1
+            while run < len(mismatch) and mismatch[run] == mismatch[run - 1] + 1:
+                run += 1
+            suffix = f" ({run} consecutive mismatched bars from that point)" if run > 1 else ""
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} equity curve does not match the ledger "
+                f"OOS span bar-for-bar: first divergence at bar {at} "
+                f"(data row {entry['oos_start'] + at}): expected {expected[at]}, found {ts[at]}"
+                f"{suffix}"
+            )
+
+    # --- 7. Explicit gap verification + reporting (overlap already failed closed
+    # in 6b, which names both windows; this reuses 6b's succ_sorted ordering) ---
+    gaps = []
+    for a, b in zip(succ_sorted, succ_sorted[1:]):
+        last_ts = equity_ts[a][-1]
+        first_ts = equity_ts[b][0]
+        between = [i for i in range(a + 1, b) if i in skipped]
+        gap_rows_start = by_index[a]["oos_end"]
+        gap_rows_end = by_index[b]["oos_start"]
+        expected_gap_rows = sum(by_index[i]["oos_end"] - by_index[i]["oos_start"] for i in between)
+        actual_gap_rows = gap_rows_end - gap_rows_start
+        if actual_gap_rows != expected_gap_rows:
+            raise RuntimeError(
+                f"Integrity Check Failed: gap between window {a} (ends {last_ts}) and window {b} "
+                f"(starts {first_ts}) spans {actual_gap_rows} data rows but the manifest-marked "
+                f"skipped windows {between} account for {expected_gap_rows} — gap does not match "
+                f"the skipped windows' ledger boundaries"
+            )
+        if between:
+            gap = {
+                "after_window": a,
+                "before_window": b,
+                "skipped_windows": between,
+                "gap_first_data_row": gap_rows_start,
+                "gap_last_data_row": gap_rows_end - 1,
+                "gap_bars": actual_gap_rows,
+                "gap_start_ts": str(data_ts[gap_rows_start]),
+                "gap_end_ts": str(data_ts[gap_rows_end - 1]),
+            }
+            gaps.append(gap)
+            print(f"[Integrity] Explicit reported gap: window {a} -> window {b}; skipped "
+                  f"window(s) {between}; data rows [{gap_rows_start},{gap_rows_end}) "
+                  f"({gap['gap_bars']} bars, {gap['gap_start_ts']} .. {gap['gap_end_ts']})")
+
+    cascade = sorted(i for i, m in skipped.items()
+                     if str(m.get("error", "")).startswith("CASCADE_SKIP"))
+    report = {
+        "passed": True,
+        "ledger_source": ledger_source,
+        "mode": mode,
+        "expected_window_count": len(ledger),
+        "expected_indices": sorted(by_index),
+        "successful_window_indices": succ_sorted,
+        "skipped_window_indices": sorted(skipped),
+        "skipped_manifest_variants": {
+            i: ("CASCADE_SKIP" if i in cascade else NO_ADMISSIBLE_TRIAL_STATUS)
+            for i in sorted(skipped)
+        },
+        "explicit_gaps": gaps,
+        "seed_verified_windows": seed_verified,
+        "seed_unverified_windows": seed_unverified,
+        "data_csv": str(data_csv),
+    }
+    print(f"[Integrity Check] PASSED: {len(ledger)} window(s) validated "
+          f"({len(succ_sorted)} successful, {len(skipped)} manifest-skipped, "
+          f"{len(gaps)} explicit gap(s)); ledger source: {ledger_source}, mode: {mode}.")
+    if seed_unverified:
+        print(f"[Integrity Check] NOTE: OOS seed unverifiable for windows {seed_unverified} "
+              f"(no survival audit record written — annual windows record no seed; flagged for P2-2).")
+    return report
+
+
+
 def aggregate_audit_logs(wfv_dir, output_dir):
     """Aggregate per-window survival-decision audit records into one JSONL file (P1-5).
 
@@ -215,11 +809,44 @@ def aggregate_audit_logs(wfv_dir, output_dir):
     return master_path, records
 
 
-def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
+def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
+                    expected_windows=None, data_csv=None):
+    # --- P1-8 INTEGRITY GATE — VERY FIRST STEP, before the baseline handshake
+    # and before any concatenation. Fail closed: any violation raises
+    # RuntimeError and no collated report is produced (docs/P1-8_collation_integrity.md).
+    integrity_report = validate_wfv_integrity(
+        wfv_dir, strategy, expected_windows=expected_windows,
+        config=CONF, data_csv=data_csv)
+
     if output_dir is None:
         output_dir = f'collated_wfv_results_{strategy}'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
+
+    # --- P1-8 cross-check: a skipped_windows.csv left over from a PREVIOUS
+    # collation must agree with the manifests the gate just read. A stale skip
+    # ledger from a different run is an integrity failure, not a leftover.
+    # Naming resolution (P1-7 review §R-G): skipped_windows.csv lists skipped
+    # WINDOWS (orchestrator NO_ADMISSIBLE_TRIAL manifests);
+    # collated_skipped_signals.csv lists bar-level skipped SIGNALS inside
+    # successful windows' backtests. The two are different concepts and are
+    # never conflated.
+    stale_ledger = Path(output_dir) / 'skipped_windows.csv'
+    if stale_ledger.exists():
+        try:
+            prev = pd.read_csv(stale_ledger)
+            prev_idx = sorted(int(w) for w in prev['window_idx'])
+        except (OSError, ValueError, KeyError) as e:
+            raise RuntimeError(
+                f"Integrity Check Failed: existing skip ledger {stale_ledger} is unreadable: {e}"
+            )
+        if prev_idx != integrity_report['skipped_window_indices']:
+            raise RuntimeError(
+                f"Integrity Check Failed: skip ledger mismatch — existing {stale_ledger} records "
+                f"windows {prev_idx} but the manifests in this run mark "
+                f"{integrity_report['skipped_window_indices']}. The output directory is stale "
+                f"for this WFV tree; clear it or use a fresh --output-dir."
+            )
+
     # --- Run baseline (native behavior, always) ---
     print(f"[baseline] Starting baseline signal generation + backtest (strategy={strategy})...")
     baseline_data = _run_baseline(output_dir, strategy)
@@ -384,6 +1011,16 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
     # --- P1-7: persist explicitly-skipped windows (visibility, not fabrication) ---
     # Written before any early return below so the skip ledger survives even if
     # equity reconstruction finds nothing to collate.
+    # P1-8 cross-check: the skips recorded by the window loop must match the
+    # manifest-derived skip set from the integrity gate — manifests are the
+    # single source of truth (P1-7 review §R-L); any divergence is a bug.
+    loop_skip_idx = sorted(w['window_idx'] for w in skipped_windows)
+    if loop_skip_idx != integrity_report['skipped_window_indices']:
+        raise RuntimeError(
+            f"Integrity Check Failed: collation skip records {loop_skip_idx} disagree with "
+            f"the integrity gate's manifest-derived skip set "
+            f"{integrity_report['skipped_window_indices']} — internal divergence, refusing to collate"
+        )
     if skipped_windows:
         skipped_csv_path = os.path.join(output_dir, 'skipped_windows.csv')
         pd.DataFrame(skipped_windows).to_csv(skipped_csv_path, index=False)
@@ -458,6 +1095,11 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
     
     if all_trades: pd.concat(all_trades).to_csv(os.path.join(output_dir, 'collated_trades.csv'), index=False)
     if all_executions: pd.concat(all_executions).to_csv(os.path.join(output_dir, 'collated_executions.csv'), index=False)
+    # Naming resolution (P1-8, P1-7 review §R-G): this file concatenates the
+    # per-window backtest skipped_signals.csv — bar-level skipped SIGNALS inside
+    # SUCCESSFUL windows. It is NOT the window-level skip ledger
+    # (skipped_windows.csv, NO_ADMISSIBLE_TRIAL manifests). Different concepts,
+    # different files, never conflated.
     if all_skipped: pd.concat(all_skipped).to_csv(os.path.join(output_dir, 'collated_skipped_signals.csv'), index=False)
     if all_daily_returns: pd.concat(all_daily_returns).to_csv(os.path.join(output_dir, 'collated_daily_returns.csv'), index=False)
     
@@ -565,9 +1207,18 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm'):
                 'regimes': list(set(d['regime'] for d in window_diagnostics)),
                 # P1-7: explicit skip visibility — NO_ADMISSIBLE_TRIAL windows
                 # are handled skips, not missing data. P1-8 integrity validation
-                # must accept these as explicitly-handled windows.
+                # accepts these as explicitly-handled windows and cross-checks
+                # them against the gate's manifest-derived skip set.
                 'skipped_windows_count': len(skipped_windows),
                 'skipped_windows': skipped_windows,
+                # P1-8: full integrity gate report (expected ledger provenance,
+                # explicit gap records, seed verification coverage). The gate ran
+                # as the very first step of collate_results and passed.
+                'integrity': integrity_report,
+                # Naming disambiguation: bar-level skipped SIGNALS rows inside
+                # successful windows (collated_skipped_signals.csv) vs the
+                # window-level skips above.
+                'collated_skipped_signals_rows': int(sum(len(df) for df in all_skipped)),
             },
             'aggregates': aggregates,
             'per_window_diagnostics': window_diagnostics,
@@ -678,5 +1329,16 @@ if __name__ == "__main__":
                         help="Strategy to use for baseline comparison (default: vm)")
     parser.add_argument("--wfv-dir", default="wfv", help="WFV output directory")
     parser.add_argument("--output-dir", default=None, help="Output directory for collated results (default: collated_wfv_results_<strategy>)")
+    parser.add_argument("--expected-windows", type=int, default=None,
+                        help="Number of windows the run under validation was scheduled to "
+                             "produce (P1-8 integrity gate). When omitted, the gate derives the "
+                             "expected ledger from wfv/sliced_data (the orchestrator's scheduling "
+                             "artifact); if that is absent too, collation fails closed. Never "
+                             "inferred from the window directories found on disk.")
+    parser.add_argument("--data-csv", default=None,
+                        help="data.csv used to map equity timestamps onto ledger rows "
+                             "(default: v6/data.csv)")
     args = parser.parse_args()
-    collate_results(wfv_dir=args.wfv_dir, output_dir=args.output_dir, strategy=args.strategy)
+    collate_results(wfv_dir=args.wfv_dir, output_dir=args.output_dir, strategy=args.strategy,
+                    expected_windows=args.expected_windows, data_csv=args.data_csv)
+
