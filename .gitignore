@@ -14,6 +14,11 @@ optuna_db/
 *_log.txt
 *.log
 *_smoke.csv
+# P2-1: test-mode signal CSVs written to the v6 root by the three generators
+# during CLI verification (`--mode test`). Generated artifacts, not sources.
+# The tracked v6/vm_automation_logic_signals_test.csv is unaffected (gitignore
+# never applies to already-tracked files).
+v6/*_signals_test.csv
 v6/output.txt
 output_*.txt
 collated_wfv_results*/

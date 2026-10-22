@@ -21,8 +21,7 @@
     "take_profit_usd_per_oz": 40.0,
     "trailing_stop_usd_per_oz": 8.0,
     "max_hold_bars": 60,
-    "bars_per_year": 362880,
-    "warmup_bars": 500
+    "bars_per_year": 362880
   },
   "tv_strategy_params": {
     "tdi_rsi_period": 14,
@@ -226,7 +225,6 @@
   },
   "data_config": {
     "total_rows": 4000000,
-    "data_start_row": 0,
-    "wfv_total_rows": 4000000
+    "data_start_row": 0
   }
 }

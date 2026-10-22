@@ -131,10 +131,14 @@ def load_data(
     elif mode == "smoke":
         gpu_df = load_csv(str(source), nrows=50_000)
     elif mode == "test":
+        # P2-1: derived from the surviving primitives (data_start_row +
+        # total_rows); `wfv_start_row`/`wfv_total_rows` were deleted from
+        # config.json as redundant duplicates of these.
+        data_start_row = DATA_CONF.get("data_start_row", 0)
         gpu_df = load_csv(
             str(source),
-            skiprows=DATA_CONF["wfv_start_row"],
-            nrows=DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"],
+            skiprows=data_start_row,
+            nrows=DATA_CONF["total_rows"] - data_start_row,
         )
     else:
         gpu_df = load_csv(str(source))

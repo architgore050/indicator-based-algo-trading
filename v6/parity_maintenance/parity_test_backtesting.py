@@ -33,7 +33,7 @@ import pandas as pd
 #      divergence must lie in the warmup region, be exit-side only, show the
 #      live risk exit firing EARLIER than the baseline indicator exit, and
 #      match EXPECTED_WARMUP_DIVERGENCES exactly. Any other divergence fails.
-BASELINE_WARMUP_BARS = 500  # bypass value the .bak baseline encodes (config.json warmup_bars at P0-6 time; P2-1 removes the config key)
+BASELINE_WARMUP_BARS = 500  # bypass value the .bak baseline encodes (config.json warmup_bars at P0-6 time; P2-1 removed the config key — see _bak_warmup_compat below)
 
 RISK_EXIT_REASONS = {"stop_loss", "take_profit", "trailing_stop", "max_hold_bars", "margin_call"}
 
@@ -84,6 +84,52 @@ def load_data(end_row: int = 50000) -> pd.DataFrame:
     return data.sort_values("timestamp").reset_index(drop=True)
 
 
+def _bak_warmup_compat(ns: dict, live_mod) -> None:
+    """P2-1: re-inject `warmup_bars` into the BACKUP leg's config dict only.
+
+    Why this is needed: the protected `.bak` backtester caches
+    `warmup_bars = BP["warmup_bars"]` and gates every risk/margin check behind
+    `if i >= warmup_bars:`. That bypass IS the pre-P0-6 behavior the `.bak`
+    baseline exists to represent, and `.bak` files may not be edited. P2-1
+    deleted `backtesting_params.warmup_bars` from config.json (the key was dead
+    for live code since P0-6 removed the bypass), so without this injection the
+    backup leg would crash with `KeyError: 'warmup_bars'` before any comparison
+    could run.
+
+    What is injected: `BASELINE_WARMUP_BARS` (500) — exactly the value config.json
+    carried when the P0-6 divergence expectations (EXPECTED_WARMUP_DIVERGENCES)
+    were derived, so the backup leg behaves bit-for-bit as it did before P2-1.
+
+    Why it cannot weaken the comparison (neutrality proof):
+      1. Scope: it is written into the backup module's OWN BP dict. The `.bak`
+         source rebinds `BP = CONF["backtesting_params"]` at module level during
+         exec(), so after exec `ns["BP"]` is a fresh dict loaded by the `.bak`'s
+         own load_config(); the guard below asserts it is NOT the live module's
+         BP object, so the live leg is provably untouched.
+      2. Reachability: the injected key is read by exactly one statement in the
+         `.bak` (`warmup_bars = BP["warmup_bars"]`) and that statement feeds only
+         the `if i >= warmup_bars:` bypass. The LIVE backtester has no warmup code
+         path at all (P0-6 removed it; test/test_risk_on_first_bar.py proves risk
+         exits fire on bar 1 even when a cfg dict carries warmup_bars=500), so the
+         injection cannot alter any live-side result.
+      3. Direction of effect: injecting 0 would silently erase the documented
+         warmup divergence and turn the two-stage fail-closed audit into a
+         trivially-passing equality check. Injecting 500 preserves the baseline's
+         original semantics, so the divergence audit measures the same thing it
+         measured before P2-1.
+    """
+    bak_bp = ns.get("BP")
+    if not isinstance(bak_bp, dict):
+        return
+    if "warmup_bars" not in bak_bp:
+        if bak_bp is live_mod.BP:
+            raise RuntimeError(
+                "P2-1 warmup compat aborted: the .bak leg shares the LIVE module's BP "
+                "dict, so injecting warmup_bars would contaminate the live leg"
+            )
+        bak_bp["warmup_bars"] = BASELINE_WARMUP_BARS
+
+
 def _load_module_from_bak(bak_path: Path, module_name: str):
     """Load a Python module from a .bak file using exec(), reusing
     the live module's imports and helper functions."""
@@ -132,6 +178,10 @@ def _load_module_from_bak(bak_path: Path, module_name: str):
             ns[name] = getattr(live_mod, name)
 
     exec(code, ns)
+
+    # P2-1: the .bak leg needs `warmup_bars` back in its own config dict (the key
+    # was deleted from config.json). Backup leg only — see _bak_warmup_compat.
+    _bak_warmup_compat(ns, live_mod)
 
     # Extract functions/classes into a clean module-like object
     class _Mod:

@@ -233,8 +233,13 @@ class TestRealConfigArithmetic(unittest.TestCase):
         data_conf = self.config["data_config"]
         self.assertNotIn("wfv_start_row", data_conf,
                          "wfv_start_row must be removed from config.json (P0-5)")
+        self.assertNotIn("wfv_total_rows", data_conf,
+                         "wfv_total_rows must be removed from config.json (P2-1: "
+                         "it duplicated data_config.total_rows)")
         self.assertIn("data_start_row", data_conf,
                       "data_start_row must be present in config.json (P0-5)")
+        self.assertIn("total_rows", data_conf,
+                      "total_rows must be present in config.json (P2-1 single source)")
 
     def test_derived_oos_start_base_and_first_window(self):
         data_conf = self.config["data_config"]
@@ -244,13 +249,21 @@ class TestRealConfigArithmetic(unittest.TestCase):
         rows_per_window = wfv_conf["rows_per_window"]
         recal_windows_count = wfv_conf["recalibration_windows"]
         full_recal_interval = wfv_conf["windows_per_full_recalibration"]
-        total_windows = data_conf["wfv_total_rows"] // rows_per_window
+        # P2-1: window count derives from data_config.total_rows (the surviving
+        # primitive). wfv_config.total_wfv_rows (the P1-8 ledger key) carries the
+        # same value; data_config.wfv_total_rows was deleted as a duplicate.
+        total_windows = data_conf["total_rows"] // rows_per_window
         oos_start_base = data_start_row + full_cal_rows
 
-        # NOTE: with the current config, the FULL-mode requirement
-        # (oos_start_base + total_windows * rows_per_window = 4,358,880) exceeds
-        # total_rows (4,000,000) — full-mode runs are expected to fail fast by
-        # design until the WFV window budget is reconciled (task P2-1).
+        # NOTE (P2-1, quantified but DELIBERATELY UNRESOLVED): with the current
+        # config the FULL-mode requirement
+        #   oos_start_base + total_windows * rows_per_window
+        #   = 362,880 + 185 * 21,600 = 4,358,880
+        # exceeds data_config.total_rows (4,000,000), so a full-mode run fails
+        # fast by design (P0-5). The maximum window count the CSV can actually
+        # fund is 168 (see test_full_run_row_budget_is_quantified). The developer
+        # must choose how to reconcile this — see docs/P2-1_config_single_source.md
+        # ("Full-run budget conflict"). P2-1 changed no values.
         # Smoke mode caps to 5 windows and must fit:
         smoke_windows = min(total_windows, 5)
         self.assertLessEqual(oos_start_base + smoke_windows * rows_per_window,
@@ -274,7 +287,10 @@ class TestRealConfigArithmetic(unittest.TestCase):
         rows_per_window = wfv_conf["rows_per_window"]
         recal_windows_count = wfv_conf["recalibration_windows"]
         full_recal_interval = wfv_conf["windows_per_full_recalibration"]
-        total_windows = data_conf["wfv_total_rows"] // rows_per_window
+        # P2-1: window count derives from data_config.total_rows (the surviving
+        # primitive). wfv_config.total_wfv_rows (the P1-8 ledger key) carries the
+        # same value; data_config.wfv_total_rows was deleted as a duplicate.
+        total_windows = data_conf["total_rows"] // rows_per_window
         oos_start_base = data_start_row + full_cal_rows
 
         ranges = [
@@ -289,6 +305,47 @@ class TestRealConfigArithmetic(unittest.TestCase):
             self.assertEqual(oos_end - oos_start, rows_per_window)
             self.assertEqual(is_end, oos_start)
             self.assertGreaterEqual(is_start, 0)
+
+    def test_full_run_row_budget_is_quantified(self):
+        """P2-1: pin the full-run budget conflict so it cannot hide.
+
+        The conflict is a DEVELOPER decision, not a code fix: P2-1 deleted the
+        duplicate keys but changed no numerical value. This test records the
+        exact arithmetic so a later reconciliation (fewer windows / shorter
+        annual IS / more data) is caught as a deliberate, reviewed change
+        instead of a silent drift. See docs/P2-1_config_single_source.md.
+        """
+        data_conf = self.config["data_config"]
+        wfv_conf = self.config["calibration_params"]["wfv_config"]
+        rows_per_window = wfv_conf["rows_per_window"]
+        full_cal_rows = self.config["calibration_params"]["calibration_rows_per_trial"]
+        total_rows = data_conf["total_rows"]
+        oos_start_base = data_conf.get("data_start_row", 0) + full_cal_rows
+
+        # The P1-8 ledger key is a DIFFERENT key and must survive P2-1.
+        self.assertIn("total_wfv_rows", wfv_conf,
+                      "wfv_config.total_wfv_rows must survive (P1-8 ledger arithmetic)")
+        self.assertEqual(wfv_conf["total_wfv_rows"], total_rows,
+                         "wfv_config.total_wfv_rows and data_config.total_rows must "
+                         "agree while both exist (they are the duplicated pair P2-1 flags)")
+
+        config_windows = wfv_conf["total_wfv_rows"] // rows_per_window      # 185
+        required_full = oos_start_base + config_windows * rows_per_window   # 4,358,880
+        feasible_windows = (total_rows - oos_start_base) // rows_per_window  # 168
+
+        self.assertEqual(oos_start_base, 362_880)
+        self.assertEqual(config_windows, 185)
+        self.assertEqual(required_full, 4_358_880)
+        self.assertEqual(total_rows, 4_000_000)
+        self.assertEqual(feasible_windows, 168)
+        self.assertGreater(required_full, total_rows,
+                           "the documented full-run budget conflict must still exist "
+                           "(if it no longer does, update docs/P2-1_config_single_source.md "
+                           "and this test together)")
+        print(f"\n  P2-1 BUDGET CONFLICT (unresolved, developer decision): "
+              f"full run needs {required_full:,} rows but total_rows={total_rows:,} "
+              f"-> config implies {config_windows} windows, CSV funds at most "
+              f"{feasible_windows}. data.csv on disk has 4,044,188 rows -> 170 max.")
 
 
 if __name__ == "__main__":

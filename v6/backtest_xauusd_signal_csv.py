@@ -135,10 +135,14 @@ def load_market_data(mode: str, start_row: int = 0, end_row: int = None, data_cs
         read_kwargs["nrows"] = 50000
         logger.info("Loading 50,000 rows (SMOKE mode)")
     elif mode == "test":
-        # Held-out set (WFV range)
-        read_kwargs["skiprows"] = range(1, DATA_CONF["wfv_start_row"] + 1)
-        read_kwargs["nrows"] = DATA_CONF["wfv_total_rows"] - DATA_CONF["wfv_start_row"]
-        logger.info(f"Loading held-out test set ({DATA_CONF['wfv_total_rows'] - DATA_CONF['wfv_start_row']:,} rows starting from {DATA_CONF['wfv_start_row']:,})")
+        # Held-out set (WFV range). P2-1: derived from the surviving primitives
+        # (data_start_row + total_rows); `wfv_start_row`/`wfv_total_rows` were
+        # deleted from config.json as redundant duplicates of these.
+        data_start_row = DATA_CONF.get("data_start_row", 0)
+        total_rows = DATA_CONF["total_rows"]
+        read_kwargs["skiprows"] = range(1, data_start_row + 1)
+        read_kwargs["nrows"] = total_rows - data_start_row
+        logger.info(f"Loading held-out test set ({total_rows - data_start_row:,} rows starting from {data_start_row:,})")
     else:
         logger.info("Loading full market dataset (4M rows)")
 

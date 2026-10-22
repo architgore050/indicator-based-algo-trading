@@ -716,7 +716,10 @@ def main():
     full_cal_rows = CALIB_PARAMS["calibration_rows_per_trial"]
     oos_start_base = data_start_row + full_cal_rows
     rows_per_window = WFV_CONF["rows_per_window"]
-    total_wfv_rows = DATA_CONF["wfv_total_rows"]
+    # P2-1: single source of truth. `data_config.wfv_total_rows` was deleted —
+    # it duplicated `data_config.total_rows`. The WFV schedule spans the whole
+    # CSV, so the row budget IS total_rows.
+    total_wfv_rows = DATA_CONF["total_rows"]
     recal_windows_count = WFV_CONF["recalibration_windows"]
     full_recal_interval = WFV_CONF["windows_per_full_recalibration"]
     pre_roll_bars = compute_pre_roll_bars()

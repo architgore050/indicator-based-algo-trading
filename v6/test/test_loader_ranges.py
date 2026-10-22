@@ -27,6 +27,12 @@ spurious failures). The fixture source-audit checks below double as a
 provenance guard: if a fixture is ever replaced with fixed code, they fail
 loudly instead of silently proving nothing.
 
+P2-1 adds the `--mode test` (no explicit rows) branch for all four loaders: the
+informational `probe_mode_test_keyerror` NOTEs became hard assertions
+(`assert_mode_test_loaders`) once `wfv_start_row`/`wfv_total_rows` were deleted
+from config.json and every `--mode test` branch derived its range from
+`data_start_row` + `total_rows`.
+
 Run from v6/ inside the rapids venv:
     CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB \
       timeout 1800 python -u test/test_loader_ranges.py > tmp/test_loader_ranges.txt 2>&1
@@ -39,8 +45,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import io
+import json
+import re
 import shutil
 import sys
+import tokenize
 from pathlib import Path
 
 import pandas as pd
@@ -186,9 +196,15 @@ def test_backtester() -> None:
     assert_slice("backtester", df, expected, next_row)
 
 
-def install_scratch_copy(mod_name: str, scratch_dir: Path, source: str) -> Path:
+def install_scratch_copy(mod_name: str, scratch_dir: Path, source: str,
+                         patch_data_config: dict | None = None) -> Path:
     """Copy a generator (pre-P1-2 fixture or current working-tree version) into
-    a scratch dir together with the config.json it loads at import time."""
+    a scratch dir together with the config.json it loads at import time.
+
+    P2-1: `patch_data_config` optionally overrides keys in the copied config's
+    `data_config` block (used to prove the derived --mode test range actually
+    drives the read). The real v6/config.json is never modified.
+    """
     scratch_dir.mkdir(parents=True, exist_ok=True)
     if source == "FIXTURE":
         fixture = FIXTURES_DIR / f"{mod_name}.py"
@@ -202,7 +218,12 @@ def install_scratch_copy(mod_name: str, scratch_dir: Path, source: str) -> Path:
         text = (V6_DIR / f"{mod_name}.py").read_text()
     dest = scratch_dir / f"{mod_name}.py"
     dest.write_text(text)
-    shutil.copy(V6_DIR / "config.json", scratch_dir / "config.json")
+    if patch_data_config:
+        conf = json.loads((V6_DIR / "config.json").read_text())
+        conf["data_config"].update(patch_data_config)
+        (scratch_dir / "config.json").write_text(json.dumps(conf, indent=2))
+    else:
+        shutil.copy(V6_DIR / "config.json", scratch_dir / "config.json")
     return dest
 
 
@@ -309,30 +330,101 @@ def test_pre_fix_proof(skip_smoke_proof: bool) -> None:
          f"~15.5/16.3 GiB VRAM, so the proof uses fixtures.")
 
 
-def probe_mode_test_keyerror() -> None:
-    """Document (do not fail) the shared latent KeyError in the --mode test branch.
+def assert_mode_test_loaders() -> None:
+    """P2-1 CONVERSION: the `--mode test` branch must now RESOLVE in all four loaders.
 
-    config.json has no `wfv_start_row` (removed by P0-5), so `--mode test`
-    WITHOUT explicit --start-row/--end-row raises KeyError in all three
-    generators and the backtester. Same root cause as the backtester finding
-    already tracked as P2-1; out of scope for P1-2.
+    This was previously `probe_mode_test_keyerror()`, which only recorded the
+    shared latent KeyError as an informational NOTE. P0-5 had already deleted
+    `wfv_start_row` from config.json while all four `--mode test` branches still
+    read it, so `--mode test` WITHOUT explicit --start-row/--end-row raised
+    `KeyError('wfv_start_row')` in the three generators and the backtester — and
+    in the collator's baseline handshake, which calls exactly that path. P2-1
+    derives the range from the surviving primitives (data_start_row + total_rows).
+    The NOTEs are now hard assertions: the sites must succeed.
+
+    Proof strategy (low-VRAM safe, and stronger than "it did not crash"):
+      (a) static audit — live source must not reference the deleted keys and must
+          contain the derived formula;
+      (b) production-path run — scratch copy + the REAL config.json + a small
+          fixture data.csv, called with no explicit rows. The derived nrows
+          (4,000,000) exceeds the fixture, so the loader returns the whole
+          fixture: the real production branch executes without a 4M-row GPU load;
+      (c) derived-value proof — scratch copy with a patched small total_rows
+          (3,000) against the same 5,000-row fixture must return EXACTLY 3,000
+          rows, proving the derived range actually drives the read rather than
+          being computed and discarded.
     """
-    print("\n--- latent --mode test KeyError (informational, P2-1 scope) ---")
-    for name, mod_name in GENERATORS.items():
-        mod = import_live(mod_name)
+    print("\n--- P2-1: --mode test loaders (converted NOTE -> hard assertions) ---")
+
+    live_conf = json.loads((V6_DIR / "config.json").read_text())
+    data_conf = live_conf["data_config"]
+    for gone in ("wfv_start_row", "wfv_total_rows"):
+        check(gone not in data_conf, f"config.json: '{gone}' absent (P2-1 deletion)")
+    check(data_conf.get("data_start_row") == 0, "config.json: data_start_row == 0")
+    check(data_conf["total_rows"] == 4_000_000, "config.json: total_rows == 4,000,000")
+    derived_rows = data_conf["total_rows"] - data_conf.get("data_start_row", 0)
+    check(derived_rows == 4_000_000, f"derived --mode test span == 4,000,000 (got {derived_rows:,})")
+
+    fixture_rows = 5_000
+    fixture_start = END - fixture_rows
+    patched_rows = 3_000
+
+    loaders = [(name, mod_name) for name, mod_name in GENERATORS.items()]
+    loaders.append(("backtester", "backtest_xauusd_signal_csv"))
+
+    for name, mod_name in loaders:
+        print(f"  [{name}] --mode test (no explicit rows)")
+
+        # (a) static audit of the LIVE source. Comments are stripped first:
+        # P2-1 repair comments deliberately NAME the deleted keys to document
+        # why the range is now derived; only executable references must be gone.
+        src = (V6_DIR / f"{mod_name}.py").read_text()
+        code = "".join(tok.string for tok in tokenize.generate_tokens(io.StringIO(src).readline)
+                       if tok.type != tokenize.COMMENT)
+        for gone in ("wfv_start_row", "wfv_total_rows"):
+            check(gone not in code, f"{name}: live source has no executable reference to '{gone}'")
+        check(re.search(r"""total_rows.{0,4}-\s*data_start_row""", src),
+              f"{name}: live source derives the test range from total_rows - data_start_row")
+        check(re.search(r"""data_start_row\s*=\s*DATA_CONF\.get\(["']data_start_row["'],\s*0\)""", src),
+              f"{name}: live source reads data_start_row from DATA_CONF (surviving primitive)")
+
+        # (b) production path with the REAL config.json
+        real_dir = V6_DIR / "tmp" / "mode_test" / name
+        real_mod = import_scratch(install_scratch_copy(mod_name, real_dir, "WORKING"),
+                                  f"scratch_real_{name}")
+        place_fixture(real_dir, fixture_start, fixture_rows)
+        check(dict(real_mod.DATA_CONF) == data_conf,
+              f"{name}: scratch copy loaded the real config.json data_config")
         try:
-            mod.load_data("test")
-            note(f"{name}: --mode test with no explicit rows did NOT raise (unexpected)")
+            df = (real_mod.load_market_data("test") if name == "backtester"
+                  else real_mod.load_data("test"))
         except KeyError as exc:
-            note(f"{name}: --mode test with no explicit rows raises KeyError({exc}) "
-                 f"— wfv_start_row absent from config.json (P2-1 scope)")
-    bt = import_live("backtest_xauusd_signal_csv")
-    try:
-        bt.load_market_data("test")
-        note("backtester: --mode test with no explicit rows did NOT raise (unexpected)")
-    except KeyError as exc:
-        note(f"backtester: --mode test with no explicit rows raises KeyError({exc}) "
-             f"— wfv_start_row absent from config.json (P2-1 scope)")
+            fail(f"{name}: --mode test with no explicit rows raised KeyError({exc})")
+        else:
+            got = len(df)
+            check(got == fixture_rows,
+                  f"{name}: --mode test resolved (no KeyError) and read the whole "
+                  f"{fixture_rows:,}-row fixture (derived nrows={derived_rows:,} > fixture) "
+                  f"-> {got:,} rows")
+
+        # (c) derived range must actually drive the read
+        patched_dir = V6_DIR / "tmp" / "mode_test_patched" / name
+        patched_mod = import_scratch(
+            install_scratch_copy(mod_name, patched_dir, "WORKING",
+                                 patch_data_config={"total_rows": patched_rows,
+                                                    "data_start_row": 0}),
+            f"scratch_patched_{name}")
+        place_fixture(patched_dir, fixture_start, fixture_rows)
+        try:
+            df_p = (patched_mod.load_market_data("test") if name == "backtester"
+                    else patched_mod.load_data("test"))
+        except KeyError as exc:
+            fail(f"{name}: --mode test with patched total_rows raised KeyError({exc})")
+        else:
+            check(len(df_p) == patched_rows,
+                  f"{name}: derived range drives the read — total_rows={patched_rows:,} "
+                  f"against a {fixture_rows:,}-row fixture returned {len(df_p):,} rows "
+                  f"(expected exactly {patched_rows:,})")
 
 
 def main() -> int:
@@ -351,7 +443,7 @@ def main() -> int:
 
     test_backtester()
     test_pre_fix_proof(args.skip_smoke_proof)
-    probe_mode_test_keyerror()
+    assert_mode_test_loaders()
 
     print("\n" + "=" * 72)
     if failures:

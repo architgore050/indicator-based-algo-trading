@@ -239,31 +239,29 @@ def test_strategy(strategy: str, rows: int, end_row: int, n_trials: int) -> bool
     import io as _io
     df_a = concat_fold_trades(cap_a1)
     df_b = concat_fold_trades(cap_b1)
-    # The backtester skips ALL risk-exit checks (including max_hold) while
-    # i < warmup_bars, so positions entered during warmup may legitimately be
-    # held longer than max_hold. Only post-warmup entries prove the cap.
-    # Forward-compatibility with task P0-6 (removal of the warmup risk bypass):
-    # .get(..., 0) tolerates the key being removed from config, and the
-    # post-warmup-only assertion stays valid whether or not warmup entries are
-    # capped (it simply checks a subset of trades either way).
-    warmup = int(bt_mod.BP.get("warmup_bars", 0))
+    # P0-6 removed the warmup risk bypass; P2-1 then deleted the now-dead
+    # `warmup_bars` key from config.json. There is therefore NO warmup exemption
+    # left: every trade, whatever its entry bar, must respect max_hold_bars.
+    # The exemption is pinned to 0 (the entry_bar filter becomes a no-op, so the
+    # cap check covers EVERY trade — strictly stronger than the old
+    # post-warmup-only subset), and the key's absence is asserted so a re-add
+    # fails loudly instead of silently re-widening the exemption.
+    if "warmup_bars" in bt_mod.BP:
+        fail("warmup_bars reappeared in backtesting_params — P2-1 deleted it "
+             "(dead since P0-6 removed the risk bypass)")
+    warmup = 0
     df_a_pw = df_a[df_a["entry_bar"] >= warmup] if "entry_bar" in df_a.columns else df_a
     df_b_pw = df_b[df_b["entry_bar"] >= warmup] if "entry_bar" in df_b.columns else df_b
-    if len(df_a_pw) < len(df_a):
-        print(f"  INFO: {len(df_a) - len(df_a_pw)} Set A trade(s) entered during warmup "
-              f"(entry_bar < {warmup}) — exempt from max_hold cap by design")
-    if len(df_b_pw) < len(df_b):
-        print(f"  INFO: {len(df_b) - len(df_b_pw)} Set B trade(s) entered during warmup — exempt")
     max_hold_a = int(df_a_pw["bars_held"].max()) if len(df_a_pw) else -1
     max_hold_b = int(df_b_pw["bars_held"].max()) if len(df_b_pw) else -1
     cap_a = int(set_a["max_hold_bars"])
     if max_hold_b == -1 and len(df_b) > 0:
-        print("  INFO: Set B has only warmup-entry trades — using all Set B trades for the >cap check")
+        print("  INFO: Set B trades missing bars_held — using all Set B trades for the >cap check")
         max_hold_b = int(df_b["bars_held"].max())
     if max_hold_a <= cap_a:
-        ok(f"every post-warmup Set A trade held <= max_hold_bars={cap_a} (max observed {max_hold_a}) — override reached the bar loop")
+        ok(f"every Set A trade held <= max_hold_bars={cap_a} (max observed {max_hold_a}) — override reached the bar loop")
     else:
-        fail(f"post-warmup Set A trades held {max_hold_a} bars > its max_hold_bars={cap_a} — override NOT applied")
+        fail(f"Set A trades held {max_hold_a} bars > its max_hold_bars={cap_a} — override NOT applied")
     if max_hold_b > cap_a:
         ok(f"Set B contains trades held {max_hold_b} bars (> {cap_a}) — Set A's cap did not leak into Set B")
     else:

@@ -9,8 +9,9 @@ until bar 500 (or the forced end_of_data exit).
 
 Tests:
   A. No pre-roll: signal at bar 0 -> entry bar 0 -> SL breach bar 1 ->
-     position closes on bar 1 at the SL price (despite warmup_bars=500 still
-     being present in config.json — the key is now ignored by the backtester).
+     position closes on bar 1 at the SL price. `warmup_bars` was deleted from
+     config.json by P2-1 (dead once P0-6 removed the bypass); this test also
+     proves a cfg that re-injects warmup_bars=500 is still ignored.
   B. Pre-roll slice (oos_start_row_in_slice=3): decoy signal inside the
      pre-roll is discarded; real signal at OOS bar 0 -> entry OOS bar 1 ->
      SL breach OOS bar 2 -> closes at SL price; equity curve starts exactly
@@ -89,10 +90,15 @@ class TestRiskOnFirstBar(unittest.TestCase):
         self.assertEqual(len(equity), len(self.DATA_A),
                          "standalone run (no boundary arg) must still emit equity for every bar")
 
-    def test_warmup_key_present_in_config_but_ignored(self):
-        # config.json keeps warmup_bars until P2-1; the backtester must ignore it.
-        self.assertIn("warmup_bars", bt.BP, "config.json warmup_bars key must still exist (P2-1 removes it)")
-        cfg = dict(bt.BP)  # explicit cfg carrying warmup_bars=500
+    def test_warmup_key_absent_and_ignored_even_if_injected(self):
+        # P2-1 deleted `warmup_bars` from config.json (it was dead once P0-6
+        # removed the bypass). Assert the deletion, then prove the deletion is
+        # load-bearing in the right direction: even a cfg dict that MANUALLY
+        # carries warmup_bars=500 must still fire risk exits on bar 1, i.e. the
+        # backtester has no warmup code path left to resurrect.
+        self.assertNotIn("warmup_bars", bt.BP,
+                         "config.json must not carry warmup_bars (P2-1 deleted it)")
+        cfg = {**bt.BP, "warmup_bars": 500}  # deliberately re-injected decoy
         trades, _, _, _ = bt.run_backtest(self.DATA_A, self.SIGNALS_A, seed=42, config=cfg)
         self.assertEqual(trades.iloc[0]["exit_reason"], "stop_loss")
         self.assertEqual(int(trades.iloc[0]["bars_held"]), 1)
