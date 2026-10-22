@@ -330,6 +330,9 @@ for a in ("--data-csv", "--output", "--annual-baseline", "--distribution-prior")
 for a in ("--start-row", "--end-row", "--window-index"):
     p.add_argument(a, type=int)
 p.add_argument("--smoke", action="store_true"); p.add_argument("--phase3-only", action="store_true")
+# P2-2: the orchestrator always passes --oos-seed (and --run-id for run-scoped
+# runs); the stub must accept them exactly like the real calibrator.
+p.add_argument("--run-id"); p.add_argument("--oos-seed", type=int)
 a = p.parse_args()
 mode = json.loads(Path(os.environ["P17_STUB_CONTROL"]).read_text()).get(str(a.window_index), "ok")
 with open(os.environ["P17_STUB_COUNTER"], "a") as f:
@@ -367,7 +370,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--output-dir")
 p.add_argument("--headless", action="store_true")
 for a in ("--strategy", "--mode", "--data-csv", "--start-row", "--end-row",
-          "--oos-start-row-in-slice", "--signals", "--random-seed", "--calibration"):
+          "--oos-start-row-in-slice", "--signals", "--random-seed", "--calibration",
+          "--run-id"):
     p.add_argument(a)
 a = p.parse_args()
 d = Path(a.output_dir)
@@ -551,7 +555,9 @@ def _write_min_backtest(window_dir: Path) -> None:
     (d / "summary_stats.json").write_text(json.dumps({
         "signal_file": "vm_automation_logic_signals_test.csv",
         "cagr_pct": 4.2, "total_trades": 3, "win_rate_pct": 66.7,
-        "profit_factor": 1.9, "sharpe_ratio": 1.1, "max_drawdown_pct": 2.0}))
+        "profit_factor": 1.9, "sharpe_ratio": 1.1, "max_drawdown_pct": 2.0,
+        # P2-2: the backtester echoes the effective seed into summary_stats.json
+        "random_seed": bp_seed + 2}))
     # Equity bars == fixture data.csv rows 6..8 == the ledger OOS span of
     # window 2 ([6,9)) — P1-8 requires bar-for-bar agreement.
     (d / "equity_curve.csv").write_text(
@@ -561,13 +567,24 @@ def _write_min_backtest(window_dir: Path) -> None:
         "2024-02-01 01:02:00,100100.0,0,2001.0\n")
     (d / "trades.csv").write_text("entry_time,exit_time,pnl_usd\n"
                                   "2024-02-01 01:01:00,2024-02-01 01:02:00,50.0\n")
-    # P1-8 provenance requirements for a successful window:
+    # P2-2 provenance requirements for a successful window: calibration
+    # results, and a lifecycle.jsonl event stream carrying the OOS seed
+    # (wfv_decision.json and the audit logger are retired).
     (window_dir / "calibration_results_vm.json").write_text(json.dumps({
         "dataset_info": {"rows_used": 3, "strategy": "vm", "end_row": 6}}))
-    (window_dir / "wfv_decision.json").write_text(json.dumps({
-        "event": "survival_decision", "strategy": "vm", "window_index": 2,
-        "is_seed": bp_seed, "oos_seed": bp_seed + 2,
-        "decision": "REFINED_WINS"}) + "\n")
+    (window_dir / "lifecycle.jsonl").write_text("\n".join(json.dumps(ev) for ev in [
+        {"event": "window_start", "window_index": 2, "window_label": "monthly_refine_2",
+         "regime": "monthly_refine",
+         "is_start_row": 3, "is_end_row": 6, "oos_start_row": 6, "oos_end_row": 9},
+        {"event": "survival_decision", "window_index": 2, "window_label": "monthly_refine_2",
+         "strategy": "vm",
+         "is_seed": bp_seed, "oos_seed": bp_seed + 2, "decision": "REFINED_WINS"},
+        {"event": "oos_backtest_complete", "window_index": 2,
+         "window_label": "monthly_refine_2", "status": "OK", "oos_seed": bp_seed + 2,
+         "cagr_pct": 4.2, "signal_file": "vm_automation_logic_signals_test.csv"},
+        {"event": "window_complete", "window_index": 2, "window_label": "monthly_refine_2",
+         "status": "completed"},
+    ]) + "\n")
 
 
 def _write_manifest(window_dir: Path) -> None:

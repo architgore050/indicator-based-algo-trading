@@ -75,12 +75,24 @@ def get_logger(name, log_dir=None, worker_id=None):
 
     Returns:
         Configured logging.Logger instance.
-    """
-    logger = logging.getLogger(name)
 
-    # Avoid adding duplicate handlers on repeated calls
-    if logger.handlers:
-        return logger
+    P2-2: when ``log_dir`` is provided the underlying logging.Logger is keyed by
+    ``name + resolved log_dir + worker_id``, not by ``name`` alone. A WFV worker
+    process handles several windows sequentially; with name-only caching the
+    first window's file handler would be reused for every later window (the same
+    bug class as the lifecycle-logger landmine). Human-readable logs are keyed
+    the same way the machine-readable lifecycle logs are.
+    """
+    if log_dir is None:
+        logger = logging.getLogger(name)
+        if logger.handlers:
+            return logger
+        logger_key = name
+    else:
+        logger_key = f"{name}@{Path(log_dir).resolve()}#{worker_id}"
+        logger = logging.getLogger(logger_key)
+        if logger.handlers:
+            return logger
 
     # Inherit level from parent (root) if not explicitly set
     if logger.level == logging.NOTSET:
@@ -123,7 +135,7 @@ def get_logger(name, log_dir=None, worker_id=None):
 
 
 # ---------------------------------------------------------------------------
-# Structured audit logging (P1-5: survival-decision records)
+# Structured JSONL formatting (P1-5 records, P2-2 lifecycle events)
 # ---------------------------------------------------------------------------
 
 class JSONFormatter(logging.Formatter):
@@ -148,32 +160,129 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_record)
 
 
-def get_audit_logger(name: str, log_dir: str) -> logging.Logger:
-    """Return a structured audit logger writing to ``<log_dir>/wfv_decision.json``.
+LIFECYCLE_FILE_NAME = "lifecycle.jsonl"
 
-    NOTE ON FORMAT: despite the ``.json`` extension the file is JSONL by
-    content — one JSON object per line (the spec pins the ``.json`` name and
-    the file lives beside the other per-window JSON artifacts; the collator
-    consumes it as JSONL).
+# POSIX PIPE_BUF: a single write() of at most this many bytes to an O_APPEND
+# file is atomic with respect to other writers. Every lifecycle record is kept
+# under this limit (see LifecycleJSONFormatter) so that the orchestrator worker
+# and the calibrator subprocess can append to the SAME per-window
+# lifecycle.jsonl without interleaving or truncation.
+LIFECYCLE_MAX_LINE_BYTES = 4096
 
-    mode="w": each calibration process starts a fresh audit file for its own
-    window directory (an orchestrator retry overwrites the failed attempt).
-    propagate=False: audit records never leak into the human-readable worker
-    logs. Handler-guarded: repeated calls in one process reuse one handler.
 
-    P2-2 DESIGN NOTE: this factory is scheduled to be upgraded into the
-    per-window ``lifecycle.jsonl`` system (append-mode FileHandler, run_id
-    scoping, multiple event types). Keep this factory small and event-
-    agnostic so that upgrade does not foreclose or rework call sites.
+class LifecycleJSONFormatter(JSONFormatter):
+    """JSONFormatter with a PIPE_BUF size guard for concurrent appends.
+
+    Every emitted record must fit in ONE write() of <= LIFECYCLE_MAX_LINE_BYTES
+    bytes; otherwise a concurrent writer could observe a torn line. Records
+    that would exceed the cap are compacted lossily-but-honestly: bulky nested
+    payloads (parameter dicts, score-component dicts) are replaced by a
+    sha256 digest + item count, and the compacted field names are listed in
+    ``_compacted_fields``. Nothing is silently dropped: the full payload stays
+    available in the window's own JSON artifacts (calibration results,
+    survival record digests).
     """
-    logger = logging.getLogger(f"{name}.audit")
+
+    BULKY_KEYS = (
+        "baseline_params", "refined_params", "baseline_components",
+        "refined_components", "params", "combined", "fold_trades",
+        "path_psrs", "path_sharpes", "path_calmars", "path_max_dd_pct",
+        "path_profit_factors", "fold_sharpes", "fold_psrs",
+    )
+
+    @staticmethod
+    def _digest(value) -> dict:
+        import hashlib
+        blob = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {"_digest_sha256": hashlib.sha256(blob).hexdigest(),
+                "_n_items": len(value)}
+
+    def format(self, record):
+        line = super().format(record)
+        if len(line.encode("utf-8")) <= LIFECYCLE_MAX_LINE_BYTES:
+            return line
+        payload = json.loads(line)
+        compacted = []
+        for key in list(payload.keys()):
+            value = payload[key]
+            if key in self.BULKY_KEYS and isinstance(value, (dict, list)):
+                payload[key] = self._digest(value)
+                compacted.append(key)
+        if compacted:
+            payload["_compacted_fields"] = compacted
+        line = json.dumps(payload, separators=(",", ":"))
+        if len(line.encode("utf-8")) > LIFECYCLE_MAX_LINE_BYTES:
+            # Last resort: clip long free-text fields (reason strings) with an
+            # explicit marker instead of emitting an oversized, torn record.
+            for key, value in list(payload.items()):
+                if isinstance(value, str) and len(value) > 200:
+                    payload[key] = value[:187] + "...[truncated]"
+            payload["_line_truncated"] = True
+            line = json.dumps(payload, separators=(",", ":"))
+        return line
+
+
+# Registry of per-window lifecycle loggers, keyed by RESOLVED log directory.
+#
+# THE BUG THIS REGISTRY FIXES (P2-2 landmine): the review spec's snippet caches
+# the logger by NAME only (`logging.getLogger(f"{name}.lifecycle")` +
+# `if not logger.handlers`). A worker process that handles several windows
+# sequentially calls the factory again for window 5, gets the cached logger
+# whose single handler still points at window 2's lifecycle.jsonl, and window
+# 5's events land in window 2's file. Keying by the resolved directory gives
+# every window directory its own logger + handler, and close_lifecycle_logger()
+# releases the file handle when a window finishes.
+_LIFECYCLE_LOGGERS: dict = {}
+
+
+def get_lifecycle_logger(log_dir, name: str = "wfv.lifecycle") -> logging.Logger:
+    """Return the structured lifecycle logger writing to ``<log_dir>/lifecycle.jsonl``.
+
+    P2-2 replaces the P1-5 ``get_audit_logger`` (per-window ``wfv_decision.json``,
+    mode="w", single event type). Lifecycle events are append-mode JSONL: one
+    JSON object per line, <= PIPE_BUF bytes per line, written by a single
+    write() per record (StreamHandler emits ``msg + terminator`` then flushes),
+    so the orchestrator worker and the calibrator subprocess can append to the
+    same per-window file concurrently without corruption.
+
+    ``propagate=False``: lifecycle records never leak into the human-readable
+    worker/console logs. The returned logger is cached PER RESOLVED log_dir —
+    see the registry comment above for why caching by name alone is a bug.
+    """
+    key = str(Path(log_dir).resolve())
+    cached = _LIFECYCLE_LOGGERS.get(key)
+    if cached is not None:
+        return cached
+    logger = logging.getLogger(f"{name}:{key}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    if not logger.handlers:
-        log_path = Path(log_dir)
-        log_path.mkdir(parents=True, exist_ok=True)
-        log_file = log_path / "wfv_decision.json"
-        file_handler = logging.FileHandler(log_file, mode="w")
-        file_handler.setFormatter(JSONFormatter())
-        logger.addHandler(file_handler)
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path / LIFECYCLE_FILE_NAME,
+                                       mode="a", encoding="utf-8")
+    file_handler.setFormatter(LifecycleJSONFormatter())
+    logger.addHandler(file_handler)
+    _LIFECYCLE_LOGGERS[key] = logger
     return logger
+
+
+def close_lifecycle_logger(log_dir) -> bool:
+    """Flush + close + unregister the lifecycle logger for one window directory.
+
+    Called at the end of each window in a worker process: a worker that
+    processes many windows must not hold one open file handle per window, and
+    closing guarantees the JSONL file is complete on disk before the collator
+    reads it.
+    """
+    key = str(Path(log_dir).resolve())
+    logger = _LIFECYCLE_LOGGERS.pop(key, None)
+    if logger is None:
+        return False
+    for handler in logger.handlers[:]:
+        try:
+            handler.flush()
+            handler.close()
+        except OSError:
+            pass
+        logger.removeHandler(handler)
+    return True

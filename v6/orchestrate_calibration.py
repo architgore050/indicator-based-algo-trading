@@ -1,20 +1,22 @@
 import argparse
+import hashlib
 import json
 import logging
 import multiprocessing
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import math
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
-from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger
+from logging_utils import (get_logger, get_lifecycle_logger, close_lifecycle_logger,
+                           suppress_pandas_warnings, setup_root_logger)
 
 import moo_selection as moo
 
@@ -128,6 +130,9 @@ from wfv_ledger import (  # noqa: E402
     compute_window_ranges,
     compute_signal_chunk_range,
     compute_pre_roll_bars as _compute_pre_roll_bars,
+    build_expected_ledger,
+    expected_chunk_set,
+    config_fingerprint,
 )
 
 
@@ -183,10 +188,37 @@ def atomic_write(src: Path, dst: Path) -> None:
 # ---------------------------------------------------------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = PROJECT_DIR / "config.json"
-WFV_DIR = PROJECT_DIR / "wfv"
+
+# ---------------------------------------------------------------------------
+# P2-2 — Run-scoped WFV directories (wfv/runs/<run_id>/)
+# ---------------------------------------------------------------------------
+# The defect: WFV_DIR used to be the single root `wfv/` directory, and
+# setup_wfv_dirs() called shutil.rmtree(WFV_DIR) at the start of every run —
+# destroying all evidence of previous runs (window dirs, manifests, backtest
+# artifacts, the sliced_data scheduling ledger). P2-2 gives every run its own
+# directory under wfv/runs/<run_id>/ and NEVER deletes a run directory.
+#
+# run_id is `<YYYYmmdd_HHMMSS>_<6 hex>`: the timestamp prefix makes lexicographic
+# order chronological, so the collator can discover "the latest run" by NAME
+# (getmtime is unreliable — copying/touching a run dir rewrites its mtime).
+#
+# Everything the run produces lives inside its run dir: window_* directories,
+# per-window lifecycle.jsonl event streams, manifest.json skip records,
+# backtest_results/, sliced_data/ (the chunk ledger — moving it INSIDE the run
+# dir is what closes the P1-8 reviewer's cross-run contamination hole), and
+# run_meta.json (the planned window ledger + data/config fingerprints written
+# BEFORE calibration starts).
+RUNS_DIR = PROJECT_DIR / "wfv" / "runs"
+WFV_DIR = None  # run-scoped: RUNS_DIR / run_id. Set by main() (see make_run_id).
 
 setup_root_logger(logging.INFO)
-logger = get_logger(__name__, log_dir=WFV_DIR, worker_id=None)
+# Console/root logger at import time; the run-dir main_log.txt handler is
+# attached once the run directory exists (attach_run_logger). Historically the
+# import-time handler was created under the root wfv/ dir and then dropped by
+# setup_wfv_dirs()'s pre-rmtree handler close, so main_log.txt silently stopped
+# being written mid-run; attaching it after the run dir exists fixes that.
+logger = get_logger(__name__)
+
 
 def load_config():
     with open(CONFIG_PATH, "r") as f:
@@ -197,15 +229,147 @@ WFV_CONF = CONFIG["calibration_params"]["wfv_config"]
 CALIB_PARAMS = CONFIG["calibration_params"]
 DATA_CONF = CONFIG["data_config"]
 
-def setup_wfv_dirs():
-    # Close file handlers on the root logger before rmtree to avoid
-    # PermissionError on Windows when main_log.txt is locked.
-    for handler in logger.handlers[:]:
-        handler.close()
-        logger.removeHandler(handler)
-    if WFV_DIR.exists():
-        shutil.rmtree(WFV_DIR)
-    WFV_DIR.mkdir()
+
+def make_run_id() -> str:
+    """Run identifier: chronological timestamp prefix + uniqueness suffix."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+
+def attach_run_logger(run_dir):
+    """Attach the run-dir main_log.txt handler (after the run dir exists)."""
+    global logger
+    logger = get_logger(__name__, log_dir=run_dir, worker_id=None)
+    return logger
+
+
+def setup_wfv_dirs(run_dir):
+    """Create the run directory tree. P2-2: NO rmtree — historical runs are never deleted.
+
+    A run directory that already carries run_meta.json is a finished (or crashed)
+    run: writing a second run into it would mix two runs' evidence, so it is
+    rejected instead of silently reused. Resume-style reruns must use a new run id.
+    """
+    if (run_dir / "run_meta.json").exists():
+        raise FileExistsError(
+            f"Run directory {run_dir} already carries run_meta.json — its evidence is "
+            f"committed. Refusing to write a second run into it. Use a different "
+            f"--run-id (or omit it to generate a fresh one).")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "sliced_data").mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# P2-2 — run_meta.json: the run's own expectation record
+# ---------------------------------------------------------------------------
+# Written BEFORE calibration starts. The P1-8 integrity gate reads it as the
+# PRIMARY expectation source: a run that deletes window directories AND their
+# data chunks together can no longer pass, because run_meta still names them
+# (the "consistent truncation" hole the P1-8 reviewer deferred).
+# Fingerprints (data.csv sha256 + consumed-config fingerprint) close the
+# "price drift with unchanged timestamps passes" blind spot.
+
+def sha256_file(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# config_fingerprint() lives in wfv_ledger.py (shared with the collator, which must
+# recompute the identical value at collation time). Imported below.
+
+
+def build_run_meta(run_id: str, strategy: str, args, ledger: list, pre_roll_bars: int,
+                   schedule: dict, workers: int) -> dict:
+    """The planned-ledger + fingerprint record written before calibration starts."""
+    data_csv = PROJECT_DIR / "data.csv"
+    return {
+        "schema": "wfv_run_meta/v1",
+        "run_id": run_id,
+        "strategy": strategy,
+        "mode": "smoke" if args.smoke else "full",
+        "created_at": datetime.now().isoformat(),
+        "orchestrator": "orchestrate_calibration.py",
+        "workers": int(workers),
+        # Scheduling constants the ledger arithmetic needs (P1-8 shared math).
+        "schedule": schedule,
+        "pre_roll_bars": int(pre_roll_bars),
+        "total_windows": len(ledger),
+        # The full planned window ledger: indices, labels, row ranges.
+        "planned_ledger": ledger,
+        "planned_window_dirs": [e["dir_name"] for e in ledger],
+        # The exact sliced-data chunk ledger this run must produce.
+        "expected_chunks": sorted(expected_chunk_set(ledger, pre_roll_bars)),
+        # Fingerprints: verified by the collator at collation time.
+        "data_csv": str(data_csv),
+        "data_sha256": sha256_file(data_csv),
+        "data_rows": sum(1 for _ in open(data_csv, "rb")) - 1,
+        "config_path": str(CONFIG_PATH),
+        "config_sha256": sha256_file(CONFIG_PATH),
+        "config_fingerprint": config_fingerprint(CONFIG, strategy),
+        # OOS seed formula (the backtester receives random_seed + window_index).
+        "oos_seed_formula": "backtesting_params.random_seed + window_index",
+        "random_seed_base": int(CONFIG["backtesting_params"]["random_seed"]),
+        # Filled in by finalize_run_meta() at the end of the run.
+        "outcomes": None,
+        "skipped_windows": None,
+        "finished_at": None,
+    }
+
+
+def finalize_run_meta(run_dir, window_statuses: list, run_meta: dict,
+                      full_recal_interval: int) -> dict:
+    """Record per-window outcomes + the skip ledger into run_meta.json.
+
+    P1-7 carry-forward: a run summary (which windows completed, which were
+    NO_ADMISSIBLE_TRIAL / CASCADE_SKIP) must be reconstructible from the run
+    directory alone. The plain-vs-cascade variant is read back from each
+    skipped window's manifest.json (the single source of truth, P1-7 review
+    §R-L) rather than trusted from the in-memory status string.
+    """
+    from wfv_ledger import window_dir_name
+    completed = [i for i, status in sorted(window_statuses) if status == "OK"]
+    skipped = []
+    for i, status in sorted(window_statuses):
+        if status == "OK":
+            continue
+        variant = status
+        error = ""
+        manifest_path = run_dir / window_dir_name(i, full_recal_interval) / "manifest.json"
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, "r") as f:
+                    manifest = json.load(f)
+                error = str(manifest.get("error", ""))
+                if error.startswith("CASCADE_SKIP"):
+                    variant = "CASCADE_SKIP"
+            except (json.JSONDecodeError, OSError):
+                pass
+        skipped.append({"window_index": int(i), "status": variant, "error": error[:400]})
+    run_meta["outcomes"] = {str(i): status for i, status in window_statuses}
+    run_meta["completed_window_indices"] = completed
+    run_meta["skipped_windows"] = skipped
+    run_meta["skipped_window_indices"] = [s["window_index"] for s in skipped]
+    run_meta["cascade_skipped_window_indices"] = [s["window_index"] for s in skipped
+                                                   if s["status"] == "CASCADE_SKIP"]
+    run_meta["finished_at"] = datetime.now().isoformat()
+    _atomic_write_json(run_dir / "run_meta.json", run_meta)
+    return run_meta
+
+
+def _atomic_write_json(path, payload: dict) -> None:
+    """Atomic JSON write (temp file + os.replace) — AGENTS.md parallel-writes lesson."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def write_run_meta(run_dir, run_meta: dict) -> dict:
+    _atomic_write_json(run_dir / "run_meta.json", run_meta)
+    return run_meta
 
 def get_calibration_script(strategy: str) -> str:
     return f"optuna_calibrate_{strategy}.py"
@@ -494,9 +658,14 @@ def _extract_error_line(captured_text: str) -> str:
 
 def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv_rows, 
                    recal_windows_count, full_recal_interval, full_cal_rows, 
-                   wfv_dir, row_to_chunk, pre_roll_bars):
+                   wfv_dir, row_to_chunk, pre_roll_bars, run_id=None):
     """
     Processes a single WFV window. This function is designed to run in a separate process.
+
+    P2-2: emits the window's machine-readable lifecycle events into
+    ``<window_dir>/lifecycle.jsonl`` (the calibrator subprocess appends its own
+    events to the SAME file — see logging_utils.get_lifecycle_logger for the
+    per-directory handler keying and the PIPE_BUF append design).
     """
     # Per-worker logger with dedicated log file
     worker_logger = get_logger(__name__, log_dir=wfv_dir, worker_id=i)
@@ -511,6 +680,20 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     oos_start, oos_end, is_start, is_end = compute_window_ranges(
         i, oos_start_base, rows_per_window, full_recal_interval,
         recal_windows_count, full_cal_rows, args.smoke)
+
+    # P2-2: per-window lifecycle stream. Keyed by directory, closed at window
+    # end (a worker handling several windows must not reuse one handler).
+    lifecycle = get_lifecycle_logger(current_dir)
+
+    def _lifecycle(event: str, **fields):
+        record = {"event": event, "run_id": run_id, "window_index": int(i),
+                  "window_label": window_label}
+        record.update(fields)
+        lifecycle.info(record)
+
+    _lifecycle("window_start", regime="annual_recal" if is_annual else "monthly_refine",
+               is_start_row=int(is_start), is_end_row=int(is_end),
+               oos_start_row=int(oos_start), oos_end_row=int(oos_end))
 
     worker_logger.info(f"--- Window {i}: {window_label} ---")
 
@@ -534,12 +717,27 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
                    f"{parent_manifest.get('error', 'no recorded error')}"),
             ranges=(is_start, is_end, oos_start, oos_end),
         )
+        _lifecycle("window_skipped", status="CASCADE_SKIP",
+                   parent_index=int(parent_idx), parent_dir=parent_name)
+        close_lifecycle_logger(current_dir)
         worker_logger.info(f"--- Skipped Window {i} (NO_ADMISSIBLE_TRIAL cascade) ---")
         return NO_ADMISSIBLE_TRIAL_STATUS
 
     yearly_best_path = _resolve_parent_path(wfv_dir, i, full_recal_interval, strategy)
+    if yearly_best_path:
+        parent_idx = 1 + ((i - 2) // full_recal_interval) * full_recal_interval
+        _lifecycle("parent_transfer", parent_index=int(parent_idx),
+                   parent_path=str(yearly_best_path))
 
     worker_logger.info(f"Decision: {window_label} - always recalibrate.")
+
+    # P2-2: the OOS seed is computed ONCE here and passed EXPLICITLY to both the
+    # calibrator (--oos-seed, recorded in its survival_decision event) and the
+    # backtester (--random-seed, echoed in summary_stats.json), and recorded in
+    # the window's lifecycle stream (oos_backtest_complete). The P1-5 calibrator
+    # re-derived this formula internally — a documented coupling the P1-5 record
+    # itself flagged for P2-2; the seed is now a single value passed down.
+    oos_seed = int(CONFIG["backtesting_params"]["random_seed"]) + i
 
     # 4. Calibration (with retry)
     cal_success = False
@@ -555,6 +753,14 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             "--output", window_cal_output,
             "--window-index", str(i)
         ]
+        # P2-2: run identity + the explicit OOS seed are threaded into every
+        # subprocess so the calibrator's own lifecycle events carry the same
+        # run_id and the same seed the backtester will receive.
+        # --run-id is OPTIONAL at the receiving end: standalone calibrator runs
+        # (AGENTS.md developer commands) stay valid without it.
+        cal_cmd.extend(["--oos-seed", str(oos_seed)])
+        if run_id:
+            cal_cmd.extend(["--run-id", run_id])
         if args.smoke:
             cal_cmd.append("--smoke")
         if not is_annual:
@@ -614,6 +820,9 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         worker_logger.warning(
             f"Window {i} skipped: NO_ADMISSIBLE_TRIAL recorded at {manifest_path}. "
             "Signal generation and OOS backtest are skipped for this window.")
+        _lifecycle("window_skipped", status=NO_ADMISSIBLE_TRIAL_STATUS,
+                   manifest=str(manifest_path), error=inadmissible_error[:300])
+        close_lifecycle_logger(current_dir)
         worker_logger.info(f"--- Skipped Window {i} (NO_ADMISSIBLE_TRIAL) ---")
         return NO_ADMISSIBLE_TRIAL_STATUS
 
@@ -667,7 +876,11 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
     # makes bars before the OOS boundary indicator history only — no trade
     # accounting and no equity-curve rows are emitted for them, so window N's
     # equity curve never overlaps window N-1's.
-    run_step([
+    # P2-2: --random-seed receives the window's single computed OOS seed (see
+    # above); the backtester echoes it in summary_stats.json and the orchestrator
+    # records it in the lifecycle stream, so the integrity gate can verify the
+    # seed for EVERY window — annual windows included (the P1-8 "unverified [1]" gap).
+    backtest_cmd = [
         PYTHON, str(PROJECT_DIR / "backtest_xauusd_signal_csv.py"),
         "--strategy", strategy,
         "--mode", "smoke" if args.smoke else "test",
@@ -678,13 +891,17 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
         "--headless",
         "--output-dir", str(backtest_dir),
         "--signals", str(signal_file_path),
-        "--random-seed", str(CONFIG["backtesting_params"]["random_seed"] + i),
-        "--calibration", str(window_cal)
-    ])
+        "--random-seed", str(oos_seed),
+        "--calibration", str(window_cal),
+    ]
+    if run_id:
+        backtest_cmd.extend(["--run-id", run_id])
+    run_step(backtest_cmd)
 
     # 7. Record Performance
     stats_file = backtest_dir / "summary_stats.json"
     reward = -100.0
+    backtest_status = "success"
     if stats_file.exists():
         with open(stats_file, "r") as f:
             stats = json.load(f)
@@ -692,6 +909,12 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
             worker_logger.info(f"Window {i} Performance (CAGR): {reward:.2f}%")
     else:
         worker_logger.warning(f"Window {i} stats not found.")
+        backtest_status = "failed"
+
+    _lifecycle("oos_backtest_complete", status=backtest_status, oos_seed=oos_seed,
+               cagr_pct=float(reward), signal_file=str(signal_file_path.name))
+    _lifecycle("window_complete", status="OK")
+    close_lifecycle_logger(current_dir)
 
     worker_logger.info(f"--- Completed Window {i} ---")
     return "OK"
@@ -705,6 +928,17 @@ def main():
     parser.add_argument("--strategy", type=str, choices=["tv", "vm", "trend"], required=True)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workers")
+    # P2-2: run identity. --run-id overrides the generated id (deterministic
+    # scratch/test runs); --runs-dir relocates the run tree (scratch WFV trees
+    # under v6/tmp/ must never pollute the real wfv/runs/ tree); --windows caps
+    # the schedule for a deliberately partial run (the integrity gate validates
+    # partial runs against the run's own run_meta ledger).
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Explicit run id (default: generated timestamp+uuid).")
+    parser.add_argument("--runs-dir", type=str, default=None,
+                        help=f"Root directory for run trees (default: {RUNS_DIR}).")
+    parser.add_argument("--windows", type=int, default=None,
+                        help="Cap the WFV schedule to this many windows (partial run).")
     args = parser.parse_args()
 
     # Logic Parameters (needed before VRAM estimation)
@@ -730,6 +964,13 @@ def main():
     if args.smoke:
         total_windows = min(total_windows, 5)
         logger.info(f"[SMOKE] Capped to {total_windows} windows for fast feedback")
+
+    # P2-2: explicit partial-run cap (used by the scratch lifecycle tests).
+    if args.windows is not None:
+        if args.windows < 1:
+            raise ValueError(f"--windows must be >= 1, got {args.windows}")
+        total_windows = min(total_windows, args.windows)
+        logger.info(f"Window cap (--windows): {total_windows} windows (partial run)")
 
     # Fail-fast validation (P0-5): the whole WFV schedule — the initial IS
     # reservation plus every OOS window — must fit inside the CSV. Runs after
@@ -772,26 +1013,59 @@ def main():
 
     args.workers = safe_count
 
-    setup_wfv_dirs()
+    # -----------------------------------------------------------------------
+    # P2-2: run identity + run directory (wfv/runs/<run_id>/) + run_meta.json
+    # -----------------------------------------------------------------------
+    global WFV_DIR
+    runs_dir = Path(args.runs_dir) if args.runs_dir else RUNS_DIR
+    run_id = args.run_id or make_run_id()
+    # run_id is a DIRECTORY NAME here: reject anything that could escape runs_dir.
+    if any(sep in run_id for sep in ("/", "\\", "..")) or run_id != run_id.strip():
+        raise ValueError(
+            f"--run-id {run_id!r} is not a safe directory name (no path separators, no "
+            f"'..', no leading/trailing whitespace).")
+    WFV_DIR = runs_dir / run_id
+    setup_wfv_dirs(WFV_DIR)
+    attach_run_logger(WFV_DIR)
+
+    # The planned window ledger: the SAME shared wfv_ledger arithmetic the
+    # integrity gate uses. Written to run_meta.json BEFORE any calibration
+    # starts, so the run carries its own expectation record.
+    ledger = build_expected_ledger(CONFIG, total_windows, smoke=args.smoke)
+    schedule = {
+        "data_start_row": data_start_row,
+        "oos_start_base": oos_start_base,
+        "rows_per_window": rows_per_window,
+        "full_cal_rows": full_cal_rows,
+        "recal_windows_count": recal_windows_count,
+        "full_recal_interval": full_recal_interval,
+        "total_wfv_rows": total_wfv_rows,
+    }
+    run_meta = write_run_meta(WFV_DIR, build_run_meta(
+        run_id, args.strategy, args, ledger, pre_roll_bars, schedule, args.workers))
+    logger.info(f"[P2-2] Run id: {run_id}  Run dir: {WFV_DIR}")
+    logger.info(f"[P2-2] run_meta.json written BEFORE calibration: "
+                f"{len(ledger)} planned window(s), data sha256={run_meta['data_sha256'][:16]}..., "
+                f"config fingerprint={run_meta['config_fingerprint'][:16]}...")
 
     logger.info(f"Starting Parallel WFV for {args.strategy.upper()}. Total Windows: {total_windows}")
     logger.info(f"Using {args.workers} workers.")
 
     # -----------------------------------------------------------------------
     # Pre-slice data.csv into per-window chunks to avoid OOM from parallel reads
+    # P2-2: the chunk ledger lives INSIDE the run dir, so a stale ledger from a
+    # previous run can never contaminate another run's collation.
     # -----------------------------------------------------------------------
     DATA_CSV = PROJECT_DIR / "data.csv"
     SLICED_DIR = WFV_DIR / "sliced_data"
     SLICED_DIR.mkdir(exist_ok=True)
 
     row_ranges = []
-    for i in range(1, total_windows + 1):
-        oos_start, oos_end, is_start, is_end = compute_window_ranges(
-            i, oos_start_base, rows_per_window, full_recal_interval,
-            recal_windows_count, full_cal_rows, args.smoke)
-        row_ranges.append((is_start, is_end))      # calibration IS range [is_start, is_end) — never includes pre-roll
+    for entry in ledger:
+        row_ranges.append((entry["is_start"], entry["is_end"]))  # calibration IS range — never includes pre-roll
         # P0-6: signal/backtest range [signal_start, oos_end) — OOS plus pre-roll history.
-        signal_start, signal_end, _ = compute_signal_chunk_range(oos_start, oos_end, pre_roll_bars)
+        signal_start, signal_end, _ = compute_signal_chunk_range(
+            entry["oos_start"], entry["oos_end"], pre_roll_bars)
         row_ranges.append((signal_start, signal_end))
 
     # Deduplicate ranges
@@ -816,6 +1090,8 @@ def main():
     # run summary (a NO_ADMISSIBLE_TRIAL window is a HANDLED outcome, not a
     # crash — the run completes with exit 0 and the skip is recorded per-window
     # in manifest.json + here in the main log).
+    # P2-2: statuses are recorded as (window_index, status) pairs so run_meta.json
+    # can reconstruct the run summary from the run directory alone.
     window_statuses = []
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -827,12 +1103,13 @@ def main():
                 process_window, 
                 i, args.strategy, args, oos_start_base, rows_per_window, 
                 total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars
+                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
             ))
 
-        for f in tqdm(annual_futures, desc="Phase 1 — Annual Windows", unit="window"):
+        for i, f in tqdm(list(zip(annual_indices, annual_futures)),
+                         desc="Phase 1 — Annual Windows", unit="window"):
             try:
-                window_statuses.append(f.result())
+                window_statuses.append((i, f.result()))
             except RuntimeError as e:
                 if "ABORT" in str(e):
                     logger.error(f"WFV run aborted: {e}")
@@ -850,12 +1127,13 @@ def main():
                 process_window, 
                 i, args.strategy, args, oos_start_base, rows_per_window, 
                 total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars
+                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
             ))
 
-        for f in tqdm(monthly_futures, desc="Phase 2 — Monthly Windows", unit="window"):
+        for i, f in tqdm(list(zip(monthly_indices, monthly_futures)),
+                         desc="Phase 2 — Monthly Windows", unit="window"):
             try:
-                window_statuses.append(f.result())
+                window_statuses.append((i, f.result()))
             except RuntimeError as e:
                 if "ABORT" in str(e):
                     logger.error(f"WFV run aborted: {e}")
@@ -866,12 +1144,17 @@ def main():
                 raise
 
     # P1-7 run summary: skipped windows are reported, never hidden.
-    skipped = [s for s in window_statuses if s == NO_ADMISSIBLE_TRIAL_STATUS]
+    skipped = [s for s in window_statuses if s[1] == NO_ADMISSIBLE_TRIAL_STATUS]
     completed = len(window_statuses) - len(skipped)
+
+    # P2-2: the run summary is persisted into run_meta.json (skipped windows
+    # included) so the run dir alone can reconstruct what happened.
+    run_meta = finalize_run_meta(WFV_DIR, window_statuses, run_meta, full_recal_interval)
+
     logger.info(
         f"WFV run summary: {completed} window(s) completed, "
         f"{len(skipped)} window(s) skipped as NO_ADMISSIBLE_TRIAL "
-        f"(manifest.json recorded per skipped window)."
+        f"(manifest.json recorded per skipped window; run_meta.json outcomes recorded)."
     )
     if skipped:
         logger.warning(
@@ -879,7 +1162,9 @@ def main():
             "explicitly inadmissible windows, NOT default-parameter substitutions. "
             "Collation (P1-8 integrity validation) must account for them."
         )
-    logger.info("WFV Pipeline Complete.")
+    logger.info(f"WFV Pipeline Complete. Run dir: {WFV_DIR} (run_id={run_id}).")
+    logger.info("Collate with: python collate_wfv_results.py --strategy "
+                f"{args.strategy}   (auto-discovers the latest run under {runs_dir})")
 
 if __name__ == "__main__":
     # Required for multiprocessing on Windows

@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import warnings
 import sys
+import hashlib
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
@@ -11,6 +12,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import numpy as np
 
+from logging_utils import LIFECYCLE_MAX_LINE_BYTES  # re-exported: the gate checks it
 from wfv_ledger import (
     build_expected_ledger,
     normalize_ledger,
@@ -18,6 +20,8 @@ from wfv_ledger import (
     parse_window_dir_name,
     parse_chunk_file_name,
     ledger_params,
+    expected_chunk_set,
+    config_fingerprint,
 )
 
 
@@ -28,6 +32,28 @@ def load_config():
 
 CONF = load_config()
 BP = CONF["backtesting_params"]
+PROJECT_DIR = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------------------
+# P2-2 — run-scoped WFV trees (wfv/runs/<run_id>/)
+# ---------------------------------------------------------------------------
+# The defect (docs/externalReview_pipeline_correctness.md §P2-2): the orchestrator
+# used to rmtree the single root wfv/ directory at the start of every run, so each
+# run destroyed all evidence of the previous one, and the collator had no way to
+# tell which run a window directory belonged to. P2-2 gives every run its own
+# directory and the collator resolves ONE run at a time:
+#   --run-id <id>   collate that run under --runs-dir (default wfv/runs)
+#   (neither)       collate the LATEST run, chosen by lexicographic max of the run
+#                   DIRECTORY NAME. run_id is timestamp-prefixed (%Y%m%d_%H%M%S_<6hex>),
+#                   so name order IS chronological order. getmtime is deliberately
+#                   NOT used: copying or touching a run tree rewrites its mtime and
+#                   would silently change which run "latest" means.
+#   --wfv-dir <p>   escape hatch: collate an explicit tree (scratch test trees, or a
+#                   legacy pre-P2-2 tree, which is then reported as such).
+RUNS_SUBDIR = "runs"
+RUN_META_FILE_NAME = "run_meta.json"
+LIFECYCLE_FILE_NAME = "lifecycle.jsonl"
+RUN_META_SCHEMA = "wfv_run_meta/v1"
 def _safe_std(values):
     """Compute std without RuntimeWarning from NaN values."""
     with warnings.catch_warnings():
@@ -100,11 +126,16 @@ def _run_baseline(output_dir, strategy="vm"):
         shutil.rmtree(handshake_dir)
     handshake_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Generate signals with default params (no --calibration flag)
+    # Step 1: Generate signals with BASELINE params. P2-2 (reviewer carry-forward):
+    # "no --calibration flag" was not enough — load_params() falls back to the
+    # repo-root calibration_results_<strategy>.json whenever it exists, so the
+    # "baseline" reference silently used whatever parameters the LAST calibration
+    # run left behind. --no-calibration pins config.json.
     signal_script = _get_signal_script(strategy)
     signal_cmd = [
         sys.executable, str(signal_script),
         "--mode", "test",
+        "--no-calibration",
         "--output-dir", str(handshake_dir),
     ]
     result = _run_subprocess(signal_cmd)
@@ -150,20 +181,18 @@ def _run_baseline(output_dir, strategy="vm"):
 
 
 def _extract_window_info(window_dir):
-    """Extract window index and regime type from directory name."""
-    name = window_dir.name
-    parts = name.split('_')
-    window_idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-    if 'annual_recal' in name:
-        regime = 'annual_recal'
-        recal_idx = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-    elif 'monthly_refine' in name:
-        regime = 'monthly_refine'
-        recal_idx = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-    else:
-        regime = 'unknown'
-        recal_idx = 0
-    return window_idx, regime, recal_idx
+    """Extract window index / regime / recalibration index from a directory name.
+
+    P2-2: delegates to wfv_ledger.parse_window_dir_name — the SAME parser the
+    integrity gate and the orchestrator use. The old hand-rolled split('_') read
+    parts[3] for the recalibration index, but the canonical name
+    window_<i>_<regime>_<i> puts it at parts[-1] (regime itself contains an
+    underscore), so recal_idx silently fell back to 0 in every diagnostic row.
+    """
+    parsed = parse_window_dir_name(Path(window_dir).name)
+    if parsed is None:
+        return 0, 'unknown', 0
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +229,189 @@ SIGNAL_FILE_PREFIXES = {
 NO_ADMISSIBLE_TRIAL_STATUS = "NO_ADMISSIBLE_TRIAL"
 
 
+def sha256_file(path) -> str:
+    """sha256 of a file, read in 1 MB chunks (data.csv is ~280 MB)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_run_meta(wfv_path: Path):
+    """Read <run_dir>/run_meta.json, or None when the tree predates P2-2.
+
+    An unreadable/corrupt run_meta is a hard failure: it is the run's own
+    expectation record, and a gate that silently proceeds without it is exactly
+    the "plausible partial report" failure mode P1-8/P2-2 exist to prevent.
+    """
+    meta_path = wfv_path / RUN_META_FILE_NAME
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(
+            f"Integrity Check Failed: {meta_path} is unreadable ({e}). The run's "
+            f"expectation record is required to validate this tree; refusing to guess."
+        )
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            f"Integrity Check Failed: {meta_path} is not a JSON object.")
+    return meta
+
+
+def _is_run_dir(d: Path) -> bool:
+    """A run directory carries run_meta.json and/or window_* result directories."""
+    if (d / RUN_META_FILE_NAME).exists():
+        return True
+    try:
+        return any(c.is_dir() and parse_window_dir_name(c.name) is not None
+                   for c in d.iterdir())
+    except OSError:
+        return False
+
+
+def discover_run_dir(runs_dir, run_id=None, strategy=None) -> Path:
+    """Resolve which run tree to collate (P2-2).
+
+    run_id given  -> <runs_dir>/<run_id> must exist.
+    run_id absent -> lexicographic max of the run directory NAMES (chronological,
+                     because run ids are timestamp-prefixed). Never getmtime.
+    strategy given -> discovery is strategy-scoped: wfv/runs/ holds runs of all
+                     three strategies, so the latest tree OF THE REQUESTED STRATEGY
+                     is chosen and other-strategy runs are reported, not collated.
+                     A run tree without run_meta (pre-P2-2) stays eligible.
+    A legacy pre-P2-2 tree (window_* directories directly under the parent of
+    runs_dir) is reported with instructions instead of being collated implicitly.
+    """
+    runs_path = Path(runs_dir)
+    if run_id:
+        candidate = runs_path / run_id
+        if not candidate.is_dir():
+            known = sorted(d.name for d in runs_path.iterdir()
+                           if d.is_dir() and _is_run_dir(d)) if runs_path.is_dir() else []
+            raise RuntimeError(
+                f"Run directory not found: {candidate}. Known runs under {runs_path}: "
+                f"{known if known else 'none'}.")
+        return candidate
+
+    if not runs_path.is_dir():
+        legacy_root = runs_path.parent
+        legacy_windows = sorted(d.name for d in legacy_root.iterdir()
+                                if d.is_dir() and parse_window_dir_name(d.name) is not None) \
+            if legacy_root.is_dir() else []
+        if legacy_windows:
+            raise RuntimeError(
+                f"Legacy pre-P2-2 WFV layout detected: {len(legacy_windows)} window_* "
+                f"directories sit directly under {legacy_root} instead of under "
+                f"{runs_path}/<run_id>/. P2-2 collates one run-scoped tree at a time. "
+                f"Re-run the orchestrator to produce a run tree, then collate it with "
+                f"--runs-dir/--run-id; to collate this legacy tree deliberately, pass "
+                f"its path explicitly with --wfv-dir {legacy_root} (its evidence predates "
+                f"run scoping and will be reported as such)."
+            )
+        raise RuntimeError(
+            f"No WFV run trees found under {runs_path}. Run the orchestrator first "
+            f"(python orchestrate_calibration.py --strategy {run_id or 'vm'} --smoke), or "
+            f"point the collator at an existing tree with --wfv-dir <path>.")
+
+    candidates = sorted(d.name for d in runs_path.iterdir()
+                        if d.is_dir() and _is_run_dir(d))
+    if not candidates:
+        raise RuntimeError(
+            f"No run directories found under {runs_path} (expected subdirectories named "
+            f"<YYYYmmdd_HHMMSS>_<6hex>). Collation refuses to fall back to a root-level "
+            f"window_* scan: that is the cross-run contamination hole P2-2 closes.")
+    chosen_name = candidates[-1]
+    if strategy:
+        matching, foreign = [], []
+        for name in candidates:
+            meta = read_run_meta(runs_path / name)
+            got = (meta or {}).get("strategy")
+            if got is None or got == strategy:
+                matching.append(name)
+            else:
+                foreign.append(f"{name} ({got})")
+        if not matching:
+            raise RuntimeError(
+                f"No run tree under {runs_path} belongs to strategy {strategy!r}. "
+                f"Runs present: {foreign}. Collation is strategy-scoped — pass "
+                f"--run-id for one of these runs, or run the {strategy} orchestrator "
+                f"first; collating a {strategy} report out of another strategy's "
+                f"evidence is refused.")
+        chosen_name = matching[-1]
+        if foreign:
+            print(f"[P2-2] Run discovery: ignoring {len(foreign)} run tree(s) of other "
+                  f"strategies: {foreign}")
+    chosen = runs_path / chosen_name
+    print(f"[P2-2] Run discovery: {len(candidates)} run tree(s) under {runs_path}; "
+          f"choosing latest by name: {chosen.name} "
+          f"(others: {[c for c in candidates if c != chosen_name]})")
+    return chosen
+
+
+def read_lifecycle_events(window_dir: Path) -> list:
+    """Parse <window_dir>/lifecycle.jsonl into a list of event dicts.
+
+    Returns [] when the file is absent (pre-P2-2 tree). A malformed line is a
+    HARD failure: lifecycle.jsonl is integrity evidence, and a torn or hand-edited
+    event stream must be reported, not skipped (contrast the retired P1-5 audit
+    aggregator, which tolerated malformed lines).
+    """
+    path = window_dir / LIFECYCLE_FILE_NAME
+    if not path.exists():
+        return []
+    events = []
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(
+            f"Integrity Check Failed: {path} unreadable: {e}")
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        if len(line.encode("utf-8")) > LIFECYCLE_MAX_LINE_BYTES:
+            raise RuntimeError(
+                f"Integrity Check Failed: lifecycle record in {path} (line {line_no}) is "
+                f"{len(line.encode('utf-8'))} bytes, above the {LIFECYCLE_MAX_LINE_BYTES}B "
+                f"PIPE_BUF append cap. Writers keep every record inside one atomic write(); "
+                f"an oversized line means the stream was assembled by hand or a formatter "
+                f"guard was bypassed.")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Integrity Check Failed: malformed lifecycle event in {path} "
+                f"(line {line_no}): {e}. Event streams must be valid JSONL.")
+        if not isinstance(rec, dict):
+            raise RuntimeError(
+                f"Integrity Check Failed: lifecycle record in {path} (line {line_no}) "
+                f"is not a JSON object.")
+        events.append(rec)
+    return events
+
+
+def _read_chunk_ledger(wfv_path: Path) -> set:
+    """The (start, end) chunk ledger actually present in <run>/sliced_data."""
+    sliced_dir = wfv_path / "sliced_data"
+    chunk_set = set()
+    if sliced_dir.is_dir():
+        for f in sorted(sliced_dir.iterdir()):
+            if not f.is_file():
+                continue
+            parsed = parse_chunk_file_name(f.name)
+            if parsed is None:
+                raise RuntimeError(
+                    f"Integrity Check Failed: unexpected file in sliced_data: {f.name} "
+                    f"(chunk files must be named rows_<start>_<end>.csv)"
+                )
+            chunk_set.add(parsed)
+    return chunk_set
+
+
 def _load_data_timestamps(data_csv: Path) -> np.ndarray:
     """Naive-UTC datetime64 array of data.csv rows (index == 0-based data row).
 
@@ -220,24 +432,165 @@ def _parse_equity_timestamps(equity_path: Path) -> np.ndarray:
     return ts.to_numpy()
 
 
-def _resolve_expected_ledger(wfv_path: Path, expected_windows, config: dict):
+def _verify_run_meta_identity(run_meta: dict, wfv_path: Path, strategy: str,
+                              config: dict, data_csv: Path, chunk_set: set) -> dict:
+    """Cross-check a run tree against its own run_meta.json (P2-2, fail closed).
+
+    Closes the blind spots the P1-8 reviewer deferred:
+      - "consistent truncation": deleting window dirs AND their data chunks used to
+        leave a self-consistent-looking tree. run_meta still names every planned
+        window and every planned chunk, so the missing pieces are now detectable.
+      - cross-run contamination: copying run A's sliced_data (or windows) into run B
+        changes the chunk set or the run_id/dir-name pairing that run_meta pins.
+      - price drift with unchanged timestamps: the data.csv sha256 fingerprint.
+      - config drift after the run: the consumed-config fingerprint (shared math
+        from wfv_ledger, identical to what the orchestrator recorded).
+    """
+    schema = run_meta.get("schema")
+    if schema != RUN_META_SCHEMA:
+        raise RuntimeError(
+            f"Integrity Check Failed: {wfv_path / RUN_META_FILE_NAME} schema "
+            f"{schema!r} != expected {RUN_META_SCHEMA!r} (the collator and the "
+            f"orchestrator must agree on the run_meta contract).")
+
+    run_id = run_meta.get("run_id")
+    if run_id != wfv_path.name:
+        raise RuntimeError(
+            f"Integrity Check Failed: run_meta.json records run_id {run_id!r} but this "
+            f"tree lives in directory {wfv_path.name!r}. Run trees are named after their "
+            f"run id; a renamed or copied run directory is not collatable evidence.")
+
+    if run_meta.get("strategy") != strategy:
+        raise RuntimeError(
+            f"Integrity Check Failed: run {run_id} calibrated strategy "
+            f"{run_meta.get('strategy')!r} but collation requests {strategy!r}.")
+
+    # --- data fingerprint: the exact bytes the run consumed ---
+    # Reviewer hardening (F4): the orchestrator always writes these fingerprint
+    # keys, so their ABSENCE in a run_meta is itself the signature of a hand-edited
+    # ledger. Optional-key checks were a fail-open seam in a fail-closed gate: a
+    # forger could delete a key to switch its check off. Presence is now mandatory.
+    recorded_data_sha = run_meta.get("data_sha256")
+    if not recorded_data_sha:
+        raise RuntimeError(
+            f"Integrity Check Failed: {wfv_path / RUN_META_FILE_NAME} carries no data_sha256. "
+            f"Every orchestrator-written run_meta pins the data.csv fingerprint; a run_meta "
+            f"without it cannot prove which bytes this run consumed — key omission is "
+            f"refused, not treated as 'nothing to verify'.")
+    actual_data_sha = sha256_file(data_csv)
+    if recorded_data_sha != actual_data_sha:
+        raise RuntimeError(
+            f"Integrity Check Failed: data.csv fingerprint mismatch for run {run_id}. "
+            f"run_meta records sha256 {recorded_data_sha[:16]}... for {run_meta.get('data_csv')}, "
+            f"the file used now hashes to {actual_data_sha[:16]}... The data changed after the "
+            f"run (price drift, re-download, or a substituted CSV), so this tree's evidence "
+            f"no longer describes the data being validated.")
+
+    # --- config fingerprint: the exact settings the run consumed ---
+    actual_fp = config_fingerprint(config, strategy)
+    recorded_fp = run_meta.get("config_fingerprint")
+    if recorded_fp != actual_fp:
+        raise RuntimeError(
+            f"Integrity Check Failed: consumed-config fingerprint mismatch for run {run_id}: "
+            f"run_meta records {str(recorded_fp)[:16]}... but the config now in effect hashes "
+            f"to {actual_fp[:16]}... (data_config / calibration_params / backtesting_params / "
+            f"{strategy}_strategy_params). Collating a run against a mutated config would "
+            f"re-interpret its evidence; refusing. Restore the config the run used or "
+            f"re-run the calibration.")
+    cfg_path = Path(run_meta.get("config_path", ""))
+    if not cfg_path.exists():
+        raise RuntimeError(
+            f"Integrity Check Failed: run_meta.json names config file {cfg_path} which no "
+            f"longer exists; the run's config provenance cannot be verified.")
+    recorded_cfg_sha = run_meta.get("config_sha256")
+    if not recorded_cfg_sha:
+        raise RuntimeError(
+            f"Integrity Check Failed: {wfv_path / RUN_META_FILE_NAME} carries no config_sha256. "
+            f"Post-run config drift is detected through this pin; omitting it switches the "
+            f"check off, which a fail-closed gate refuses (F4 hardening: key absence is not "
+            f"a valid state for a P2-2 run_meta).")
+    if recorded_cfg_sha != sha256_file(cfg_path):
+        raise RuntimeError(
+            f"Integrity Check Failed: {cfg_path} was modified after run {run_id} "
+            f"(run_meta records sha256 {recorded_cfg_sha[:16]}..., file now hashes "
+            f"{sha256_file(cfg_path)[:16]}...).")
+
+    # --- chunk ledger: every planned chunk must be present, no foreign chunks ---
+    raw_chunks = run_meta.get("expected_chunks")
+    expected_chunks = {tuple(c) for c in raw_chunks or []}
+    if not expected_chunks:
+        raise RuntimeError(
+            f"Integrity Check Failed: {wfv_path / RUN_META_FILE_NAME} carries no "
+            f"expected_chunks ledger. Every planned window implies sliced_data chunks; "
+            f"a run_meta without the chunk plan disables the cross-run-contamination / "
+            f"consistent-truncation checks, which this gate refuses (F4 hardening).")
+    missing = sorted(expected_chunks - chunk_set)
+    foreign = sorted(chunk_set - expected_chunks)
+    if missing or foreign:
+        raise RuntimeError(
+            f"Integrity Check Failed: sliced_data does not match the chunk ledger "
+            f"run_meta.json planned for run {run_id}. "
+            f"Missing chunks: {missing if missing else 'none'}; "
+            f"foreign chunks: {foreign if foreign else 'none'}. "
+            f"Either evidence was deleted alongside its window directories "
+            f"(consistent truncation), or another run's slices were copied in.")
+
+    return {
+        "run_id": run_id,
+        "mode": run_meta.get("mode"),
+        "data_sha256": actual_data_sha,
+        "config_fingerprint": actual_fp,
+        "planned_windows": int(run_meta.get("total_windows", len(run_meta.get("planned_ledger") or []))),
+    }
+
+
+def _resolve_expected_ledger(wfv_path: Path, expected_windows, config: dict,
+                             run_meta: dict = None):
     """Resolve the ledger the run under validation was SUPPOSED to produce.
 
     Returns (ledger, source, mode). Never looks at window result directories.
+
+    P2-2 priority:
+      1. run_meta.json planned ledger (the orchestrator wrote it BEFORE calibration)
+         — an explicit --expected-windows / ledger list is then CROSS-CHECKED
+         against it, never allowed to override it silently.
+      2. no run_meta (pre-P2-2 tree): explicit spec, then the sliced_data chunk
+         ledger, then fail closed (the P1-8 design, unchanged).
     """
-    sliced_dir = wfv_path / "sliced_data"
-    chunk_set = set()
-    if sliced_dir.is_dir():
-        for f in sorted(sliced_dir.iterdir()):
-            if not f.is_file():
-                continue
-            parsed = parse_chunk_file_name(f.name)
-            if parsed is None:
+    chunk_set = _read_chunk_ledger(wfv_path)
+
+    if run_meta is not None:
+        planned = run_meta.get("planned_ledger")
+        if not planned:
+            raise RuntimeError(
+                f"Integrity Check Failed: run_meta.json for run "
+                f"{run_meta.get('run_id')} carries no planned_ledger — the run's own "
+                f"expectation record is incomplete, so nothing can be validated against it.")
+        meta_ledger = normalize_ledger(planned)
+        meta_ledger.sort(key=lambda e: e["index"])
+        mode = run_meta.get("mode") or "unknown"
+        if isinstance(expected_windows, list):
+            explicit = normalize_ledger(expected_windows)
+            explicit.sort(key=lambda e: e["index"])
+            if explicit != meta_ledger:
                 raise RuntimeError(
-                    f"Integrity Check Failed: unexpected file in sliced_data: {f.name} "
-                    f"(chunk files must be named rows_<start>_<end>.csv)"
-                )
-            chunk_set.add(parsed)
+                    f"Integrity Check Failed: the explicit expected ledger supplied to the "
+                    f"collator contradicts run_meta.json's planned ledger for run "
+                    f"{run_meta.get('run_id')} "
+                    f"(explicit indices {[e['index'] for e in explicit]} vs planned "
+                    f"{[e['index'] for e in meta_ledger]}). run_meta is the primary "
+                    f"expectation; an override must match it, not replace it.")
+            return meta_ledger, "run_meta+explicit_ledger", mode
+        if expected_windows is not None:
+            if int(expected_windows) != len(meta_ledger):
+                raise RuntimeError(
+                    f"Integrity Check Failed: --expected-windows {int(expected_windows)} "
+                    f"contradicts run_meta.json, which planned {len(meta_ledger)} window(s) "
+                    f"for run {run_meta.get('run_id')}. run_meta is the primary expectation "
+                    f"source; drop the override or fix the run.")
+            return meta_ledger, "run_meta+cli", mode
+        return meta_ledger, "run_meta", mode
+
 
     def _match_chunks(chunk_set, want_n=None):
         if not chunk_set:
@@ -335,15 +688,23 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
          ranges match the ledger (half-open boundaries, shared arithmetic).
       5. Successful-window provenance: calibration_results_<strategy>.json
          exists and records the collated strategy; summary_stats signal_file
-         matches the strategy; wfv_decision.json survival records (where
-         recorded) carry strategy/window_index/is_seed/oos_seed matching
-         config backtesting_params.random_seed + window_index. Windows where
-         the seed is NOT recorded anywhere are listed in the report as
-         seed_unverified (documented gap for P2-2 — not a fake check).
+         matches the strategy. P2-2: each window's lifecycle.jsonl stream is
+         verified (window_start opener, terminal event, window_index/run_id
+         linkage, agreement with the manifest) and the OOS seed is checked
+         FAIL-CLOSED from every source that records it (lifecycle
+         oos_backtest_complete / survival_decision, summary_stats.random_seed)
+         against backtesting_params.random_seed + window_index. A window with no
+         seed evidence, or with sources that disagree, fails the gate:
+         seed_unverified no longer exists as an escape hatch.
       6. Equity/ledger integrity per successful window: no duplicate
          timestamps; the equity curve matches data.csv rows
          [oos_start, oos_end) bar-for-bar (P0-6: starts exactly at the OOS
          boundary, covers the full window, no pre-roll rows, no internal gaps).
+      0. P2-2 run identity (when run_meta.json is present): run_id == the run
+         directory name, matching strategy, data.csv sha256 + row count,
+         consumed-config fingerprint + config file hash, and the planned chunk
+         ledger vs the sliced_data actually on disk. A tree without run_meta is
+         a pre-P2-2 legacy tree: validated by the P1-8 method, reported as legacy.
       7. Cross-window contiguity: overlap (first_ts <= last_ts) → RuntimeError
          naming both windows and timestamps; gaps are only legitimate when they
          correspond exactly to manifest-marked skipped windows' OOS spans —
@@ -364,8 +725,36 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
             f"gate maps equity-curve timestamps onto ledger rows and requires it."
         )
 
+    # --- 0. run_meta.json (P2-2): the run's own expectation record ---
+    # Written by the orchestrator BEFORE any calibration starts, so it describes
+    # what the run was PLANNED to produce independently of what survived on disk.
+    # Trees without it are pre-P2-2: validated with the P1-8 method (chunk ledger /
+    # explicit spec) and reported as legacy, never silently treated as run-scoped.
+    run_meta = read_run_meta(wfv_path)
+    chunk_set = _read_chunk_ledger(wfv_path)
+    run_identity = None
+    if run_meta is not None:
+        run_identity = _verify_run_meta_identity(
+            run_meta, wfv_path, strategy, config, data_csv, chunk_set)
+
+    data_ts = _load_data_timestamps(data_csv)
+    n_data_rows = len(data_ts)
+    if run_meta is not None:
+        if run_meta.get("data_rows") is None:
+            raise RuntimeError(
+                f"Integrity Check Failed: run_meta.json for run {run_meta.get('run_id')} "
+                f"carries no data_rows. The orchestrator always records the dataset size "
+                f"the run planned against; omitting it disables the dataset-extension/"
+                f"truncation check (F4 hardening: key absence is not a valid state).")
+        if int(run_meta["data_rows"]) != n_data_rows:
+            raise RuntimeError(
+                f"Integrity Check Failed: run_meta.json records {run_meta['data_rows']} data "
+                f"rows for run {run_meta['run_id']}, but {data_csv} now has {n_data_rows}. "
+                f"The dataset was extended or truncated after the run.")
+
     # --- 1. Expected ledger (never inferred from window results) ---
-    ledger, ledger_source, mode = _resolve_expected_ledger(wfv_path, expected_windows, config)
+    ledger, ledger_source, mode = _resolve_expected_ledger(
+        wfv_path, expected_windows, config, run_meta=run_meta)
     by_index = {e["index"]: e for e in ledger}
 
     # --- 2. Discover window directories and check completeness ---
@@ -433,7 +822,70 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
     skipped = {}          # idx -> manifest
     successful = {}       # idx -> window dir
     seed_verified = []
-    seed_unverified = []
+    seed_unverified = []  # P2-2: stays empty by construction — seed provenance is
+                          # now fail-closed for every window (no documented gap left)
+    run_id = (run_identity or {}).get("run_id")
+
+    def _verify_window_lifecycle(window_dir: Path, idx: int, expect: str) -> list:
+        """Verify one window's lifecycle.jsonl event stream (P2-2).
+
+        Checked whenever run_meta is present (a run-scoped tree must carry its own
+        event stream) or whenever a lifecycle file exists at all. Enforces:
+          - every event's window_index matches the directory index;
+          - every event's run_id matches the run (no cross-run event injection);
+          - the stream opens with window_start and closes with a terminal event;
+          - the terminal event agrees with the manifest (window_skipped for a
+            manifest-marked skip, window_complete for a processed window) — a
+            manifest/lifecycle contradiction is a hard failure.
+        """
+        events = read_lifecycle_events(window_dir)
+        if not events:
+            if run_meta is not None:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} ({window_dir.name}) has no "
+                    f"lifecycle.jsonl events, but run {run_id} is a run-scoped (P2-2) run. "
+                    f"Every window of a P2-2 run must carry its own event stream.")
+            return []
+        for n, ev in enumerate(events, start=1):
+            ev_idx = ev.get("window_index")
+            if ev_idx is not None and int(ev_idx) != idx:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} lifecycle event #{n} "
+                    f"({ev.get('event')}) records window_index {ev_idx} != directory index {idx}.")
+            ev_run = ev.get("run_id")
+            if run_id is not None and ev_run is not None and ev_run != run_id:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} lifecycle event #{n} "
+                    f"({ev.get('event')}) records run_id {ev_run!r} != this run's {run_id!r} "
+                    f"— events from another run were injected into this window's stream.")
+        names = [ev.get("event") for ev in events]
+        if "window_start" not in names:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} lifecycle stream never opens with a "
+                f"window_start event (found: {names}).")
+        skipped_seen = "window_skipped" in names
+        complete_seen = "window_complete" in names
+        if skipped_seen and complete_seen:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} lifecycle stream carries BOTH "
+                f"window_skipped and window_complete — contradictory terminal states.")
+        if expect == "skipped" and not skipped_seen:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} is manifest-marked "
+                f"{NO_ADMISSIBLE_TRIAL_STATUS} but its lifecycle stream has no window_skipped "
+                f"event (found: {names}).")
+        if expect == "ok" and not complete_seen:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} produced backtest results but its "
+                f"lifecycle stream never reaches window_complete (found: {names}) — the "
+                f"window's terminal state was never recorded.")
+        if expect == "ok" and "oos_backtest_complete" not in names:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} produced backtest results but its "
+                f"lifecycle stream has no oos_backtest_complete event (found: {names}) — that "
+                f"event is what records WHICH seed and WHICH signal file produced these "
+                f"results; without it the evidence cannot be attributed to this run.")
+        return events
 
     for idx in sorted(by_index):
         entry = by_index[idx]
@@ -505,6 +957,7 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
                         f"{manifest.get('is_start_row')} does not match ledger IS start "
                         f"{sorted(acceptable_is)}"
                     )
+                _verify_window_lifecycle(window_dir, idx, "skipped")
                 skipped[idx] = manifest
                 continue
             if status is not None:
@@ -566,56 +1019,123 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
                 f"(expected prefix {SIGNAL_FILE_PREFIXES[strategy]!r})"
             )
 
-        # Provenance: OOS seed where recorded (monthly survival audit records;
-        # annual windows record no seed — documented gap for P2-2).
-        decision_path = window_dir / "wfv_decision.json"
-        records = []
-        if decision_path.exists():
-            try:
-                for line in decision_path.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    rec = json.loads(line)
-                    if rec.get("event") == "survival_decision":
-                        records.append(rec)
-            except (json.JSONDecodeError, OSError) as e:
-                raise RuntimeError(
-                    f"Integrity Check Failed: window {idx} wfv_decision.json unreadable: {e}"
-                )
-        if records:
-            rec = records[-1]
+        # --- P2-2: lifecycle stream + FAIL-CLOSED OOS seed provenance ---
+        # The P1-8 gate could only check the seed where a monthly survival record
+        # happened to exist, and reported annual windows as seed_unverified (the
+        # documented gap P2-2 was created to close). Every window of a run now
+        # records its OOS seed in at least two independent places:
+        #   - lifecycle.jsonl oos_backtest_complete.oos_seed (orchestrator),
+        #   - backtest_results/summary_stats.json random_seed (backtester echo),
+        #   - lifecycle.jsonl survival_decision.oos_seed (monthly windows).
+        # A window with NO seed evidence, or with evidence that disagrees with the
+        # formula or with itself, fails the gate.
+        events = _verify_window_lifecycle(window_dir, idx, "ok")
+        seeds = {}
+        survival_records = []
+        for ev in events:
+            name = ev.get("event")
+            if name == "survival_decision":
+                survival_records.append(ev)
+            if name in ("oos_backtest_complete", "survival_decision") \
+                    and ev.get("oos_seed") is not None:
+                seeds[f"lifecycle.{name}"] = int(ev["oos_seed"])
+        if stats.get("random_seed") is not None:
+            seeds["summary_stats.random_seed"] = int(stats["random_seed"])
+
+        expected_oos_seed = bp_seed + idx
+        if not seeds:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} records its OOS seed nowhere "
+                f"(no lifecycle oos_backtest_complete/survival_decision oos_seed, no "
+                f"summary_stats.json random_seed). Seed provenance is unverifiable, so the "
+                f"window's trades cannot be attributed to a reproducible run — refusing to "
+                f"collate. (P2-2 removed the P1-8 seed_unverified escape hatch.)")
+        mismatched = {src: val for src, val in seeds.items() if val != expected_oos_seed}
+        if mismatched:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} OOS seed provenance mismatch: "
+                f"{mismatched} recorded, but the orchestrator formula is "
+                f"backtesting_params.random_seed + window_index = {bp_seed}+{idx} = "
+                f"{expected_oos_seed}. Seed drift between the calibrator, the backtester, "
+                f"and the orchestrator is exactly what P2-2's explicit --oos-seed wiring "
+                f"prevents; a mismatch means the run was assembled by hand.")
+        if survival_records:
+            rec = survival_records[-1]
             if rec.get("strategy") != strategy:
                 raise RuntimeError(
-                    f"Integrity Check Failed: window {idx} survival audit record strategy "
+                    f"Integrity Check Failed: window {idx} survival decision event strategy "
                     f"{rec.get('strategy')!r} != collated strategy {strategy!r}"
                 )
             if int(rec.get("window_index", -1)) != idx:
                 raise RuntimeError(
-                    f"Integrity Check Failed: window {idx} survival audit record window_index "
+                    f"Integrity Check Failed: window {idx} survival decision event window_index "
                     f"{rec.get('window_index')} != directory index {idx}"
                 )
             if int(rec.get("is_seed", -1)) != bp_seed:
                 raise RuntimeError(
-                    f"Integrity Check Failed: window {idx} survival audit is_seed "
+                    f"Integrity Check Failed: window {idx} survival decision event is_seed "
                     f"{rec.get('is_seed')} != config backtesting_params.random_seed {bp_seed}"
                 )
-            expected_oos_seed = bp_seed + idx
-            if int(rec.get("oos_seed", -1)) != expected_oos_seed:
+            if run_id is not None and rec.get("run_id") is not None and rec.get("run_id") != run_id:
                 raise RuntimeError(
-                    f"Integrity Check Failed: window {idx} survival audit oos_seed "
-                    f"{rec.get('oos_seed')} != expected {bp_seed}+{idx} = {expected_oos_seed} "
-                    f"(orchestrator OOS seed formula)"
-                )
-            seed_verified.append(idx)
-        else:
-            # 0-byte wfv_decision.json (annual windows / failed audit logger) is a
-            # tolerated pre-existing artifact — but the seed is then unverifiable.
-            seed_unverified.append(idx)
+                    f"Integrity Check Failed: window {idx} survival decision event run_id "
+                    f"{rec.get('run_id')!r} != this run's {run_id!r}")
+        # The lifecycle backtest event and the backtest evidence must name the SAME
+        # signal file: a stream that describes a different signal run than the one
+        # that produced summary_stats.json is a swapped-evidence signature.
+        bt_events = [ev for ev in events if ev.get("event") == "oos_backtest_complete"]
+        if bt_events:
+            ev_sig = str(bt_events[-1].get("signal_file", ""))
+            if ev_sig and ev_sig != sig_file:
+                raise RuntimeError(
+                    f"Integrity Check Failed: window {idx} lifecycle oos_backtest_complete "
+                    f"names signal file {ev_sig!r} but backtest_results/summary_stats.json "
+                    f"names {sig_file!r} — the lifecycle stream describes a different "
+                    f"signal/backtest run than the evidence on disk.")
+        if run_id is not None and stats.get("run_id") is not None and stats["run_id"] != run_id:
+            raise RuntimeError(
+                f"Integrity Check Failed: window {idx} summary_stats.json records run_id "
+                f"{stats['run_id']!r} != this run's {run_id!r} — backtest evidence from "
+                f"another run was placed in this window.")
+        seed_verified.append(idx)
 
-    # --- 6a. Load equity timestamps + duplicate check ---
-    data_ts = _load_data_timestamps(data_csv)
-    n_data_rows = len(data_ts)
+    # --- P2-2 hardening (reviewer F5): run_meta.outcomes must agree with the tree ---
+    # outcomes/total_windows were reported but never cross-checked: a run_meta could
+    # claim a manifest-skipped window as OK and the diagnostics report would repeat
+    # the lie. Window states are already validated independently above; this closes
+    # the summary-vs-evidence contradiction. outcomes=None is the orchestrator's
+    # honest pre-finalize state (finalize_run_meta writes the dict at run end) and is
+    # reported as-is, never invented and never required mid-life.
+    outcomes = run_meta.get("outcomes") if run_meta is not None else None
+    if isinstance(outcomes, dict):
+        claimed = {int(k): str(v) for k, v in outcomes.items()}
+        planned_idx = {int(e["index"]) for e in ledger}
+        if set(claimed) != planned_idx:
+            raise RuntimeError(
+                f"Integrity Check Failed: run_meta.outcomes covers windows {sorted(claimed)} "
+                f"but the planned ledger covers {sorted(planned_idx)} — the run summary does "
+                f"not describe the run it claims to.")
+        for idx in sorted(claimed):
+            if idx in successful:
+                if claimed[idx] != "OK":
+                    raise RuntimeError(
+                        f"Integrity Check Failed: run_meta.outcomes claims window {idx} is "
+                        f"{claimed[idx]!r} but the tree carries full backtest evidence for it "
+                        f"(summary_stats.json + lifecycle window_complete).")
+            elif idx in skipped:
+                if claimed[idx] not in (NO_ADMISSIBLE_TRIAL_STATUS, "CASCADE_SKIP"):
+                    raise RuntimeError(
+                        f"Integrity Check Failed: run_meta.outcomes claims window {idx} is "
+                        f"{claimed[idx]!r} but the window is manifest-marked "
+                        f"{NO_ADMISSIBLE_TRIAL_STATUS} — skipped windows cannot be claimed OK.")
+    if run_meta is not None and run_meta.get("total_windows") is not None:
+        if int(run_meta["total_windows"]) != len(ledger):
+            raise RuntimeError(
+                f"Integrity Check Failed: run_meta.total_windows records "
+                f"{run_meta['total_windows']} but the resolved ledger has {len(ledger)} "
+                f"windows — the run's own count disagrees with its plan.")
+
+    # --- 6a. Equity timestamps + duplicate check (data_ts loaded in step 0) ---
     equity_ts = {}
     for idx in sorted(successful):
         entry = by_index[idx]
@@ -726,6 +1246,12 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
                      if str(m.get("error", "")).startswith("CASCADE_SKIP"))
     report = {
         "passed": True,
+        "run_id": run_id,
+        "run_meta_present": run_meta is not None,
+        "run_scoped": run_meta is not None,
+        "fingerprints_verified": run_meta is not None,
+        "data_sha256": (run_identity or {}).get("data_sha256"),
+        "config_fingerprint": (run_identity or {}).get("config_fingerprint"),
         "ledger_source": ledger_source,
         "mode": mode,
         "expected_window_count": len(ledger),
@@ -744,68 +1270,71 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
     print(f"[Integrity Check] PASSED: {len(ledger)} window(s) validated "
           f"({len(succ_sorted)} successful, {len(skipped)} manifest-skipped, "
           f"{len(gaps)} explicit gap(s)); ledger source: {ledger_source}, mode: {mode}.")
-    if seed_unverified:
-        print(f"[Integrity Check] NOTE: OOS seed unverifiable for windows {seed_unverified} "
-              f"(no survival audit record written — annual windows record no seed; flagged for P2-2).")
+    if run_meta is not None:
+        print(f"[Integrity Check] Run identity verified: run_id={run_id}, "
+              f"data sha256 {(run_identity or {}).get('data_sha256', '')[:16]}..., "
+              f"config fingerprint {(run_identity or {}).get('config_fingerprint', '')[:16]}..., "
+              f"chunk ledger matched exactly.")
+    else:
+        print(f"[Integrity Check] NOTE: no {RUN_META_FILE_NAME} in this tree — it predates "
+              f"P2-2 run scoping (or was produced outside the orchestrator). Validated with "
+              f"the P1-8 method; run-level identity and fingerprints are unavailable.")
+    print(f"[Integrity Check] OOS seed provenance verified fail-closed for all "
+          f"{len(seed_verified)} successful window(s); seed_unverified is empty by design.")
     return report
 
 
 
-def aggregate_audit_logs(wfv_dir, output_dir):
-    """Aggregate per-window survival-decision audit records into one JSONL file (P1-5).
+def aggregate_lifecycle_logs(wfv_dir, output_dir=None):
+    """Concatenate per-window lifecycle.jsonl streams into one master stream (P2-2).
 
-    Each monthly calibration writes ``wfv_decision.json`` in its window
-    directory via the logging_utils audit logger. Despite the ``.json`` name
-    the file is JSONL by content: one JSON object per line. This walks the
-    window directories in window-index order and concatenates every valid
-    record into ``<output_dir>/collated_wfv_decisions.jsonl``.
+    Replaces the P1-5 ``aggregate_audit_logs`` (which merged the single-event
+    ``wfv_decision.json`` files into ``collated_wfv_decisions.jsonl``). The master
+    stream lands in the RUN DIRECTORY — ``<run_dir>/master_lifecycle.jsonl`` —
+    because a lifecycle stream is run evidence, not a collation report: it belongs
+    with the run it describes and survives independently of any collation output
+    directory (which is a reusable, overwritable scratch space).
 
-    DEVIATION from the review spec's literal CWD-relative
-    ``Path("collated_wfv_decisions.jsonl")``: the master file lands in the
-    collator's established --output-dir convention (default
-    ``collated_wfv_results_<strategy>``), like every other collated artifact.
-
-    Tolerated by design: missing audit files (annual windows have no survival
-    decision), empty audit files, and malformed lines (a warning naming the
-    path is logged; collation never crashes).
+    Ordering: window index ascending, events in per-file append order. Each line
+    is validated as JSON before being copied; a malformed line is a HARD failure
+    (lifecycle streams are integrity evidence — the old aggregator's tolerance of
+    malformed audit lines silently dropped evidence, which is the behavior P2-2
+    retires). Missing per-window files are tolerated: a pre-P2-2 tree, or a window
+    that crashed before its logger opened, contributes nothing rather than
+    fabricating events. The integrity gate is what decides whether absence is
+    acceptable for a given run.
     """
     wfv_path = Path(wfv_dir)
-    master_path = os.path.join(output_dir, 'collated_wfv_decisions.jsonl')
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    out_dir = Path(output_dir) if output_dir else wfv_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+    master_path = out_dir / "master_lifecycle.jsonl"
+
     if not wfv_path.exists():
-        print(f"[audit] WFV directory not found: {wfv_dir}; no decision records aggregated.")
-        with open(master_path, 'w'):
+        print(f"[lifecycle] WFV directory not found: {wfv_dir}; no events aggregated.")
+        with open(master_path, "w"):
             pass
         return master_path, 0
 
-    windows = sorted(
-        [d for d in wfv_path.iterdir() if d.is_dir() and 'window_' in d.name],
-        key=lambda x: int(x.name.split('_')[1])
-    )
+    windows = []
+    for d in wfv_path.iterdir():
+        if not d.is_dir():
+            continue
+        parsed = parse_window_dir_name(d.name)
+        if parsed is not None:
+            windows.append((parsed[0], d))
+    windows.sort(key=lambda t: t[0])
 
     records = 0
-    with open(master_path, 'w') as master_f:
-        for window_dir in windows:
-            audit_file = window_dir / 'wfv_decision.json'
-            if not audit_file.exists():
-                continue  # annual windows have no survival decision
-            try:
-                content = audit_file.read_text()
-            except OSError as e:
-                print(f"[audit] WARNING: could not read audit file {audit_file}: {e}")
-                continue
-            for line_no, line in enumerate(content.splitlines(), start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    json.loads(line)  # validate JSONL-by-content before copying
-                except json.JSONDecodeError:
-                    print(f"[audit] WARNING: malformed audit record in {audit_file} (line {line_no}); skipped")
-                    continue
-                master_f.write(line + "\n")
+    per_window = {}
+    with open(master_path, "w", encoding="utf-8") as master_f:
+        for idx, window_dir in windows:
+            events = read_lifecycle_events(window_dir)
+            per_window[idx] = len(events)
+            for ev in events:
+                master_f.write(json.dumps(ev, separators=(",", ":")) + "\n")
                 records += 1
-    print(f"[audit] Aggregated {records} survival decision record(s) -> {master_path}")
+    print(f"[lifecycle] Aggregated {records} lifecycle event(s) from {len(per_window)} "
+          f"window stream(s) -> {master_path}")
     return master_path, records
 
 
@@ -817,6 +1346,10 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
     integrity_report = validate_wfv_integrity(
         wfv_dir, strategy, expected_windows=expected_windows,
         config=CONF, data_csv=data_csv)
+
+    # P2-2: the run's own record, for the diagnostics report. The gate has already
+    # verified it against the tree (identity + fingerprints + chunk ledger).
+    run_meta = read_run_meta(Path(wfv_dir))
 
     if output_dir is None:
         output_dir = f'collated_wfv_results_{strategy}'
@@ -1003,10 +1536,11 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
                 except pd.errors.EmptyDataError:
                     pass
 
-    # --- Aggregate per-window survival-decision audit records (P1-5) ---
-    # Runs even if equity reconstruction below fails, and never crashes on
-    # missing/empty/malformed audit files.
-    aggregate_audit_logs(wfv_dir, output_dir)
+    # --- Merge per-window lifecycle streams into the run's master stream (P2-2) ---
+    # Runs even if equity reconstruction below fails. Malformed lines fail closed
+    # (read_lifecycle_events), missing per-window streams are tolerated here and
+    # judged by the integrity gate.
+    aggregate_lifecycle_logs(wfv_dir)
 
     # --- P1-7: persist explicitly-skipped windows (visibility, not fabrication) ---
     # Written before any early return below so the skip ledger survives even if
@@ -1215,6 +1749,31 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
                 # explicit gap records, seed verification coverage). The gate ran
                 # as the very first step of collate_results and passed.
                 'integrity': integrity_report,
+                # P2-2 run-level visibility: which run this evidence belongs to, what
+                # the orchestrator planned, and how each window ended. Reconstructed
+                # from the run directory alone (run_meta.json + manifests), so a run
+                # summary survives even if no collation output directory is kept.
+                'run': ({
+                    'run_id': run_meta.get('run_id'),
+                    'mode': run_meta.get('mode'),
+                    'created_at': run_meta.get('created_at'),
+                    'finished_at': run_meta.get('finished_at'),
+                    'workers': run_meta.get('workers'),
+                    'total_windows': run_meta.get('total_windows'),
+                    'outcomes': run_meta.get('outcomes'),
+                    'completed_window_indices': run_meta.get('completed_window_indices'),
+                    'skipped_windows': run_meta.get('skipped_windows'),
+                    'cascade_skipped_window_indices': run_meta.get('cascade_skipped_window_indices'),
+                    'data_sha256': run_meta.get('data_sha256'),
+                    'config_sha256': run_meta.get('config_sha256'),
+                    'config_fingerprint': run_meta.get('config_fingerprint'),
+                    'oos_seed_formula': run_meta.get('oos_seed_formula'),
+                    'random_seed_base': run_meta.get('random_seed_base'),
+                } if run_meta is not None else {
+                    'run_id': None,
+                    'note': ('no run_meta.json in this tree: pre-P2-2 layout, or a tree '
+                             'assembled outside the orchestrator'),
+                }),
                 # Naming disambiguation: bar-level skipped SIGNALS rows inside
                 # successful windows (collated_skipped_signals.csv) vs the
                 # window-level skips above.
@@ -1327,7 +1886,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collate WFV results across windows")
     parser.add_argument("--strategy", choices=["vm", "tv", "trend"], default="vm",
                         help="Strategy to use for baseline comparison (default: vm)")
-    parser.add_argument("--wfv-dir", default="wfv", help="WFV output directory")
+    parser.add_argument("--runs-dir", default=None,
+                        help=f"Root of run-scoped WFV trees (default: {PROJECT_DIR / 'wfv' / RUNS_SUBDIR}). "
+                             "Point it elsewhere to collate scratch trees.")
+    parser.add_argument("--run-id", default=None,
+                        help="Collate this specific run id. When omitted, the LATEST run is chosen "
+                             "by lexicographic max of the run directory NAME (run ids are "
+                             "timestamp-prefixed, so name order is chronological order; mtime is "
+                             "deliberately ignored).")
+    parser.add_argument("--wfv-dir", default=None,
+                        help="Escape hatch: collate this explicit tree directory and skip run "
+                             "discovery (scratch test trees, or a deliberate legacy pre-P2-2 tree).")
     parser.add_argument("--output-dir", default=None, help="Output directory for collated results (default: collated_wfv_results_<strategy>)")
     parser.add_argument("--expected-windows", type=int, default=None,
                         help="Number of windows the run under validation was scheduled to "
@@ -1339,6 +1908,13 @@ if __name__ == "__main__":
                         help="data.csv used to map equity timestamps onto ledger rows "
                              "(default: v6/data.csv)")
     args = parser.parse_args()
-    collate_results(wfv_dir=args.wfv_dir, output_dir=args.output_dir, strategy=args.strategy,
+
+    if args.wfv_dir:
+        wfv_dir = args.wfv_dir
+        print(f"[P2-2] Collating explicit tree (--wfv-dir): {wfv_dir}")
+    else:
+        runs_dir = args.runs_dir or str(PROJECT_DIR / "wfv" / RUNS_SUBDIR)
+        wfv_dir = discover_run_dir(runs_dir, args.run_id, strategy=args.strategy)
+    collate_results(wfv_dir=str(wfv_dir), output_dir=args.output_dir, strategy=args.strategy,
                     expected_windows=args.expected_windows, data_csv=args.data_csv)
 

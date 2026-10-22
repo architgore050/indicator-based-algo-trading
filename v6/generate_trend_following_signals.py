@@ -46,10 +46,20 @@ CONF = load_config()
 DATA_CONF = CONF["data_config"]
 
 
-def load_params(calibration_path=None):
+def load_params(calibration_path=None, no_override=False):
     with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
     params = dict(config["trend_strategy_params"])
+
+    # P2-2 (reviewer carry-forward): no_override=True pins the BASELINE parameter
+    # set - config.json only - and skips the CALIBRATION_PATH fallback entirely.
+    # Without it, a "baseline params" reference run silently picks up whatever stale
+    # calibration_results_*.json a previous calibration run left in the repo root, so
+    # the baseline is no longer the documented baseline. Used by the collator's
+    # baseline reference run via --no-calibration.
+    if no_override:
+        logger.info("Baseline purity: calibration overrides disabled (--no-calibration).")
+        return params
 
     path_to_use = Path(calibration_path) if calibration_path else CALIBRATION_PATH
     if path_to_use.exists():
@@ -440,13 +450,17 @@ def main() -> None:
     parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
+    parser.add_argument("--no-calibration", action="store_true",
+                        help="Baseline purity: load parameters from config.json only, ignoring "
+                             "calibration_results_trend.json overrides (used by the collator's "
+                             "baseline reference run).")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
     parser.add_argument("--oos-start-row-in-slice", type=int, default=None,
                         help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
                              "Signals generated before it are discarded. Default None = no filtering.")
     args = parser.parse_args()
 
-    params = load_params(args.calibration)
+    params = load_params(args.calibration, no_override=args.no_calibration)
 
     output_path = generate_signals(
         params, args.mode, args.start_row, args.end_row,

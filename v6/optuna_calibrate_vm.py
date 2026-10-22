@@ -37,7 +37,8 @@ import moo_selection as moo
 # path by construction (the old private generate_vm_signals_local duplicate
 # is deleted).
 from generate_vm_automation_logic_signals import compute_signals_df
-from logging_utils import get_logger, suppress_pandas_warnings, setup_root_logger, get_audit_logger
+from logging_utils import (get_logger, suppress_pandas_warnings, setup_root_logger,
+                           get_lifecycle_logger, close_lifecycle_logger)
 
 suppress_pandas_warnings()
 
@@ -636,8 +637,18 @@ def _fmt_objectives(objectives) -> str:
             f"PF={objectives[2]:.3f}")
 
 
-def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None, distribution_prior: dict = None, cpcv_config: dict = None, quality_floors: bool = True):
+def run_study(phase: int, n_trials: int, sampler, data: cudf.DataFrame, study, current_best: dict = None, distribution_prior: dict = None, cpcv_config: dict = None, quality_floors: bool = True,
+              lifecycle=None, run_id=None, window_index: int = 0):
     ranges = CALIB_PARAMS["vm_ranges"]
+
+    # P2-2: phase transitions are machine-readable lifecycle events (the human
+    # console lines below stay for operators).
+    if lifecycle is not None:
+        lifecycle.info({"event": "phase_start", "run_id": run_id,
+                        "window_index": int(window_index), "phase": int(phase),
+                        "n_trials": int(n_trials),
+                        "sampler": sampler.__class__.__name__,
+                        "strategy": "vm"})
 
     # Port over the distribution/warm start by enqueuing the best trial
     if current_best:
@@ -793,6 +804,16 @@ def main():
     parser.add_argument("--distribution-prior", type=str, help="Path to JSON file with distribution prior (mean, std) from parent annual's Phase 1+2 trials.")
     parser.add_argument("--output", type=str, default=None, help="Output path for calibration results JSON (default: calibration_results_vm.json).")
     parser.add_argument("--window-index", type=int, default=0, help="Window index for per-window SQLite DB naming.")
+    # P2-2: run identity. OPTIONAL by design — AGENTS.md documents standalone
+    # calibrator runs without --run-id; those record events with run_id: null.
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="WFV run id this calibration belongs to (orchestrator-supplied). "
+                             "Standalone runs omit it and record run_id: null.")
+    parser.add_argument("--oos-seed", type=int, default=None,
+                        help="The OOS backtest seed the orchestrator will use for this window. "
+                             "Recorded verbatim in the survival_decision event. Standalone runs "
+                             "omit it and fall back to the documented formula "
+                             "backtesting_params.random_seed + window_index.")
     args = parser.parse_args()
     
     # Override results path for per-window isolation (parallel WFV safety)
@@ -802,9 +823,22 @@ def main():
     else:
         RESULTS_PATH = PROJECT_DIR / "calibration_results_vm.json"
 
-    # P1-5: structured survival-decision audit record lands in this window's
-    # output directory (RESULTS_PATH.parent — the orchestrator's --output dir).
-    audit_logger = get_audit_logger(__name__, log_dir=str(RESULTS_PATH.parent))
+    # P2-2: the per-window lifecycle stream REPLACES the P1-5 audit logger
+    # (wfv_decision.json). It lands in this window's output directory
+    # (RESULTS_PATH.parent — the orchestrator's window dir), the same file the
+    # orchestrator appends its own events to. All machine-readable events flow
+    # through this one stream: calibration_start, phase_start, survival_decision,
+    # calibration_complete.
+    # P2-2: the OOS seed is authoritative when the orchestrator passes it
+    # (--oos-seed). Standalone runs fall back to the documented formula
+    # backtesting_params.random_seed + window_index (the pre-P2-2 coupling, kept
+    # only as an explicit fallback so standalone developer commands still record
+    # a seed).
+    oos_seed_value = (int(args.oos_seed) if args.oos_seed is not None
+                      else int(BP["random_seed"] + args.window_index))
+    # Standalone runs without a window output directory have no window dir to
+    # attach a lifecycle.jsonl to, so their events stay console-only.
+    lifecycle_logger = None
 
     end_row = args.end_row
     trial_rows = 1000 if args.smoke else CALIB_PARAMS["calibration_rows_per_trial"]
@@ -812,6 +846,19 @@ def main():
     # Overwrite trial_rows if explicitly provided via start-row logic in orchestrator
     if args.start_row > 0:
         trial_rows = end_row - args.start_row
+
+    # P2-2: calibration_start is recorded once the window's row budget is known,
+    # so the event payload matches the tv/trend calibrators exactly (trial_rows
+    # included) — one vocabulary, three strategies.
+    if RESULTS_PATH.parent.name.startswith("window_"):
+        lifecycle_logger = get_lifecycle_logger(str(RESULTS_PATH.parent), name="optuna_calibrate_vm")
+        lifecycle_logger.info({
+            "event": "calibration_start", "run_id": args.run_id, "strategy": "vm",
+            "window_index": int(args.window_index), "phase3_only": bool(args.phase3_only),
+            "smoke": bool(args.smoke), "start_row": int(args.start_row),
+            "end_row": int(args.end_row), "trial_rows": int(trial_rows),
+            "output": str(RESULTS_PATH), "oos_seed": oos_seed_value,
+        })
 
     # P1-6: CPCV knob set — smoke slices are too small for the full 6x3
     # combinatorial grid; smoke proves plumbing/determinism, not statistical
@@ -945,7 +992,9 @@ def main():
         sampler = NSGAIISampler(seed=p1_seed)
         logger.info(f"Phase 1 sampler: {sampler.__class__.__name__} seed={p1_seed}")
         study = run_study(1, p1_trials, sampler, data, shared_study,
-                          cpcv_config=cpcv_knobs, quality_floors=quality_floors)
+                          cpcv_config=cpcv_knobs, quality_floors=quality_floors,
+                          lifecycle=lifecycle_logger, run_id=args.run_id,
+                          window_index=args.window_index)
 
         # Archive phase trials BEFORE winner selection so an all-infeasible phase
         # still leaves a diagnosable archive for the P1-7 NO_ADMISSIBLE_TRIAL path.
@@ -977,7 +1026,9 @@ def main():
             logger.info(f"Phase 2 sampler: {sampler.__class__.__name__} seed={p2_seed}")
             study = run_study(2, p2_trials, sampler, data, shared_study,
                               current_best=current_best, cpcv_config=cpcv_knobs,
-                              quality_floors=quality_floors)
+                              quality_floors=quality_floors,
+                              lifecycle=lifecycle_logger, run_id=args.run_id,
+                              window_index=args.window_index)
 
             save_phase_trials(study, output_dir, 2)
 
@@ -1007,7 +1058,9 @@ def main():
     logger.info(f"Phase 3 sampler: {sampler.__class__.__name__} seed={p3_seed}")
     study = run_study(3, p3_trials, sampler, data, shared_study, current_best=current_best,
                       distribution_prior=distribution_prior, cpcv_config=cpcv_knobs,
-                      quality_floors=quality_floors)
+                      quality_floors=quality_floors,
+                      lifecycle=lifecycle_logger, run_id=args.run_id,
+                      window_index=args.window_index)
 
     # --- MOO-aware extraction (P1-6): deterministic single answer from the
     # feasible Pareto front. study.best_trials returns ONLY constraint-feasible
@@ -1094,13 +1147,14 @@ def main():
             reason = (f"refined objectives dominate baseline "
                       f"(refined {_fmt_objectives(refined_objectives)} vs baseline {_fmt_objectives(baseline_objectives)}): "
                       f"refined trial adopted")
-        # oos_seed mirrors the orchestrator's OOS backtest seed formula
-        # (CONFIG["backtesting_params"]["random_seed"] + window_index, see
-        # orchestrate_calibration.py:544 with --window-index i). The calibrator
-        # is never told the OOS seed explicitly — this duplicated formula is a
-        # KNOWN COUPLING/FRAGILITY, flagged for P2-2 to pass the seed explicitly.
+        # oos_seed: P2-2 — the orchestrator passes the window's OOS seed
+        # explicitly (--oos-seed); the recorded value is that seed verbatim.
+        # The pre-P2-2 behavior (re-deriving random_seed + window_index inside
+        # the calibrator) survives only as the standalone fallback documented
+        # above.
         audit_record = {
             "event": "survival_decision",
+            "run_id": args.run_id,
             "strategy": "vm",
             "window_index": int(args.window_index),
             "start_row": int(args.start_row),
@@ -1108,7 +1162,7 @@ def main():
             "rows_used": int(trial_rows),
             "phase3_only": bool(args.phase3_only),
             "is_seed": int(BP["random_seed"]),
-            "oos_seed": int(BP["random_seed"] + args.window_index),
+            "oos_seed": int(oos_seed_value),
             "baseline_score": float(baseline_objectives[0]),
             "refined_score": float(refined_objectives[0]),
             "baseline_objectives": [float(v) for v in baseline_objectives],
@@ -1135,10 +1189,11 @@ def main():
             # (dominance arithmetic bypassed — see classify_survival_decision).
             "baseline_admissible": bool(baseline_admissible),
         }
-        audit_logger.info(audit_record)
+        if lifecycle_logger is not None:
+            lifecycle_logger.info(audit_record)
         logger.info(
             f"Survival Decision (audit): {decision} | incumbent_selected={incumbent_selected} | "
-            f"parent_digest={parent_digest[:16]} | record: {RESULTS_PATH.parent / 'wfv_decision.json'}"
+            f"parent_digest={parent_digest[:16]} | record: {RESULTS_PATH.parent / 'lifecycle.jsonl'}"
         )
 
     # Final Results
@@ -1162,7 +1217,20 @@ def main():
     
     with open(RESULTS_PATH, "w") as f:
         json.dump(results, f, indent=2)
-    
+
+    # P2-2: terminal lifecycle event for this calibration (the orchestrator
+    # records the window-level events around it).
+    if lifecycle_logger is not None:
+        lifecycle_logger.info({
+            "event": "calibration_complete", "run_id": args.run_id, "strategy": "vm",
+            "window_index": int(args.window_index),
+            "best_objectives": [float(v) for v in best_objectives],
+            "objective_keys": list(moo.OBJECTIVE_KEYS),
+            "phase3_only": bool(args.phase3_only),
+            "results_path": str(RESULTS_PATH),
+        })
+        close_lifecycle_logger(str(RESULTS_PATH.parent))
+
     logger.info(f"SOTA Calibration Complete. Final objectives: {_fmt_objectives(best_objectives)}. Results saved to {RESULTS_PATH}")
 
 if __name__ == "__main__":

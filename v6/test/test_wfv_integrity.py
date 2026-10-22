@@ -28,6 +28,25 @@ Scenarios:
   S18 Explicit int N resolution path (no chunks)
   S19 Manifest-skipped window carrying calibration_results debris
   S20 Manifest window_label inconsistent with directory index/regime
+  S21 Foreign calibration results on a successful window
+  P2-2 lifecycle / run_meta scenarios (synthetic run-scoped trees):
+  S22 run_meta happy path: run identity + fingerprints + chunk ledger verified
+  S23 Mutation proof (i): window dir AND its data chunks deleted together
+  S24 Mutation proof (ii): one tampered price byte in data.csv
+  S25 Mutation proof (iii): another run's sliced_data copied into this run
+  S26 run_id / run-directory-name mismatch
+  S27 Annual window with no seed evidence anywhere (fail closed)
+  S28 Lifecycle stream that never reaches window_complete
+  S29 Foreign run_id injected into a lifecycle event
+  S30 Consumed-config fingerprint drift after the run
+  S31 --expected-windows contradicts run_meta's planned ledger
+  S32 Malformed lifecycle.jsonl line (torn/hand-edited stream)
+  S33 Manifest-marked skip with no window_skipped lifecycle event
+  S34 Legacy (pre-run_meta) tree validated by the chunk ledger, status reported honestly
+  S35 Lifecycle backtest event names a different signal file than the evidence
+  S36 Mutation proof (iv): deleting a window's oos_backtest_complete event fails closed
+  S37 run_meta missing a fingerprint key fails closed (reviewer F4 hardening)
+  S38 run_meta.outcomes/total_windows cross-checked against the tree (reviewer F5)
 
 Synthetic pinned config (independent of the live config's 185-window schedule):
 data_start_row 100, annual IS 200 -> oos_start_base 300; OOS 60 bars; monthly
@@ -101,13 +120,60 @@ def dir_name(idx):
     return entry["dir_name"]
 
 
-def write_window(wfv_dir, idx, state, strategy="vm"):
+def lifecycle_events(idx, state, strategy="vm", run_id=None):
+    """The lifecycle.jsonl event stream a real window would have written (P2-2).
+
+    Mirrors orchestrate_calibration.process_window: window_start, then either
+    oos_backtest_complete + window_complete (processed) or window_skipped
+    (manifest-marked skip). Monthly windows also carry the calibrator's
+    survival_decision event.
+    """
+    entry = BY_INDEX[idx]
+    label = f"{entry['regime']}_{idx}"
+    evs = [{
+        "event": "window_start", "run_id": run_id, "window_index": idx,
+        "window_label": label, "regime": entry["regime"],
+        "is_start_row": entry["is_start"], "is_end_row": entry["is_end"],
+        "oos_start_row": entry["oos_start"], "oos_end_row": entry["oos_end"],
+    }]
+    if state in ("skipped", "skipped_variant"):
+        evs.append({"event": "window_skipped", "run_id": run_id, "window_index": idx,
+                    "window_label": label,
+                    "status": "CASCADE_SKIP" if state == "skipped_variant" else "NO_ADMISSIBLE_TRIAL"})
+        return evs
+    if state == "success":
+        if entry["regime"] == "monthly_refine":
+            evs.append({
+                "event": "survival_decision", "run_id": run_id, "strategy": strategy,
+                "window_index": idx, "window_label": label,
+                "is_seed": 42, "oos_seed": 42 + idx, "decision": "REFINED_WINS",
+            })
+        evs.append({"event": "oos_backtest_complete", "run_id": run_id,
+                    "window_index": idx, "window_label": label,
+                    "status": "OK", "oos_seed": 42 + idx})
+        evs.append({"event": "window_complete", "run_id": run_id, "window_index": idx,
+                    "window_label": label, "status": "OK"})
+    return evs
+
+
+def write_lifecycle(wfv_dir, idx, state, strategy="vm", run_id=None):
+    """Write the window's lifecycle.jsonl (one JSON object per line)."""
+    wdir = os.path.join(wfv_dir, dir_name(idx))
+    os.makedirs(wdir, exist_ok=True)
+    with open(os.path.join(wdir, collate.LIFECYCLE_FILE_NAME), "w", encoding="utf-8") as f:
+        for ev in lifecycle_events(idx, state, strategy, run_id):
+            f.write(json.dumps(ev) + "\n")
+
+
+def write_window(wfv_dir, idx, state, strategy="vm", run_id=None):
     """Create one synthetic window directory matching the real pipeline's
-    artifact conventions (manifest.json fields, JSONL wfv_decision.json,
-    dataset_info.strategy, signal_file prefix). Returns the dir path."""
+    artifact conventions (manifest.json fields, lifecycle.jsonl event stream,
+    dataset_info.strategy, signal_file prefix, summary_stats seed echo).
+    Returns the dir path."""
     entry = BY_INDEX[idx]
     wdir = os.path.join(wfv_dir, dir_name(idx))
     os.makedirs(os.path.join(wdir, "backtest_results"), exist_ok=True)
+    write_lifecycle(wfv_dir, idx, state, strategy, run_id)
 
     if state == "success":
         br = os.path.join(wdir, "backtest_results")
@@ -115,6 +181,9 @@ def write_window(wfv_dir, idx, state, strategy="vm"):
             "signal_file": f"{collate.SIGNAL_FILE_PREFIXES[strategy]}_test.csv",
             "total_trades": 5,
             "net_profit_usd": 10.0,
+            # P2-2 seed echo: the backtester records the seed it actually used.
+            "random_seed": 42 + idx,
+            "run_id": run_id,
         }
         with open(os.path.join(br, "summary_stats.json"), "w") as f:
             json.dump(stats, f)
@@ -131,19 +200,6 @@ def write_window(wfv_dir, idx, state, strategy="vm"):
         }
         with open(os.path.join(wdir, f"calibration_results_{strategy}.json"), "w") as f:
             json.dump(cal, f)
-        if entry["regime"] == "monthly_refine":
-            # JSONL survival audit record, matching the calibrator's schema
-            rec = {
-                "event": "survival_decision",
-                "strategy": strategy,
-                "window_index": idx,
-                "window_label": f"{entry['regime']}_{idx}",
-                "is_seed": 42,
-                "oos_seed": 42 + idx,
-                "decision": "REFINED_WINS",
-            }
-            with open(os.path.join(wdir, "wfv_decision.json"), "w") as f:
-                f.write(json.dumps(rec) + "\n")
     elif state in ("skipped", "skipped_variant"):
         error = ("CASCADE_SKIP: parent annual window 1 was NO_ADMISSIBLE_TRIAL"
                  if state == "skipped_variant" else "NO_ADMISSIBLE_TRIAL: all trials infeasible")
@@ -165,12 +221,69 @@ def write_window(wfv_dir, idx, state, strategy="vm"):
     return wdir
 
 
-def build_tree(wfv_dir, states):
+def build_tree(wfv_dir, states, run_id=None):
     os.makedirs(wfv_dir, exist_ok=True)
     for idx, state in sorted(states.items()):
         if state is None:
             continue
-        write_window(wfv_dir, idx, state)
+        write_window(wfv_dir, idx, state, run_id=run_id)
+
+
+def write_chunks(wfv_dir, ledger, pre_roll=PRE_ROLL):
+    """Create the sliced_data chunk ledger for a ledger (empty files)."""
+    chunks = os.path.join(wfv_dir, "sliced_data")
+    os.makedirs(chunks, exist_ok=True)
+    for s, e in sorted(expected_chunk_set(ledger, pre_roll)):
+        with open(os.path.join(chunks, f"rows_{s}_{e}.csv"), "w") as f:
+            f.write("timestamp,open,high,low,close,volume\n")
+    return chunks
+
+
+def write_run_meta(wfv_dir, run_id, tmp_dir, ledger=LEDGER, data_csv=None,
+                   strategy="vm", mode="full", **overrides):
+    """Synthetic run_meta.json matching the orchestrator's contract (P2-2).
+
+    Fingerprints are computed with the SAME helpers both sides of the pipeline
+    use (collate.sha256_file / wfv_ledger.config_fingerprint), so a healthy tree
+    must pass the gate's identity verification.
+    """
+    cfg_path = os.path.join(tmp_dir, f"config_{run_id}.json")
+    with open(cfg_path, "w") as f:
+        json.dump(TEST_CONFIG, f)
+    meta = {
+        "schema": collate.RUN_META_SCHEMA,
+        "run_id": run_id,
+        "strategy": strategy,
+        "mode": mode,
+        "created_at": "2026-10-22T00:00:00",
+        "orchestrator": "orchestrate_calibration.py",
+        "workers": 1,
+        "schedule": {
+            "data_start_row": TEST_CONFIG["data_config"]["data_start_row"],
+            "oos_start_base": 300, "rows_per_window": 60, "full_cal_rows": 200,
+            "recal_windows_count": 2, "full_recal_interval": 2, "total_wfv_rows": 240,
+        },
+        "pre_roll_bars": PRE_ROLL,
+        "total_windows": len(ledger),
+        "planned_ledger": ledger,
+        "planned_window_dirs": [e["dir_name"] for e in ledger],
+        "expected_chunks": sorted(expected_chunk_set(ledger, PRE_ROLL)),
+        "data_csv": str(data_csv),
+        "data_sha256": collate.sha256_file(data_csv),
+        "data_rows": DATA_ROWS,
+        "config_path": cfg_path,
+        "config_sha256": collate.sha256_file(cfg_path),
+        "config_fingerprint": collate.config_fingerprint(TEST_CONFIG, strategy),
+        "oos_seed_formula": "backtesting_params.random_seed + window_index",
+        "random_seed_base": 42,
+        "outcomes": None,
+        "skipped_windows": None,
+        "finished_at": None,
+    }
+    meta.update(overrides)
+    with open(os.path.join(wfv_dir, collate.RUN_META_FILE_NAME), "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta
 
 
 def expect_error(fn, needle, label):
@@ -218,11 +331,14 @@ def main():
               "S1c explicit gap 1->3 (skipped window 2) recorded")
         check(report["explicit_gaps"][0]["gap_bars"] == 60, "S1d gap size 60 bars")
         check(report["expected_window_count"] == 4, "S1e expected count 4")
-        check(report["seed_verified_windows"] == [4], "S1f monthly seed verified")
-        check(report["seed_unverified_windows"] == [1, 3], "S1g annual seeds listed as unverified")
+        check(report["seed_verified_windows"] == [1, 3, 4], "S1f every successful window seed-verified")
+        check(report["seed_unverified_windows"] == [],
+              "S1g seed_unverified is empty by design (P2-2 fail-closed seed gate)")
+        check(report["run_meta_present"] is False and report["run_id"] is None,
+              "S1h legacy tree (no run_meta) validated by the P1-8 method")
         check(report["skipped_manifest_variants"] == {2: "NO_ADMISSIBLE_TRIAL"},
-              "S1h manifest variant recorded")
-        check(report["ledger_source"] == "explicit_ledger", "S1i ledger source")
+              "S1i manifest variant recorded")
+        check(report["ledger_source"] == "explicit_ledger", "S1j ledger source")
 
         # ------------------------------------------------------------------
         print("\n=== S2: Missing expected window ===")
@@ -304,13 +420,18 @@ def main():
         print("\n=== S9: Seed drift in a recorded survival audit ===")
         wfv = os.path.join(tmp, "s9", "wfv")
         build_tree(wfv, {1: "success", 2: "skipped", 3: "success", 4: "success"})
-        dec_path = os.path.join(wfv, dir_name(4), "wfv_decision.json")
-        rec = json.loads(open(dec_path).read().strip())
-        rec["oos_seed"] = 999
+        dec_path = os.path.join(wfv, dir_name(4), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(dec_path).read().splitlines() if l.strip()]
+        for rec in lines:
+            if rec["event"] == "survival_decision":
+                rec["oos_seed"] = 999
         with open(dec_path, "w") as f:
-            f.write(json.dumps(rec) + "\n")
-        expect_error(lambda: validate(wfv, data_csv),
-                     "oos_seed 999 != expected 42+4 = 46", "S9 seed drift")
+            for rec in lines:
+                f.write(json.dumps(rec) + "\n")
+        msg = expect_error(lambda: validate(wfv, data_csv),
+                           "OOS seed provenance mismatch", "S9 seed drift in a lifecycle event")
+        check("'lifecycle.survival_decision': 999" in msg, "S9b mismatching source named")
+        check("42+4 = 46" in msg, "S9c expected formula stated")
 
         # ------------------------------------------------------------------
         print("\n=== S10: Manifest strategy mismatch ===")
@@ -452,6 +573,284 @@ def main():
                   os.path.join(wfv, dir_name(1), "calibration_results_trend.json"))
         expect_error(lambda: validate(wfv, data_csv),
                      "calibration results for a different strategy", "S21 foreign calibration file")
+
+        # ==================================================================
+        # P2-2 — run-scoped trees: run_meta.json identity, fingerprints,
+        # lifecycle streams, and the fail-closed seed gate.
+        # ==================================================================
+        def run_tree(name, run_id, states, data_csv_src, ledger=LEDGER, mode="full",
+                     with_chunks=True, with_meta=True, **meta_overrides):
+            """Build a run-scoped tree at tmp/<name>/<run_id>/ (dir name == run_id)."""
+            run_dir = os.path.join(tmp, name, run_id)
+            os.makedirs(os.path.join(tmp, name), exist_ok=True)
+            csv_copy = os.path.join(tmp, name, "data.csv")
+            shutil.copyfile(data_csv_src, csv_copy)
+            build_tree(run_dir, states, run_id=run_id)
+            if with_chunks:
+                write_chunks(run_dir, ledger)
+            if with_meta:
+                write_run_meta(run_dir, run_id, tmp, ledger=ledger, data_csv=csv_copy,
+                               mode=mode, **meta_overrides)
+            return run_dir, csv_copy
+
+        def validate_run(run_dir, data_csv, expected=None, config=None):
+            return collate.validate_wfv_integrity(
+                run_dir, "vm", expected_windows=expected,
+                config=config or TEST_CONFIG, data_csv=data_csv)
+
+        # ------------------------------------------------------------------
+        print("\n=== S22: run_meta happy path (run identity + fingerprints) ===")
+        wfv, csv22 = run_tree("s22", "20261022_101010_aaaaaa",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        report = validate_run(wfv, csv22)
+        check(report["passed"] is True, "S22a run-scoped tree validates")
+        check(report["ledger_source"] == "run_meta", "S22b ledger source is run_meta")
+        check(report["run_id"] == "20261022_101010_aaaaaa", "S22c run_id recorded")
+        check(report["run_meta_present"] is True and report["fingerprints_verified"] is True,
+              "S22d run_meta + fingerprints verified")
+        check(report["seed_unverified_windows"] == []
+              and report["seed_verified_windows"] == [1, 3, 4], "S22e seeds verified fail-closed")
+        check(report["data_sha256"] == collate.sha256_file(csv22), "S22f data fingerprint reported")
+        check(report["config_fingerprint"] == collate.config_fingerprint(TEST_CONFIG, "vm"),
+              "S22g config fingerprint reported")
+        check(report["skipped_window_indices"] == [2], "S22h skip set from manifests")
+        # explicit override must AGREE with run_meta, never silently replace it
+        expect_error(lambda: validate_run(wfv, csv22, expected=4 + 1),
+                     "contradicts run_meta.json", "S31 --expected-windows contradicts run_meta")
+        report2 = validate_run(wfv, csv22, expected=LEDGER)
+        check(report2["ledger_source"] == "run_meta+explicit_ledger",
+              "S31b agreeing explicit ledger is accepted as a cross-check")
+
+        # ------------------------------------------------------------------
+        print("\n=== S23: mutation proof (i) — window dir AND its chunks deleted ===")
+        wfv, csv23 = run_tree("s23", "20261022_101011_bbbbbb",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        w3_chunks = sorted({(e["is_start"], e["is_end"]) for e in [BY_INDEX[3]]}
+                           | {(s, e) for (s, e) in expected_chunk_set([BY_INDEX[3]], PRE_ROLL)})
+        shutil.rmtree(os.path.join(wfv, dir_name(3)))
+        for s, e in w3_chunks:
+            os.remove(os.path.join(wfv, "sliced_data", f"rows_{s}_{e}.csv"))
+        msg = expect_error(lambda: validate_run(wfv, csv23),
+                           "sliced_data does not match the chunk ledger",
+                           "S23a consistent truncation caught by run_meta")
+        check("Missing chunks" in msg, "S23b missing chunks named")
+        # and with the chunk ledger intact, the missing window itself is caught
+        wfv_b, csv23b = run_tree("s23b", "20261022_101012_cccccc",
+                                 {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        shutil.rmtree(os.path.join(wfv_b, dir_name(3)))
+        expect_error(lambda: validate_run(wfv_b, csv23b),
+                     "Missing expected window 3", "S23c missing window caught via run_meta ledger")
+
+        # ------------------------------------------------------------------
+        print("\n=== S24: mutation proof (ii) — one tampered price byte ===")
+        wfv, csv24 = run_tree("s24", "20261022_101013_dddddd",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        with open(csv24, "r+b") as f:
+            f.seek(200)
+            original = f.read(1)
+            f.seek(200)
+            f.write(b"9" if original != b"9" else b"8")
+        msg = expect_error(lambda: validate_run(wfv, csv24),
+                           "data.csv fingerprint mismatch", "S24a price drift caught")
+        check("no longer describes the data being validated" in msg, "S24b drift explained")
+        # row-count drift (dataset extended after the run) is caught too
+        wfv_c, csv24c = run_tree("s24c", "20261022_101014_eeeeee",
+                                 {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        # Append a bar AFTER the run, then re-issue run_meta with the NEW data hash
+        # but the OLD row count: the fingerprint passes, the row count does not.
+        with open(csv24c, "a") as f:
+            f.write(ts_for(DATA_ROWS) + ",2101,2102,2100,2101,1\n")
+        write_run_meta(wfv_c, "20261022_101014_eeeeee", tmp, data_csv=csv24c,
+                       data_rows=DATA_ROWS)
+        expect_error(lambda: validate_run(wfv_c, csv24c),
+                     "extended or truncated after the run", "S24c row-count drift caught")
+
+        # ------------------------------------------------------------------
+        print("\n=== S25: mutation proof (iii) — another run's sliced_data copied in ===")
+        wfv_a, csv_a = run_tree("s25a", "20261022_101015_ffaaaa",
+                                {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        ledger3 = [e for e in LEDGER if e["index"] <= 3]
+        wfv_b, csv_b = run_tree("s25b", "20261022_101016_ffbbbb",
+                                {1: "success", 2: "skipped", 3: "success"}, data_csv,
+                                ledger=ledger3)
+        shutil.rmtree(os.path.join(wfv_b, "sliced_data"))
+        shutil.copytree(os.path.join(wfv_a, "sliced_data"), os.path.join(wfv_b, "sliced_data"))
+        msg = expect_error(lambda: validate_run(wfv_b, csv_b),
+                           "sliced_data does not match the chunk ledger",
+                           "S25a cross-run slice contamination caught")
+        check("foreign chunks" in msg, "S25b foreign chunks named")
+
+        # ------------------------------------------------------------------
+        print("\n=== S26: run_id / directory-name mismatch ===")
+        wfv, csv26 = run_tree("s26", "20261022_101017_gggggg",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        os.rename(wfv, os.path.join(tmp, "s26", "20261022_101099_hijacked"))
+        expect_error(lambda: validate_run(os.path.join(tmp, "s26", "20261022_101099_hijacked"), csv26),
+                     "lives in directory", "S26 renamed run tree rejected")
+
+        # ------------------------------------------------------------------
+        print("\n=== S27: annual window with no seed evidence anywhere ===")
+        wfv, csv27 = run_tree("s27", "20261022_101018_iiiiii",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        # strip BOTH seed sources from annual window 1 (the P1-8 documented gap).
+        # The oos_backtest_complete EVENT stays (S36 covers deleting it); only the
+        # seed fields are removed, so this scenario isolates seed provenance.
+        lc = os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        for r in lines:
+            if r["event"] == "oos_backtest_complete":
+                r.pop("oos_seed", None)
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        stats_path = os.path.join(wfv, dir_name(1), "backtest_results", "summary_stats.json")
+        stats = json.load(open(stats_path))
+        stats.pop("random_seed")
+        with open(stats_path, "w") as f:
+            json.dump(stats, f)
+        expect_error(lambda: validate_run(wfv, csv27),
+                     "records its OOS seed nowhere", "S27 annual-window seed absence fails closed")
+
+        # ------------------------------------------------------------------
+        print("\n=== S28: lifecycle stream never reaches window_complete ===")
+        wfv, csv28 = run_tree("s28", "20261022_101019_jjjjjj",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        lc = os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        lines = [r for r in lines if r["event"] != "window_complete"]
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        expect_error(lambda: validate_run(wfv, csv28),
+                     "never reaches window_complete", "S28 missing terminal event")
+
+        # ------------------------------------------------------------------
+        print("\n=== S29: foreign run_id injected into a lifecycle event ===")
+        wfv, csv29 = run_tree("s29", "20261022_101020_kkkkkk",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        lc = os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        lines[0]["run_id"] = "20260101_000000_foreign"
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        expect_error(lambda: validate_run(wfv, csv29),
+                     "records run_id '20260101_000000_foreign'", "S29 foreign run_id caught")
+
+        # ------------------------------------------------------------------
+        print("\n=== S30: consumed-config fingerprint drift after the run ===")
+        wfv, csv30 = run_tree("s30", "20261022_101021_llllll",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        mutated = json.loads(json.dumps(TEST_CONFIG))
+        mutated["backtesting_params"]["random_seed"] = 4242
+        expect_error(lambda: validate_run(wfv, csv30, config=mutated),
+                     "consumed-config fingerprint mismatch", "S30 config drift caught")
+
+        # ------------------------------------------------------------------
+        print("\n=== S32: malformed lifecycle line (torn stream) ===")
+        wfv, csv32 = run_tree("s32", "20261022_101022_mmmmmm",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        with open(os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME), "a") as f:
+            f.write("{\"event\": \"window_compl\n")
+        expect_error(lambda: validate_run(wfv, csv32),
+                     "malformed lifecycle event", "S32 torn lifecycle line fails closed")
+
+        # ------------------------------------------------------------------
+        print("\n=== S33: manifest skip with no window_skipped lifecycle event ===")
+        wfv, csv33 = run_tree("s33", "20261022_101023_nnnnnn",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        lc = os.path.join(wfv, dir_name(2), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        lines = [r for r in lines if r["event"] != "window_skipped"]
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        expect_error(lambda: validate_run(wfv, csv33),
+                     "no window_skipped", "S33 manifest/lifecycle contradiction caught")
+
+        # ------------------------------------------------------------------
+        print("\n=== S34: legacy tree without run_meta is reported, not invented ===")
+        wfv = os.path.join(tmp, "s34", "wfv")
+        build_tree(wfv, {1: "success", 2: "skipped", 3: "success", 4: "success"})
+        write_chunks(wfv, LEDGER)
+        report = collate.validate_wfv_integrity(wfv, "vm", config=TEST_CONFIG, data_csv=data_csv)
+        check(report["passed"] is True, "S34a legacy tree still validates via the chunk ledger")
+        check(report["run_meta_present"] is False and report["fingerprints_verified"] is False,
+              "S34b legacy status reported honestly")
+
+        # ------------------------------------------------------------------
+        print("\n=== S35: lifecycle backtest event names a different signal file ===")
+        wfv, csv35 = run_tree("s35", "20261022_101024_oooooo",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        lc = os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        for r in lines:
+            if r["event"] == "oos_backtest_complete":
+                r["signal_file"] = "vm_automation_logic_signals_full.csv"
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        expect_error(lambda: validate_run(wfv, csv35),
+                     "describes a different signal/backtest run",
+                     "S35 lifecycle/evidence signal-file contradiction caught")
+
+        # ------------------------------------------------------------------
+        print("\n=== S36: neutered oos_backtest_complete event (mutation proof iv) ===")
+        wfv, csv36 = run_tree("s36", "20261022_101025_pppppp",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        lc = os.path.join(wfv, dir_name(1), collate.LIFECYCLE_FILE_NAME)
+        lines = [json.loads(l) for l in open(lc).read().splitlines() if l.strip()]
+        lines = [r for r in lines if r["event"] != "oos_backtest_complete"]
+        with open(lc, "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        expect_error(lambda: validate_run(wfv, csv36),
+                     "no oos_backtest_complete event",
+                     "S36 deleting the OOS backtest event fails closed")
+
+        # ------------------------------------------------------------------
+        print("\n=== S37: run_meta missing a fingerprint key fails closed (F4) ===")
+        for i, (drop, needle) in enumerate((
+                ("data_sha256", "carries no data_sha256"),
+                ("config_sha256", "carries no config_sha256"),
+                ("expected_chunks", "carries no expected_chunks"),
+                ("data_rows", "carries no data_rows"),
+        )):
+            wfv, csv37 = run_tree(f"s37_{i}", f"20261022_10103{i}_s37{i}x{i}",
+                                  {1: "success", 2: "skipped", 3: "success", 4: "success"},
+                                  data_csv, **{drop: None})
+            expect_error(lambda: validate_run(wfv, csv37), needle,
+                         f"S37 dropping {drop} from run_meta fails closed "
+                         f"(key omission is not a fail-open switch)")
+
+        # ------------------------------------------------------------------
+        print("\n=== S38: run_meta.outcomes/total_windows must agree with the tree (F5) ===")
+        wfv, csv38 = run_tree("s38a", "20261022_101034_s38aaa",
+                              {1: "success", 2: "skipped", 3: "success", 4: "success"},
+                              data_csv, outcomes={"1": "OK", "2": "OK", "3": "OK", "4": "OK"})
+        expect_error(lambda: validate_run(wfv, csv38),
+                     "manifest-marked NO_ADMISSIBLE_TRIAL",
+                     "S38a outcomes claiming a skipped window OK fails closed")
+        wfv, csv38b = run_tree("s38b", "20261022_101035_s38bbb",
+                               {1: "success", 2: "skipped", 3: "success", 4: "success"},
+                               data_csv,
+                               outcomes={"1": "OK", "2": "NO_ADMISSIBLE_TRIAL", "3": "OK"})
+        expect_error(lambda: validate_run(wfv, csv38b),
+                     "does not describe the run",
+                     "S38b outcomes keys != planned ledger fails closed")
+        wfv, csv38c = run_tree("s38c", "20261022_101036_s38ccc",
+                               {1: "success", 2: "skipped", 3: "success", 4: "success"},
+                               data_csv, total_windows=99)
+        expect_error(lambda: validate_run(wfv, csv38c),
+                     "total_windows records 99",
+                     "S38c total_windows contradicting the ledger fails closed")
+        wfv, csv38d = run_tree("s38d", "20261022_101037_s38ddd",
+                               {1: "success", 2: "skipped", 3: "success", 4: "success"},
+                               data_csv, outcomes={"1": "OK", "2": "NO_ADMISSIBLE_TRIAL",
+                                                   "3": "OK", "4": "OK"})
+        report = validate_run(wfv, csv38d)
+        check(report["passed"] is True,
+              "S38e honest outcomes dict passes (cross-check has no false positive)")
 
     print(f"\nWFV INTEGRITY TEST PASSED ({checks['n']} checks)")
 

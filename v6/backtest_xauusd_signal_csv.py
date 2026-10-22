@@ -1648,6 +1648,11 @@ def main() -> None:
     parser.add_argument("--signals", type=str, default=None, help="Path to signal CSV file (overrides auto-detection).")
     parser.add_argument("--random-seed", type=int, default=None, help="Override random seed (for per-window seed variation in WFV).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (provides SL/TP overrides).")
+    # P2-2: run identity echo. OPTIONAL by design - the AGENTS.md standalone
+    # developer commands omit it, and those runs record run_id: null.
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="WFV run id this backtest belongs to (orchestrator-supplied). "
+                             "Recorded in summary_stats.json alongside the effective random seed.")
     parser.add_argument("--oos-start-row-in-slice", type=int, default=None,
                         help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
                              "Bars before it are indicator history only: no trade accounting and no "
@@ -1732,6 +1737,16 @@ def main() -> None:
     trades, equity, executions, skipped = run_backtest(data, signals, seed=args.random_seed, config=cfg,
                                                        oos_start_row_in_slice=args.oos_start_row_in_slice)
     summary = compute_summary(trades, equity, signals, signal_path, data, config=cfg)
+
+    # P2-2 (reviewer carry-forward): the summary must record the seed that was
+    # ACTUALLY used, not a formula the collator re-derives. run_backtest resolves
+    # seed=None to cfg["random_seed"], so the effective seed is echoed here the same
+    # way. run_id links this evidence to its run. compute_summary itself is
+    # untouched, so parity_test_backtesting (which calls compute_summary directly)
+    # is unaffected.
+    summary["random_seed"] = int(args.random_seed if args.random_seed is not None
+                                 else (BP if cfg is None else cfg)["random_seed"])
+    summary["run_id"] = args.run_id
     
     # Save all outputs
     with tqdm(total=7, desc="Writing report", unit="file") as pbar:

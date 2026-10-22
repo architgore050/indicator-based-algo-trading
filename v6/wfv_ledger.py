@@ -20,6 +20,8 @@ Consumers:
     them from here — the public names and signatures are unchanged).
 """
 
+import hashlib
+import json
 import re
 
 # ---------------------------------------------------------------------------
@@ -212,6 +214,34 @@ def config_total_windows(config: dict) -> int:
     """
     p = ledger_params(config)
     return p["total_wfv_rows"] // p["rows_per_window"]
+
+
+# ---------------------------------------------------------------------------
+# Run fingerprint (P2-2)
+# ---------------------------------------------------------------------------
+
+def config_fingerprint(config: dict, strategy: str) -> str:
+    """sha256 over the canonical JSON of the config values a WFV run consumes.
+
+    Scope: data_config + calibration_params (ranges, WFV schedule, optuna knobs,
+    constraint floors) + backtesting_params + the strategy's base params. These are
+    exactly the values that determine what a run should produce, so a change to any
+    of them changes the fingerprint: collating an old run tree against a mutated
+    config.json fails closed instead of silently re-interpreting the evidence.
+
+    Lives here (pure, no I/O) because BOTH the orchestrator (writes it into
+    run_meta.json before calibration) and the collator (recomputes it at collation
+    time) must agree on one definition — duplicated fingerprint math is exactly the
+    bug class this program fixes.
+    """
+    consumed = {
+        "data_config": config.get("data_config", {}),
+        "calibration_params": config.get("calibration_params", {}),
+        "backtesting_params": config.get("backtesting_params", {}),
+        "strategy_params": config.get(f"{strategy}_strategy_params", {}),
+    }
+    blob = json.dumps(consumed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 # ---------------------------------------------------------------------------

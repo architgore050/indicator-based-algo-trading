@@ -211,7 +211,8 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
     orig_retry = cal.sqlite_retry_optimize
 
     def spy_run_study(phase, n_trials, sampler, data, study, current_best=None,
-                      distribution_prior=None, cpcv_config=None, quality_floors=True):
+                      distribution_prior=None, cpcv_config=None, quality_floors=True,
+                      lifecycle=None, run_id=None, window_index=0):
         current_phase[0] = phase
         samplers_seen.append({
             "phase": phase,
@@ -221,12 +222,20 @@ def _run_calibration(tag: str, window_index: int, storage_url: str) -> dict:
             "expected_seed": seed_for(window_index, phase),
             "cpcv_knobs": dict(cpcv_config or {}),
             "quality_floors": quality_floors,
+            # P2-2: run_study gained the lifecycle wiring kwargs; the spy must
+            # accept AND forward them, and records them so the wiring is auditable.
+            "lifecycle_attached": lifecycle is not None,
+            "run_id": run_id,
+            "window_index": window_index,
         })
         return orig_run_study(phase, n_trials, sampler, data, study,
                               current_best=current_best,
                               distribution_prior=distribution_prior,
                               cpcv_config=cpcv_config,
-                              quality_floors=quality_floors)
+                              quality_floors=quality_floors,
+                              lifecycle=lifecycle,
+                              run_id=run_id,
+                              window_index=window_index)
 
     def spy_retry_optimize(study, objective, n_trials, n_jobs, max_retries=20, sampler=None):
         out = orig_retry(study, objective, n_trials, n_jobs, max_retries=max_retries, sampler=sampler)
@@ -307,6 +316,14 @@ def part3_real_runs() -> None:
               json.dumps(run["wiring_seen"]))
         check(f"{tag}: every phase ran with n_jobs=1",
               all(w["n_jobs"] == 1 for w in run["wiring_seen"]))
+
+        # P2-2: the calibrator must forward its window_index (and the lifecycle
+        # wiring kwargs) into run_study — the phase seeds are derived from it.
+        check(f"{tag}: run_study received the calibrator's window_index (P2-2 wiring)",
+              bool(run["samplers_seen"]) and all(
+                  s["window_index"] == run["window_index"] for s in run["samplers_seen"]),
+              json.dumps([{"phase": s["phase"], "window_index": s.get("window_index")}
+                          for s in run["samplers_seen"]]))
 
         # Per-phase sampler class + seed actually used (P1-6: NSGA-II in every phase).
         by_phase = {s["phase"]: s for s in run["samplers_seen"]}

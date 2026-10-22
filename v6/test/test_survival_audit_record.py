@@ -6,31 +6,39 @@ Defect (external review P1-5, developer verdict 2026-09-27): the survival
 logger.info("Survival Check: ...") in subprocess output, so post-run analysis
 required parsing terminal text.
 
-Fix under test:
-  - logging_utils.JSONFormatter + get_audit_logger (per-window
-    wfv_decision.json, JSONL by content, mode="w", propagate=False).
-  - vm/tv/trend calibrators write a structured audit record at the survival
+Fix under test (P2-2 migration of the P1-5 audit record):
+  - logging_utils.JSONFormatter + get_lifecycle_logger (per-window
+    lifecycle.jsonl, JSONL by content, append mode, propagate=False, every line
+    <= PIPE_BUF bytes via LifecycleJSONFormatter). The retired get_audit_logger /
+    wfv_decision.json wrote ONE event type with mode="w"; the lifecycle stream
+    carries the whole window story (calibration_start, phase_start,
+    survival_decision, calibration_complete, plus the orchestrator's window
+    events) and appends so the orchestrator worker and the calibrator subprocess
+    can share one file.
+  - vm/tv/trend calibrators write the structured survival record at the survival
     point: three-value enum REFINED_WINS / TIE_KEEP_PARENT / BASELINE_WINS
     (P1-3 F1/F4 deepening), incumbent_selected, baseline/refined params +
-    score components, parent_digest, is_seed/oos_seed, row-range ids.
-  - collate_wfv_results.aggregate_audit_logs concatenates per-window audit
-    files into <output_dir>/collated_wfv_decisions.jsonl in window order,
-    tolerating missing/empty/malformed files.
+    score components, parent_digest, is_seed/oos_seed, row-range ids, and (P2-2)
+    run_id linkage.
+  - collate_wfv_results.aggregate_lifecycle_logs concatenates per-window
+    lifecycle streams into <run_dir>/master_lifecycle.jsonl in window order.
+    Missing/empty streams are tolerated; a MALFORMED line now fails closed
+    (retired behavior: tolerate-and-warn, which silently dropped evidence).
 
 Layers:
   A. Enum classification unit checks against the REAL classify_survival_decision
      in all three calibrators (synthetic score/param combinations).
-  B. Collation aggregation against a SYNTHETIC wfv-shaped fixture tree under
-     v6/tmp/ (valid records, empty file, malformed file, annual window with
-     no audit file, non-window dir).
+  B. Lifecycle aggregation against a SYNTHETIC run-shaped fixture tree under
+     v6/tmp/ (valid events, empty stream, malformed stream -> RuntimeError,
+     annual window with no stream, non-window dir, master-file placement).
   C. Real monthly --phase3-only calibration (low-memory, pinned row range,
      synthetic annual-baseline fixture built from config defaults) -> assert
-     wfv_decision.json exists in the output dir, parses line-by-line as JSON,
-     carries every mandated field, enum membership, incumbent_selected
+     lifecycle.jsonl exists in the window output dir, parses line-by-line as
+     JSON, carries every mandated field, enum membership, incumbent_selected
      consistency (cross-checked against the written results file), parent_digest
      matches an independently computed sha256, is_seed == config random_seed,
-     oos_seed == config seed + window index, score components availability
-     flags + finite component sets.
+     oos_seed == the --oos-seed the harness passed, every line fits the PIPE_BUF
+     append cap, score components availability flags + finite component sets.
 
 No test reads mutable pipeline artifacts (P1-4 lesson): fixtures are built
 under v6/tmp/ from config.json values only. Run inside ~/venvs/rapids with
@@ -70,7 +78,7 @@ SEED = int(CONFIG["backtesting_params"]["random_seed"])
 ENUM = {"REFINED_WINS", "TIE_KEEP_PARENT", "BASELINE_WINS"}
 
 MANDATED_FIELDS = [
-    "event", "strategy", "window_index", "baseline_score", "refined_score",
+    "event", "strategy", "window_index", "run_id", "baseline_score", "refined_score",
     "decision", "reason", "incumbent_selected", "baseline_params",
     "refined_params", "parent_digest", "is_seed", "oos_seed",
     "start_row", "end_row", "rows_used", "baseline_components",
@@ -157,80 +165,109 @@ def layer_a_enum_classification() -> None:
 # ---------------------------------------------------------------------------
 
 def layer_b_collation_aggregation() -> None:
-    print("Layer B: aggregate_audit_logs against synthetic fixture tree")
+    print("Layer B: aggregate_lifecycle_logs against synthetic fixture tree")
     fixture_root = V6_DIR / "tmp" / "p1_5_collate_fixture"
     if fixture_root.exists():
         shutil.rmtree(fixture_root)
-    wfv = fixture_root / "wfv"
+    # P2-2: the fixture is shaped like a RUN directory (wfv/runs/<run_id>/).
+    run_dir = fixture_root / "wfv" / "runs" / "20261022_000000_fixture"
     out = fixture_root / "out"
 
     def win(name: str) -> Path:
-        d = wfv / name
+        d = run_dir / name
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    # annual window: no survival decision at all (must be tolerated)
+    def lifecycle(name: str, events) -> Path:
+        p = win(name) / collate_wfv_results.LIFECYCLE_FILE_NAME
+        p.write_text("".join(json.dumps(e) + "\n" for e in events))
+        return p
+
+    # annual window: no lifecycle stream at all (tolerated: contributes nothing)
     win("window_1_annual_recal_1")
-    # monthly window with one valid record
-    (win("window_2_monthly_refine_2") / "wfv_decision.json").write_text(json.dumps(
+    # monthly window with one valid event stream
+    lifecycle("window_2_monthly_refine_2", [
+        {"event": "window_start", "run_id": "20261022_000000_fixture", "window_index": 2},
         {"event": "survival_decision", "strategy": "vm", "window_index": 2,
-         "decision": "TIE_KEEP_PARENT", "marker": "w2"}) + "\n")
-    # monthly window with an EMPTY audit file (tolerated)
-    (win("window_3_monthly_refine_3") / "wfv_decision.json").write_text("")
-    # monthly window with a MALFORMED audit file (warning, not crash)
-    (win("window_4_monthly_refine_4") / "wfv_decision.json").write_text("{not json at all\n")
+         "decision": "TIE_KEEP_PARENT", "marker": "w2"},
+    ])
+    # monthly window with an EMPTY stream (tolerated)
+    (win("window_3_monthly_refine_3") / collate_wfv_results.LIFECYCLE_FILE_NAME).write_text("")
     # monthly window with two valid records
-    (win("window_5_monthly_refine_5") / "wfv_decision.json").write_text(
-        json.dumps({"event": "survival_decision", "strategy": "vm", "window_index": 5,
-                    "decision": "REFINED_WINS", "marker": "w5a"}) + "\n" +
-        json.dumps({"event": "survival_decision", "strategy": "vm", "window_index": 5,
-                    "decision": "BASELINE_WINS", "marker": "w5b"}) + "\n")
+    lifecycle("window_5_monthly_refine_5", [
+        {"event": "survival_decision", "strategy": "vm", "window_index": 5,
+         "decision": "REFINED_WINS", "marker": "w5a"},
+        {"event": "survival_decision", "strategy": "vm", "window_index": 5,
+         "decision": "BASELINE_WINS", "marker": "w5b"},
+    ])
     # non-window directory must be ignored
-    (wfv / "sliced_data").mkdir(parents=True, exist_ok=True)
+    (run_dir / "sliced_data").mkdir(parents=True, exist_ok=True)
 
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            master_path, count = collate_wfv_results.aggregate_audit_logs(wfv, out)
+            master_path, count = collate_wfv_results.aggregate_lifecycle_logs(run_dir)
     except Exception as e:
-        fail(f"aggregate_audit_logs crashed: {type(e).__name__}: {e}")
+        fail(f"aggregate_lifecycle_logs crashed: {type(e).__name__}: {e}")
         return
-    stdout = buf.getvalue()
+    buf.getvalue()
 
-    if count != 3:
-        fail(f"expected 3 aggregated records, got {count}")
+    if count != 4:
+        fail(f"expected 4 aggregated events, got {count}")
     else:
-        ok("exactly the 3 valid records aggregated (empty + malformed + annual contributed none)")
+        ok("all events aggregated (empty + missing streams contributed none)")
     lines = [l for l in Path(master_path).read_text().splitlines() if l.strip()]
-    if len(lines) != 3:
-        fail(f"master JSONL has {len(lines)} lines, expected 3")
+    if len(lines) != 4:
+        fail(f"master JSONL has {len(lines)} lines, expected 4")
     records = []
     for i, line in enumerate(lines):
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             fail(f"master line {i} is not valid JSON")
-    markers = [r.get("marker") for r in records]
+    markers = [r.get("marker") for r in records if r.get("marker")]
     if markers != ["w2", "w5a", "w5b"]:
-        fail(f"record order/content wrong: {markers} (expected window order w2, w5a, w5b)")
+        fail(f"event order/content wrong: {markers} (expected window order w2, w5a, w5b)")
     else:
-        ok("records appear in window order (window_2 before window_5)")
-    if "window_4" not in stdout or "WARNING" not in stdout:
-        fail("malformed audit file did not produce a WARNING naming its path")
+        ok("events appear in window order (window_2 before window_5)")
+    if Path(master_path).parent != run_dir:
+        fail(f"master_lifecycle.jsonl landed in {Path(master_path).parent}, not the run dir")
     else:
-        ok("malformed audit file produced a warning (with path), not a crash")
+        ok("master_lifecycle.jsonl lands in the RUN directory (run evidence, not collation output)")
+    if [r.get("event") for r in records].count("window_start") != 1:
+        fail("window_start event lost during aggregation")
 
-    # missing wfv dir: tolerated, empty master file, no crash
-    buf2 = io.StringIO()
+    # explicit output_dir override still works (scratch trees / tests)
+    mp_out, c_out = collate_wfv_results.aggregate_lifecycle_logs(run_dir, out)
+    if c_out != 4 or Path(mp_out).parent != out:
+        fail(f"explicit output_dir aggregation wrong: count={c_out} path={mp_out}")
+    else:
+        ok("explicit output_dir override honored (scratch/test trees)")
+
+    # MALFORMED stream: P2-2 fails closed (the retired aggregator warned and skipped)
+    lifecycle("window_4_monthly_refine_4", [{"event": "window_start", "window_index": 4}])
+    with open(run_dir / "window_4_monthly_refine_4" / collate_wfv_results.LIFECYCLE_FILE_NAME, "a") as f:
+        f.write("{not json at all\n")
     try:
-        with contextlib.redirect_stdout(buf2):
-            mp2, c2 = collate_wfv_results.aggregate_audit_logs(fixture_root / "nope", out)
+        with contextlib.redirect_stdout(io.StringIO()):
+            collate_wfv_results.aggregate_lifecycle_logs(run_dir)
+        fail("malformed lifecycle stream was tolerated instead of failing closed")
+    except RuntimeError as e:
+        if "malformed lifecycle event" not in str(e):
+            fail(f"malformed stream raised the wrong error: {e}")
+        else:
+            ok("malformed lifecycle line fails closed (evidence is never silently dropped)")
+
+    # missing run dir: tolerated, empty master file, no crash
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mp2, c2 = collate_wfv_results.aggregate_lifecycle_logs(fixture_root / "nope")
         if c2 != 0 or Path(mp2).stat().st_size != 0:
             fail(f"missing wfv dir: expected 0 records + empty file, got {c2}/{Path(mp2).stat().st_size}B")
         else:
             ok("missing wfv dir tolerated (0 records, empty master file)")
     except Exception as e:
-        fail(f"aggregate_audit_logs crashed on missing wfv dir: {type(e).__name__}: {e}")
+        fail(f"aggregate_lifecycle_logs crashed on missing wfv dir: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +298,7 @@ def build_annual_baseline_fixture(path: Path) -> dict:
 
 
 def layer_c_real_calibration() -> None:
-    print("Layer C: real monthly --phase3-only calibration -> wfv_decision.json")
+    print("Layer C: real monthly --phase3-only calibration -> lifecycle.jsonl")
     work = V6_DIR / "tmp" / "p1_5_test"
     if work.exists():
         shutil.rmtree(work)
@@ -270,11 +307,15 @@ def layer_c_real_calibration() -> None:
     fixture = work / "parent_annual" / "calibration_results_vm.json"
     baseline_params = build_annual_baseline_fixture(fixture)
 
-    out_dir = work / "window_out"
+    # P2-2: the calibrator attaches its lifecycle stream to a WINDOW directory
+    # (the orchestrator's convention). A non-window output dir has no stream.
+    out_dir = work / "window_99_monthly_refine_99"
     results_path = out_dir / "calibration_results_vm.json"
-    audit_path = out_dir / "wfv_decision.json"
+    audit_path = out_dir / collate_wfv_results.LIFECYCLE_FILE_NAME
     run_log = V6_DIR / "tmp" / "p1_5_test_run.txt"
 
+    run_id = "p1_5_layer_c_fixture"
+    oos_seed = SEED + 99
     cmd = [
         sys.executable, "optuna_calibrate_vm.py",
         "--phase3-only", "--smoke",
@@ -282,6 +323,9 @@ def layer_c_real_calibration() -> None:
         "--output", str(results_path),
         "--window-index", "99",
         "--start-row", "2950000", "--end-row", "3000000",
+        # P2-2: the orchestrator passes run identity + the OOS seed explicitly.
+        "--run-id", run_id,
+        "--oos-seed", str(oos_seed),
     ]
     with open(run_log, "w") as lf:
         proc = subprocess.run(cmd, cwd=V6_DIR, stdout=lf, stderr=subprocess.STDOUT,
@@ -298,26 +342,47 @@ def layer_c_real_calibration() -> None:
         ok("human-readable console survival lines + audit line present")
 
     if not audit_path.exists():
-        fail(f"wfv_decision.json not created in {out_dir}")
+        fail(f"lifecycle.jsonl not created in {out_dir}")
         return
-    ok(f"wfv_decision.json exists in the window output dir: {audit_path}")
+    ok(f"lifecycle.jsonl exists in the window output dir: {audit_path}")
 
-    # parse line-by-line as JSON (JSONL by content)
+    # parse line-by-line as JSON (JSONL by content) + PIPE_BUF append-cap check
     records = []
+    oversized = []
     for i, line in enumerate(audit_path.read_text().splitlines(), 1):
         if not line.strip():
             continue
+        if len(line.encode("utf-8")) > collate_wfv_results.LIFECYCLE_MAX_LINE_BYTES:
+            oversized.append((i, len(line.encode("utf-8"))))
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError as e:
-            fail(f"audit line {i} is not valid JSON: {e}")
+            fail(f"lifecycle line {i} is not valid JSON: {e}")
             return
+    if oversized:
+        fail(f"lifecycle lines exceed the PIPE_BUF append cap ({oversized}) — concurrent "
+             f"appends from the worker and the calibrator could tear each other's lines")
+    else:
+        ok(f"every lifecycle line fits the {collate_wfv_results.LIFECYCLE_MAX_LINE_BYTES}B "
+           f"PIPE_BUF cap (concurrent-append safety)")
+    events = [r.get("event") for r in records]
+    for expected_event in ("calibration_start", "phase_start", "survival_decision",
+                           "calibration_complete"):
+        if expected_event not in events:
+            fail(f"lifecycle stream missing the {expected_event} event (events: {events})")
+    ok(f"lifecycle stream covers the calibration: {sorted(set(events))}")
     survival = [r for r in records if r.get("event") == "survival_decision"]
     if len(survival) != 1:
         fail(f"expected exactly 1 survival_decision record, got {len(survival)} (of {len(records)} lines)")
         return
     rec = survival[0]
-    ok("audit file parses line-by-line as JSON with exactly one survival_decision record")
+    ok("lifecycle stream parses line-by-line as JSON with exactly one survival_decision record")
+
+    # P2-2 run linkage: the record carries the run id and the seed the harness passed
+    if rec.get("run_id") != run_id:
+        fail(f"survival record run_id {rec.get('run_id')!r} != the --run-id passed ({run_id!r})")
+    else:
+        ok(f"survival record carries run_id={run_id} (run linkage)")
 
     missing = [f for f in MANDATED_FIELDS if f not in rec]
     if missing:
@@ -336,13 +401,22 @@ def layer_c_real_calibration() -> None:
     else:
         ok("window-locatable ids recorded (window_index/start_row/end_row/rows_used)")
 
-    # seeds
+    # seeds. P2-2: oos_seed is the value passed via --oos-seed (the coupling where
+    # the calibrator re-derived random_seed + window_index itself is closed).
     if rec["is_seed"] != SEED:
         fail(f"is_seed {rec['is_seed']} != config backtesting_params.random_seed {SEED}")
-    elif rec["oos_seed"] != SEED + 99:
-        fail(f"oos_seed {rec['oos_seed']} != config seed + window index ({SEED}+99)")
+    elif rec["oos_seed"] != oos_seed:
+        fail(f"oos_seed {rec['oos_seed']} != the --oos-seed passed ({oos_seed})")
     else:
-        ok(f"is_seed == {SEED} (CRN IS seed) and oos_seed == {SEED}+99 (orchestrator formula)")
+        ok(f"is_seed == {SEED} (CRN IS seed) and oos_seed == {oos_seed} (recorded verbatim "
+           f"from --oos-seed, not re-derived)")
+    cal_start = next((r for r in records if r.get("event") == "calibration_start"), None)
+    if cal_start is not None and cal_start.get("oos_seed") != oos_seed:
+        fail(f"calibration_start event oos_seed {cal_start.get('oos_seed')} != {oos_seed}")
+    elif cal_start is None:
+        fail("calibration_start event absent — cannot verify seed recording at entry")
+    else:
+        ok("calibration_start event records the same oos_seed at calibration entry")
 
     # parent_digest self-verification
     if rec["parent_digest"] != canonical_digest(rec["baseline_params"]):

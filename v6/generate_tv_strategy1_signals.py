@@ -47,26 +47,47 @@ CONF = load_config()
 DATA_CONF = CONF["data_config"]
 
 
-def load_params(calibration_path=None):
+def load_params(calibration_path=None, no_override=False, log=True):
     # Load defaults from config.json
     with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
     params = config["tv_strategy_params"]
 
-    # Override with calibration results if available
+    # P2-2 (reviewer carry-forward): no_override=True pins the BASELINE parameter
+    # set — config.json only — and skips the CALIBRATION_PATH fallback entirely.
+    # Without it, a "baseline params" reference run silently picks up whatever stale
+    # calibration_results_*.json a previous calibration run left in the repo root, so
+    # the baseline is no longer the documented baseline. Used by the collator's
+    # baseline reference run via --no-calibration.
+    if no_override:
+        if log:
+            logger.info("Baseline purity: calibration overrides disabled (--no-calibration).")
+        return params
+
     path_to_use = Path(calibration_path) if calibration_path else CALIBRATION_PATH
     if path_to_use.exists():
-        logger.info(f"Loading calibrated parameters from {path_to_use}")
+        if log:
+            logger.info(f"Loading calibrated parameters from {path_to_use}")
         with open(path_to_use, "r") as f:
             calib = json.load(f)
         params.update(calib["best_parameters"])
     elif not calibration_path:
-        logger.info(f"Calibration file not found. Using default parameters from {CONFIG_PATH}")
+        if log:
+            logger.info(f"Calibration file not found. Using default parameters from {CONFIG_PATH}")
 
     return params
 
 
-PARAMS = load_params()
+# Import-time default: config.json baseline only (P2-2 review F3 fix). main()
+# re-pins PARAMS from the CLI contract on every run, matching the vm/trend
+# generators where the parameter load lives in main(). The previous import-time
+# load_params() applied whatever stale calibration_results_tv.json sat in the
+# repo root to this module global before main() ran — contaminating importers
+# that call compute_signals_df/generate_signals without explicit params, and
+# logging a misleading "Loading calibrated parameters" line even in
+# --no-calibration runs. Plain-run override semantics are unchanged: the load
+# moved from import to main().
+PARAMS = load_params(no_override=True, log=False)
 
 
 # ---------------------------------------------------------------------------
@@ -490,16 +511,24 @@ def main() -> None:
     parser.add_argument("--end-row", type=int, default=None)
     parser.add_argument("--data-csv", type=str, default=None, help="Path to pre-sliced data CSV (WFV parallel safety).")
     parser.add_argument("--calibration", type=str, default=None, help="Path to calibration results JSON (overrides shared file).")
+    parser.add_argument("--no-calibration", action="store_true",
+                        help="Baseline purity: load parameters from config.json only, ignoring "
+                             "calibration_results_%s.json overrides (used by the collator's "
+                             "baseline reference run)." % CALIBRATION_PATH.name)
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for signal CSV (defaults to script directory).")
     parser.add_argument("--oos-start-row-in-slice", type=int, default=None,
                         help="Index of the first OOS bar inside --data-csv (P0-6 pre-roll boundary). "
                              "Signals generated before it are discarded. Default None = no filtering.")
     args = parser.parse_args()
 
-    # Override PARAMS with per-window calibration if provided (parallel WFV safety)
+    # Override PARAMS with per-window calibration if provided (parallel WFV safety).
+    # P2-2 review F3: the re-pin is now UNCONDITIONAL (was: only when
+    # --calibration/--no-calibration was passed). A plain run loads the calibration
+    # override here exactly as it used to via the import-time load — same effective
+    # parameters, load relocated to main() like vm/trend. --no-calibration re-loads
+    # from config.json only (baseline purity, used by the collator's handshake).
     global PARAMS
-    if args.calibration:
-        PARAMS = load_params(args.calibration)
+    PARAMS = load_params(args.calibration, no_override=args.no_calibration)
 
     output_csv = generate_signals(
         args.mode, start_row=args.start_row, end_row=args.end_row,
