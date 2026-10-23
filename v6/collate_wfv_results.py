@@ -215,9 +215,10 @@ def _extract_window_info(window_dir):
 #      artifact written before any window is calibrated, matched against the
 #      shared wfv_ledger arithmetic, or
 #   3. nothing else: if neither is available the gate fails closed with
-#      instructions. The config full-run ledger (185 windows) is never applied
-#      implicitly, because smoke runs use 5 windows and partial runs arbitrary
-#      subsets — validating them against the full-run ledger would reject
+#      instructions. The config ledger is never applied implicitly — neither the
+#      configured cap (185 windows) nor the P2-4 budget-funded plan (168 with the
+#      live config) — because smoke runs use 5 windows and partial runs arbitrary
+#      subsets: validating them against a full-run ledger would reject
 #      every legitimate partial run.
 
 SIGNAL_FILE_PREFIXES = {

@@ -1,10 +1,11 @@
 """Shared WFV window arithmetic (P1-8 extraction).
 
 Single source of truth for the WFV window schedule (half-open [start, end)
-row ranges — P0-5/P0-6). Extracted verbatim from ``orchestrate_calibration.py``
-so the orchestrator and the collation integrity gate
-(``collate_wfv_results.validate_wfv_integrity``) share ONE implementation of
-the ledger math. Duplicated window arithmetic is exactly the bug class this
+row ranges — P0-5/P0-6) AND for the P2-4 dynamic window budget (how many
+windows the config-stated row budget actually funds). Extracted verbatim from
+``orchestrate_calibration.py`` so the orchestrator and the collation integrity
+gate (``collate_wfv_results.validate_wfv_integrity``) share ONE implementation
+of the ledger math. Duplicated window arithmetic is exactly the bug class this
 program has been fixing (P0-5 half-open intervals, P0-6 pre-roll), so the
 collator must not reimplement it.
 
@@ -205,15 +206,110 @@ def ledger_params(config: dict) -> dict:
 
 
 def config_total_windows(config: dict) -> int:
-    """Full-run window count from config (total_wfv_rows // rows_per_window).
+    """Configured full-run window count (total_wfv_rows // rows_per_window).
 
     NOTE (P1-8): this is the FULL-run ledger size only. Smoke runs are capped
     to 5 windows and partial runs are arbitrary subsets, so the integrity gate
     must NEVER use this as an implicit expectation for an arbitrary tree —
     see docs/P1-8_collation_integrity.md ("expected-ledger design").
+
+    NOTE (P2-4): since the dynamic-budget decision this value is an OPTIONAL
+    CAP, not the schedule itself: the orchestrator plans
+    ``min(configured, budget-feasible)`` windows. It is still a REQUIRED key —
+    ``ledger_params`` reads it and the collator reads ``ledger_params``, so a
+    missing key fails closed. See docs/P2-4_dynamic_window_budget.md.
     """
     p = ledger_params(config)
     return p["total_wfv_rows"] // p["rows_per_window"]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Window Budget (P2-4 — developer decision, 2026-10-23)
+# ---------------------------------------------------------------------------
+# "The code should dynamically allocate windows based on whatever fits in the
+#  stated fund in config (not hard coded). If config says 4M is the budget we
+#  fill as many full windows as we can fit. No incomplete windows at the end —
+#  we simply discard the few rows we can not use."
+#
+# This replaces the P0-5 fail-fast that REJECTED a full-mode run whenever the
+# configured ledger exceeded the row budget. The arithmetic lives here because
+# wfv_ledger is the single source of truth for window math: the orchestrator
+# schedules through it and the collator validates the resulting ledger.
+
+def compute_feasible_window_count(budget_rows: int, full_cal_rows: int,
+                                  rows_per_window: int) -> int:
+    """How many COMPLETE OOS windows the stated row budget can fund (P2-4).
+
+    `budget_rows` is the config-stated fund available to the WFV schedule:
+    ``data_config.total_rows - data_config.data_start_row``. The initial annual
+    IS reservation (`full_cal_rows` = calibration_rows_per_trial) must exist in
+    the CSV before the first OOS window can start (oos_start_base =
+    data_start_row + full_cal_rows), so it is subtracted first.
+
+    ``max(0, (budget_rows - full_cal_rows) // rows_per_window)`` — the floor
+    division IS the "no incomplete windows" rule. Whatever fewer than
+    rows_per_window rows remain are DISCARDED; they never become a short final
+    window, and no window is ever partially funded. Half-open tiling from
+    oos_start_base is unchanged (compute_window_ranges).
+
+    Returns 0 when the budget cannot fund even one window — the caller decides
+    whether that is a hard error (the orchestrator: it is, P0-5 retained).
+    """
+    if rows_per_window <= 0:
+        raise ValueError(f"rows_per_window must be > 0, got {rows_per_window}")
+    if full_cal_rows < 0:
+        raise ValueError(f"full_cal_rows must be >= 0, got {full_cal_rows}")
+    return max(0, (int(budget_rows) - int(full_cal_rows)) // int(rows_per_window))
+
+
+def compute_budget_plan(budget_rows: int, full_cal_rows: int, rows_per_window: int,
+                        configured_windows=None) -> dict:
+    """The complete P2-4 budget plan as a plain dict (pure, no config access).
+
+    `configured_windows` is the optional cap from wfv_config.total_wfv_rows
+    (None when no cap is configured). Returns:
+      budget_rows, full_cal_rows, rows_per_window,
+      configured_windows   — the cap, or None
+      feasible_windows     — what the budget funds (hard ceiling)
+      planned_windows      — min(configured, feasible) (or feasible when uncapped)
+      discarded_rows       — budget_rows - full_cal_rows - feasible*rows_per_window,
+                             clamped at 0 (the sub-window leftover the budget
+                             cannot fund; always 0 <= discarded_rows < rows_per_window).
+                             A budget that cannot even fund full_cal_rows has NO
+                             leftover to speak of — the plan is inadmissible and the
+                             orchestrator hard-errors before this value is recorded.
+      budget_truncated     — True when the budget is the binding constraint
+                             (feasible < configured)
+    """
+    feasible = compute_feasible_window_count(budget_rows, full_cal_rows, rows_per_window)
+    configured = None if configured_windows is None else int(configured_windows)
+    if configured is not None and configured < 0:
+        raise ValueError(f"configured_windows must be >= 0, got {configured}")
+    planned = feasible if configured is None else min(configured, feasible)
+    leftover = int(budget_rows) - int(full_cal_rows) - feasible * int(rows_per_window)
+    return {
+        "budget_rows": int(budget_rows),
+        "full_cal_rows": int(full_cal_rows),
+        "rows_per_window": int(rows_per_window),
+        "configured_windows": configured,
+        "feasible_windows": feasible,
+        "planned_windows": planned,
+        "discarded_rows": max(0, leftover),
+        "budget_truncated": configured is not None and feasible < configured,
+    }
+
+
+def budget_plan_from_config(config: dict) -> dict:
+    """compute_budget_plan evaluated against a config dict (no I/O, no logging).
+
+    budget_rows = data_config.total_rows - data_config.data_start_row (the
+    config-stated fund); configured_windows = config_total_windows(config)
+    (wfv_config.total_wfv_rows // rows_per_window).
+    """
+    p = ledger_params(config)
+    budget_rows = int(config["data_config"]["total_rows"]) - p["data_start_row"]
+    return compute_budget_plan(budget_rows, p["full_cal_rows"], p["rows_per_window"],
+                               configured_windows=config_total_windows(config))
 
 
 # ---------------------------------------------------------------------------

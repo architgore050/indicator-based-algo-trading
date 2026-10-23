@@ -156,6 +156,17 @@ class TestConfigSingleSource(unittest.TestCase):
         self.assertEqual(params["total_wfv_rows"], wfv_conf["total_wfv_rows"])
         self.assertEqual(wfv_ledger.config_total_windows(self.config),
                          wfv_conf["total_wfv_rows"] // wfv_conf["rows_per_window"])
+        # P2-4 semantics: the key survives as an OPTIONAL CAP on the schedule —
+        # the orchestrator plans min(configured, budget-feasible), and the key is
+        # still REQUIRED (ledger_params reads it, so a missing key fails closed).
+        plan = wfv_ledger.budget_plan_from_config(self.config)
+        self.assertEqual(plan["configured_windows"],
+                         wfv_ledger.config_total_windows(self.config),
+                         "the configured cap must come from wfv_config.total_wfv_rows")
+        self.assertLessEqual(plan["planned_windows"], plan["configured_windows"],
+                             "planned windows may never exceed the configured cap")
+        self.assertLessEqual(plan["planned_windows"], plan["feasible_windows"],
+                             "planned windows may never exceed what the budget funds")
 
     # -- 5. no live references -----------------------------------------------
     def test_no_live_module_references_deleted_keys(self):

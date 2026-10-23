@@ -112,6 +112,24 @@ Branch `fix/wfv-correctness-external-review`, commit range **`719d267` … `3cf0
 - Per-task proposals and verification records: `docs/P0-*.md` … `docs/P2-3_e2e_invariants.md`. Open residual: M1c external run registry (see `docs/P2-2_run_id_lifecycle_ledger.md` §13 — open developer decision item, not yet implemented).
 - **Still open after the program:** Tasks 4.3, 4.4, 4.5, 4.8 and the deferred full-scale WFV run. Future candidates are tracked in `Future_Path.md` (repo root — the authoritative future-plans doc).
 
+### ✅ P2-4 — Dynamic Window Budget (post-program developer decision, 2026-10-23)
+
+The full-run budget conflict P0-5 pinned and P2-1 quantified (configured ledger
+needs 4,358,880 rows vs the stated 4,000,000-row budget) is **resolved by
+decision**: full-mode WFV now allocates windows dynamically —
+`planned = min(configured cap from wfv_config.total_wfv_rows, budget-feasible)`
+where `feasible = (total_rows − data_start_row − full_cal_rows) // rows_per_window`.
+With the live config that is **168 windows** (10 annual + 158 monthly) and
+**8,320 discarded rows**; the leftover is never emitted as a partial window. The
+P0-5 fail-fast is **replaced** for the overrun case (truncate + loud warning +
+`run_meta.json` budget fields: `budget_rows`, `configured_windows`,
+`feasible_windows`, `discarded_rows`, `budget_truncated`) and **retained** for the
+zero-feasible case. Arithmetic lives in `wfv_ledger.py`
+(`compute_feasible_window_count` / `compute_budget_plan` / `budget_plan_from_config`);
+policy in `orchestrate_calibration.py` (`enforce_budget_floor` /
+`format_budget_truncation_warning`); new `--dry-run` schedule-only path.
+`config.json` unchanged. Record: `docs/P2-4_dynamic_window_budget.md`.
+
 ### ✅ Decisions Recorded (2026-10-22 — documentation-only, zero code changes)
 - **`min_sharpe` / `min_calmar` configured floors — RESOLVED BY DECISION: keep as-is, documented as a known deviation.** The live values are `min_sharpe: -0.5` / `min_calmar: -0.2` (VM and TV — `config.json → calibration_params → scoring_constraints`) and `min_sharpe: -2.0` / `min_calmar: -1.0` (Trend — `calibration_params → trend_strategy_constraints`). Since P1-6 these are enforced as Optuna trial constraints with feasible-first Pareto ranking instead of penalty weights. They are far looser than the historically documented Sharpe > 1.0 / Calmar > 0.5 intent — leftovers from the retired linear-penalty objective era. The developer chose **not** to raise them; the deviation is documented in `AGENTS.md` (User Preferences → Reward Function Philosophy) and tracked for a future config decision under P2-1. `config.json` remains frozen.
 - **Smoke-mode slice geometry — RESOLVED BY DECISION: stays tiny by design, no enlargement.** Smoke runs exist only to prove the pipeline runs end-to-end without crashing; they are not statistical or performance evidence. Instead of enlarging the smoke geometry, the statistical-validity caveat is documented in `AGENTS.md` and `testing_skill.md`: smoke CPCV folds carry ~1-30 trades, `min_usable_folds=1` collapses the metric distribution to a point estimate, and the Sharpe/Calmar constraint floors are disabled in smoke with a loud warning. Statistically meaningful validation remains the job of parity/validation tests with real data depth (≥1 year where the strategy must actually trade).
@@ -270,3 +288,4 @@ python backtest_xauusd_signal_csv.py --strategy trend --mode test --headless --o
 *Last updated by AI Agent on 2026-07-11 — Phase 4 signal generation complete: sparse event loops (100x fewer iterations), pre-computed reasons, GPU data loading via `--gpu` flag. Both VM and TV parity tests PASS. Added algorithmic soundness table. Remaining: backtesting loop-breaking (4.3), Optuna search space reduction (4.4), parity validation (4.5).*
 *Last updated by AI Agent on 2026-10-22 — documentation-only update on `fix/wfv-correctness-external-review`: added open Task 4.8 (calibration reproducibility under NSGA-II ask/tell interleaving at `n_jobs > 1` — deferred, no policy chosen) and recorded two developer decisions (keep the loose `min_sharpe`/`min_calmar` floors as a documented deviation; keep smoke-mode slices tiny by design with the statistical-validity caveat documented in AGENTS.md). The roadmap sections above still describe the pre-P0/P1 external-review state.*
 *Last updated by AI Agent on 2026-10-23 — status refresh: external-review correctness program (P0-1 … P2-3) marked COMPLETE with the branch commit range `719d267` … `3cf06f2`; Task 4.8 kept OPEN with a `Future_Path.md` §7 cross-reference; `Future_Path.md` (repo root) designated the authoritative future-plans doc. Historical roadmap sections and cleanup logs retained as history.*
+*Last updated by AI Agent on 2026-10-23 (P2-4) — post-program developer decision recorded: full-mode WFV window count is now dynamic (`min(configured cap, budget-feasible)` = 168 windows / 8,320 discarded rows with the live 4,000,000-row budget), the P0-5 budget-overrun fail-fast is replaced by truncate + loud warning + `run_meta.json` budget fields, and the zero-feasible fail-fast is retained. `config.json` untouched. Record: `docs/P2-4_dynamic_window_budget.md`.*

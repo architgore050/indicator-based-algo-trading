@@ -133,6 +133,14 @@ from wfv_ledger import (  # noqa: E402
     build_expected_ledger,
     expected_chunk_set,
     config_fingerprint,
+    # P2-4: dynamic window budget. The arithmetic lives in wfv_ledger (never
+    # re-declared here); main() calls budget_plan_from_config. The other three
+    # are re-exported so consumers and tests can reach the shared budget math
+    # through this module, matching the existing re-export pattern above.
+    compute_feasible_window_count,
+    compute_budget_plan,
+    budget_plan_from_config,
+    config_total_windows,
 )
 
 
@@ -141,6 +149,68 @@ def compute_pre_roll_bars() -> int:
     P0-6 pre-roll from this module's loaded CALIB_PARAMS via the shared
     wfv_ledger implementation."""
     return _compute_pre_roll_bars(CALIB_PARAMS)
+
+
+# ---------------------------------------------------------------------------
+# P2-4 — Dynamic Window Budget (orchestrator policy layer)
+# ---------------------------------------------------------------------------
+# Developer decision (2026-10-23): "the code should dynamically allocate
+# windows based on whatever fits in the stated fund in config (not hard coded).
+# If config says 4M is the budget we fill as many full windows as we can fit.
+# No incomplete windows at the end — we simply discard the few rows we can not
+# use."
+#
+# The window arithmetic itself lives in wfv_ledger (compute_feasible_window_count
+# / compute_budget_plan / budget_plan_from_config) so the orchestrator and the
+# collator share ONE implementation. What lives HERE is the policy: which
+# condition is a hard error, what gets logged, and what run_meta records.
+
+def enforce_budget_floor(plan: dict, data_start_row: int, total_rows: int) -> None:
+    """P0-5 fail-fast RETAINED for the zero-feasible case (P2-4).
+
+    A budget that cannot fund even ONE complete window is a config error, not a
+    truncation. Raising it before setup_wfv_dirs() preserves the P0-5 guarantee
+    that a rejected config never wipes a previous run tree.
+    """
+    if plan["feasible_windows"] >= 1:
+        return
+    raise ValueError(
+        f"ABORT: the config-stated row budget funds ZERO WFV windows. "
+        f"budget_rows={plan['budget_rows']:,} (data_config.total_rows={total_rows:,} - "
+        f"data_start_row={data_start_row:,}) must first fund the initial annual IS "
+        f"reservation full_cal_rows={plan['full_cal_rows']:,}; "
+        f"{plan['budget_rows'] - plan['full_cal_rows']:,} rows remain for "
+        f"rows_per_window={plan['rows_per_window']:,}-bar OOS windows. "
+        f"Raise data_config.total_rows (and extend data.csv) or lower "
+        f"calibration_params.calibration_rows_per_trial."
+    )
+
+
+def format_budget_truncation_warning(plan: dict, planned_windows: int,
+                                     oos_start_base: int, total_rows: int,
+                                     total_wfv_rows: int, data_start_row: int) -> str:
+    """The LOUD P2-4 warning: every number a reviewer needs, spelled out."""
+    last_oos_end = oos_start_base + planned_windows * plan["rows_per_window"]
+    return (
+        "[P2-4 BUDGET TRUNCATION] The configured WFV ledger does not fit the "
+        "config-stated row budget; the schedule is truncated to the windows the "
+        "budget can actually fund. "
+        f"budget_rows={plan['budget_rows']:,} "
+        f"(data_config.total_rows={total_rows:,} - data_start_row={data_start_row:,}); "
+        f"full_cal_rows={plan['full_cal_rows']:,} (initial annual IS reservation); "
+        f"rows_per_window={plan['rows_per_window']:,}; "
+        f"feasible_windows={plan['feasible_windows']}; "
+        f"configured_windows={plan['configured_windows']} "
+        f"(wfv_config.total_wfv_rows={total_wfv_rows:,} // rows_per_window); "
+        f"planned_windows={planned_windows}; "
+        f"discarded_rows={plan['discarded_rows']:,} (leftover after "
+        f"{plan['feasible_windows']} full windows — smaller than one window and "
+        "NEVER emitted as a partial window). "
+        f"Last OOS window ends at row {last_oos_end:,}; data ends at "
+        f"{total_rows:,}. To fund the full configured ledger, raise "
+        "data_config.total_rows (and extend data.csv) or reduce the configured "
+        "window count."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +351,15 @@ def sha256_file(path) -> str:
 
 
 def build_run_meta(run_id: str, strategy: str, args, ledger: list, pre_roll_bars: int,
-                   schedule: dict, workers: int) -> dict:
+                   schedule: dict, workers: int, budget: dict = None) -> dict:
     """The planned-ledger + fingerprint record written before calibration starts."""
     data_csv = PROJECT_DIR / "data.csv"
-    return {
+    # Row count with an explicit close (the old inline `open()` leaked a
+    # ResourceWarning whenever build_run_meta was called outside the orchestrator,
+    # e.g. from the P2-4 unit tests).
+    with open(data_csv, "rb") as _data_fh:
+        data_rows = sum(1 for _ in _data_fh) - 1
+    meta = {
         "schema": "wfv_run_meta/v1",
         "run_id": run_id,
         "strategy": strategy,
@@ -304,7 +379,7 @@ def build_run_meta(run_id: str, strategy: str, args, ledger: list, pre_roll_bars
         # Fingerprints: verified by the collator at collation time.
         "data_csv": str(data_csv),
         "data_sha256": sha256_file(data_csv),
-        "data_rows": sum(1 for _ in open(data_csv, "rb")) - 1,
+        "data_rows": data_rows,
         "config_path": str(CONFIG_PATH),
         "config_sha256": sha256_file(CONFIG_PATH),
         "config_fingerprint": config_fingerprint(CONFIG, strategy),
@@ -316,6 +391,21 @@ def build_run_meta(run_id: str, strategy: str, args, ledger: list, pre_roll_bars
         "skipped_windows": None,
         "finished_at": None,
     }
+    # P2-4: the dynamic window-budget decision recorded truthfully, BEFORE any
+    # calibration happens, so the run carries the evidence that its ledger was
+    # truncated by the budget (or was not). `total_windows` above is the planned
+    # count; these fields explain WHERE that number came from.
+    # budget_truncated is a property of the CONFIG BUDGET vs the configured
+    # ledger (feasible < configured), independent of the run's mode or caps;
+    # discarded_rows is the sub-window leftover the budget could not fund.
+    if budget is not None:
+        meta["budget_rows"] = int(budget["budget_rows"])
+        meta["configured_windows"] = (None if budget["configured_windows"] is None
+                                      else int(budget["configured_windows"]))
+        meta["feasible_windows"] = int(budget["feasible_windows"])
+        meta["discarded_rows"] = int(budget["discarded_rows"])
+        meta["budget_truncated"] = bool(budget["budget_truncated"])
+    return meta
 
 
 def finalize_run_meta(run_dir, window_statuses: list, run_meta: dict,
@@ -939,6 +1029,15 @@ def main():
                         help=f"Root directory for run trees (default: {RUNS_DIR}).")
     parser.add_argument("--windows", type=int, default=None,
                         help="Cap the WFV schedule to this many windows (partial run).")
+    # P2-4: schedule-only path. Computes the dynamic budget plan, writes the run's
+    # run_meta.json (planned ledger + expected chunks + budget fields), logs the
+    # plan, and exits 0 WITHOUT slicing data, spawning workers, or touching
+    # PostgreSQL/GPU. Exists so the budget policy is observable and testable
+    # without a multi-hour calibration. Combine with --runs-dir to keep the
+    # scratch run tree out of the real wfv/runs/ tree.
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Compute + record the WFV schedule (run_meta.json) and exit "
+                             "before any data slicing or calibration.")
     args = parser.parse_args()
 
     # Logic Parameters (needed before VRAM estimation)
@@ -958,7 +1057,45 @@ def main():
     full_recal_interval = WFV_CONF["windows_per_full_recalibration"]
     pre_roll_bars = compute_pre_roll_bars()
 
-    total_windows = total_wfv_rows // rows_per_window
+    # -----------------------------------------------------------------------
+    # P2-4: DYNAMIC WINDOW BUDGET (developer decision, 2026-10-23).
+    # "the code should dynamically allocate windows based on whatever fits in
+    #  the stated fund in config (not hard coded). If config says 4M is the
+    #  budget we fill as many full windows as we can fit. No incomplete windows
+    #  at the end — we simply discard the few rows we can not use."
+    #
+    # planned = min(configured cap from wfv_config.total_wfv_rows, budget-
+    # feasible count). The feasible count is the hard ceiling: the budget must
+    # first fund the initial annual IS reservation (full_cal_rows) and then
+    # whole rows_per_window OOS windows. The leftover (< one window) is
+    # DISCARDED — a partial final window is never scheduled.
+    #
+    # This REPLACES the P0-5 fail-fast that rejected a full-mode run whenever
+    # the configured ledger exceeded the budget: an overrun is now a loud
+    # truncation, not a crash. The P0-5 fail-fast is RETAINED for the zero-
+    # feasible case (a budget that funds not even one window is a config error)
+    # and stays positioned BEFORE setup_wfv_dirs(), so a rejected config can
+    # never wipe a previous run tree.
+    # -----------------------------------------------------------------------
+    budget_plan = budget_plan_from_config(CONFIG)
+    enforce_budget_floor(budget_plan, data_start_row, total_wfv_rows)
+    total_windows = budget_plan["planned_windows"]
+
+    if budget_plan["budget_truncated"]:
+        # LOUD: the configured ledger is bigger than the budget can fund.
+        logger.warning(format_budget_truncation_warning(
+            budget_plan, total_windows, oos_start_base, total_wfv_rows,
+            WFV_CONF["total_wfv_rows"], data_start_row))
+    else:
+        logger.info(
+            f"[P2-4] Budget plan: budget_rows={budget_plan['budget_rows']:,}, "
+            f"full_cal_rows={budget_plan['full_cal_rows']:,}, "
+            f"rows_per_window={budget_plan['rows_per_window']:,} -> "
+            f"feasible_windows={budget_plan['feasible_windows']}, "
+            f"configured_windows={budget_plan['configured_windows']}, "
+            f"planned_windows={total_windows}, "
+            f"discarded_rows={budget_plan['discarded_rows']:,} "
+            "(no window exceeds the budget; no partial window)")
 
     # In smoke mode, cap the number of windows for fast feedback
     if args.smoke:
@@ -972,17 +1109,20 @@ def main():
         total_windows = min(total_windows, args.windows)
         logger.info(f"Window cap (--windows): {total_windows} windows (partial run)")
 
-    # Fail-fast validation (P0-5): the whole WFV schedule — the initial IS
-    # reservation plus every OOS window — must fit inside the CSV. Runs after
-    # the smoke cap (so smoke validates the windows it actually uses) and
-    # before setup_wfv_dirs() (so a rejected config never wipes a previous run).
+    # Invariant guard (P0-5, now defensive): the planned schedule — the initial
+    # IS reservation plus every OOS window — must fit inside the CSV. Under the
+    # P2-4 dynamic plan total_windows <= feasible_windows, so this can only fire
+    # if the shared budget arithmetic is broken; it is kept as an assertion of
+    # the half-open tiling guarantee, NOT as the config-overrun gate (that role
+    # is now the truncation above).
     required_total_rows = oos_start_base + (total_windows * rows_per_window)
     if DATA_CONF["total_rows"] < required_total_rows:
         raise ValueError(
-            f"CSV has {DATA_CONF['total_rows']} rows, but WFV config requires {required_total_rows} "
-            f"(data_start_row={data_start_row} + full_cal_rows={full_cal_rows} + WFV rows={total_windows * rows_per_window}). "
-            f"Please update config.json 'total_rows' or reduce WFV windows."
-        )
+            f"CSV has {DATA_CONF['total_rows']} rows, but the planned WFV schedule requires "
+            f"{required_total_rows} (data_start_row={data_start_row} + full_cal_rows={full_cal_rows} "
+            f"+ WFV rows={total_windows * rows_per_window}). The P2-4 dynamic budget plan "
+            f"(feasible_windows={budget_plan['feasible_windows']}) should have made this "
+            f"impossible — please report this as a scheduling bug.")
 
     # VRAM-aware worker limiting — compute from actual data sizes, not hardcoded defaults
     max_is_rows, oos_rows = compute_max_rows_per_window(args, full_cal_rows, rows_per_window, recal_windows_count)
@@ -1042,11 +1182,33 @@ def main():
         "total_wfv_rows": total_wfv_rows,
     }
     run_meta = write_run_meta(WFV_DIR, build_run_meta(
-        run_id, args.strategy, args, ledger, pre_roll_bars, schedule, args.workers))
+        run_id, args.strategy, args, ledger, pre_roll_bars, schedule, args.workers,
+        budget_plan))
     logger.info(f"[P2-2] Run id: {run_id}  Run dir: {WFV_DIR}")
     logger.info(f"[P2-2] run_meta.json written BEFORE calibration: "
                 f"{len(ledger)} planned window(s), data sha256={run_meta['data_sha256'][:16]}..., "
                 f"config fingerprint={run_meta['config_fingerprint'][:16]}...")
+    logger.info(f"[P2-4] run_meta budget record: budget_rows={run_meta['budget_rows']:,}, "
+                f"configured_windows={run_meta['configured_windows']}, "
+                f"feasible_windows={run_meta['feasible_windows']}, "
+                f"planned_windows={len(ledger)}, "
+                f"discarded_rows={run_meta['discarded_rows']:,}, "
+                f"budget_truncated={run_meta['budget_truncated']}")
+
+    if args.dry_run:
+        # P2-4 schedule-only path: the plan and its evidence exist, nothing else runs.
+        n_annual = sum(1 for i in range(1, total_windows + 1)
+                       if (i - 1) % full_recal_interval == 0)
+        logger.info(
+            f"[P2-4 DRY RUN] Schedule computed and recorded; NO data slicing, NO "
+            f"calibration, NO worker subprocesses were started. "
+            f"Planned windows: {total_windows} ({n_annual} annual + "
+            f"{total_windows - n_annual} monthly), "
+            f"expected chunks: {len(run_meta['expected_chunks'])}, "
+            f"last OOS window ends at row {ledger[-1]['oos_end'] if ledger else oos_start_base:,} "
+            f"of {total_wfv_rows:,} available rows "
+            f"({run_meta['discarded_rows']:,} discarded). Run dir: {WFV_DIR}")
+        return
 
     logger.info(f"Starting Parallel WFV for {args.strategy.upper()}. Total Windows: {total_windows}")
     logger.info(f"Using {args.workers} workers.")

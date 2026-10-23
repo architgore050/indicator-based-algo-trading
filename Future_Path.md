@@ -287,6 +287,25 @@ Two variants, deliberately separated because they have very different blast radi
 
 ---
 
+## 9. Collator Baseline Handshake — Bounded Execution (P2-4 review carry-forward, 2026-10-23)
+
+### Problem
+The collator's optional baseline handshake (`collate_wfv_results.py → _run_baseline`) launches `generate_*_signals.py --mode test --no-calibration` with **no size flags**, so the generator derives its full config test span (~4M rows) and dies with `RuntimeError: CUDA error at … cudaErrorMemoryAllocation out of memory` on this host (the resident local-inference engine holds ~15.5 of 16.3 GiB GPU). The collator fails soft ("Skipping baseline", collation EXIT 0). **Pre-existing, not a P2-4 regression**: identical failure signature in every historical collation log since P1-8 (`tmp/p1_8_collate_vm.txt`, `tmp/p18r_collate_vm.txt`, `tmp/p22_coll_vm.txt`); the handshake has never completed on this host. The integrity gate and collation EXIT codes are unaffected.
+
+### What would change
+Bound the handshake's generator span (e.g. `--start-row/--end-row` derived from the run's OOS ledger, or a `--baseline-rows` cap) so it can actually run on a constrained host.
+
+### Design question (developer decision required before implementing)
+The baseline is meant to be a config-defaults reference over the same span the WFV run traded. A bounded baseline is **not comparable** to a 168-window WFV aggregate, and the full span still OOMs on this host. Choose one: (a) bounded-comparable baseline (e.g. per-window or last-N-windows baseline with the comparison restated), (b) full-span baseline reserved for a host without a resident GPU tenant, or (c) retire the handshake and rely on the config-defaults reference elsewhere.
+
+### Related guard found in the same review
+Degenerate cap-0 config: `wfv_config.total_wfv_rows < rows_per_window` → configured cap 0 → `planned_windows = 0` and the orchestrator proceeds with an empty schedule (`enforce_budget_floor` guards `feasible ≥ 1`, not `planned ≥ 1`; verified live in P2-4 review probe M5, `docs/P2-4_dynamic_window_budget.md` Review findings R2). Unreachable with the frozen config; a future hardening should make `planned == 0` after caps a hard error or reject `total_wfv_rows < rows_per_window`.
+
+### Why deferred
+Collator diagnostics only; collation EXIT 0 and the P1-8/P2-2 integrity gate are unaffected; the comparison-semantics choice belongs to the developer. See `docs/P2-4_dynamic_window_budget.md` §13.6 + Review findings R-I.
+
+---
+
 ## Execution Order
 
 These upgrades should be tackled in this order:
@@ -298,6 +317,7 @@ These upgrades should be tackled in this order:
 5. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
 6. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.
 7. **Session-Aware Spread** — Lowest priority. Marginal accuracy gain for significant complexity.
+8. **Collator Baseline Handshake bounding (§9)** — small collator task (size-flag the baseline leg) but it requires the comparison-semantics decision in §9 first; bundle the `planned == 0` guard from the same section.
 
 ---
 
@@ -312,4 +332,4 @@ These upgrades should be tackled in this order:
 
 ---
 
-*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Updated 2026-10-22 with new §7 Calibration Reproducibility Policy (open item — mirrors `docs/PLAN.md` Task 4.8) and a corrected Current Status paragraph. Updated 2026-10-23 with new §8 Dead Tunable Parameters — Removal Decision (7 `DEAD_CONFIRMED` + 1 `INERT_MASKED` tunables from P2-3 Test 8; verdict-coverage audit found **none** covered by a verdict in `docs/externalReview_pipeline_correctness.md`, so `config.json` and the Test 8 allowlist were deliberately left untouched). Review and update after each baseline WFV run.*
+*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Updated 2026-10-22 with new §7 Calibration Reproducibility Policy (open item — mirrors `docs/PLAN.md` Task 4.8) and a corrected Current Status paragraph. Updated 2026-10-23 with new §8 Dead Tunable Parameters — Removal Decision (7 `DEAD_CONFIRMED` + 1 `INERT_MASKED` tunables from P2-3 Test 8; verdict-coverage audit found **none** covered by a verdict in `docs/externalReview_pipeline_correctness.md`, so `config.json` and the Test 8 allowlist were deliberately left untouched). Updated 2026-10-23 (P2-4 review) with new §9 Collator Baseline Handshake — Bounded Execution (pre-existing CUDA-OOM handshake failure on this host, ownership + semantics decision; plus the degenerate `planned == 0` guard found in the same review). Review and update after each baseline WFV run.*
