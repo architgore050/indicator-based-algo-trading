@@ -22,8 +22,6 @@ from backend.utils import (
 from backend.api.models import *
 from backend.api.data_loader import (
     load_all_collated,
-    load_collated_diagnostics_csv,
-    load_collated_baseline,
 )
 from backend.api.indicator_engine import compute_indicators, get_strategy_indicators
 from backend.api.signal_engine import (
@@ -40,10 +38,19 @@ from backend.api.analysis import (
     compute_drawdown_timeline,
 )
 from backend.api.wfv import (
+    load_wfv_bundle,
     load_wfv_windows,
-    load_wfv_aggregates,
-    load_wfv_per_window,
+    load_wfv_window_detail,
+    load_wfv_window_equity,
     load_param_evolution,
+)
+from backend.api.run_resolver import (
+    RunIdError,
+    RunResolutionError,
+    collated_report_info,
+    discover_run_dir,
+    list_run_dirs,
+    run_summary,
 )
 
 router = APIRouter()
@@ -57,6 +64,51 @@ _indicators_cache: dict[str, dict] = {}
 
 def _strategy_valid(strategy: str) -> bool:
     return strategy in ("vm", "tv", "trend")
+
+
+def _run_or_404(strategy: str, run_id: str) -> tuple[Path, dict | None]:
+    """Resolve a run tree; map resolver failures to HTTP codes:
+    malformed run_id -> 400, unknown/foreign run -> 404."""
+    try:
+        return discover_run_dir(strategy, run_id)
+    except RunIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RunResolutionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+def _collated_gate_or_404(strategy: str, run_id: str) -> dict | None:
+    """Fail-closed gate for collated-report consumers (/api/backtest, /api/summary,
+    /api/equity, /api/trade, /api/analysis/*, /api/ohlcv trade overlay).
+
+    No run_id  -> today's behavior unchanged (serve the root collated report);
+                   returns None so callers add no extra JSON parse to hot paths.
+    run_id given -> the report must be stamped with exactly that run
+    (metadata.run.run_id, P2-2). A foreign/legacy/missing report is a 404 with the
+    collator command needed to produce it — the backend never runs the collator.
+    Returns the report-info dict for callers that want to report provenance.
+    """
+    if not run_id:
+        return None
+    run_dir, _ = _run_or_404(strategy, run_id)
+    info = collated_report_info(strategy, run_dir)
+    if not (info["available"] and info["matches_run"]):
+        raise HTTPException(
+            status_code=404,
+            detail=(f"No collated report for run {run_id!r} (strategy {strategy}). "
+                    f"{info['note'] or 'Report missing.'}"))
+    return info
+
+
+def _run_block_for_report(strategy: str) -> dict:
+    """Honest run-association block for collated consumers (additive field):
+    which run the served collated report belongs to, and whether it matches the
+    latest run tree of this strategy."""
+    try:
+        run_dir, _ = discover_run_dir(strategy, "")
+    except (RunResolutionError, RunIdError):
+        run_dir = None
+    return collated_report_info(strategy, run_dir)
 
 
 def _parse_time(ts: str) -> str:
@@ -222,9 +274,18 @@ def get_ohlcv(
     start: str = Query("", description="Start timestamp or epoch ms"),
     end: str = Query("", description="End timestamp or epoch ms"),
     chunk_size: int = Query(10000, ge=100, le=100000),
+    run_id: str = Query("", description="P2-5 (F2): require the trade overlay to come from this exact run's collated report"),
 ):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+
+    # P2-5 finding F2: the trade overlay below reads the root collated report
+    # (collated_trades.csv). With an explicit run_id the report must be stamped
+    # with that run, so a run-scoped client can never mix run A's WFV table with
+    # run B's trade markers. Without run_id the pre-P2-5 behavior is unchanged and
+    # the chart hot path pays no extra JSON parse.
+    gate_info = _collated_gate_or_404(strategy, run_id)
+    trades_run = gate_info.get("run_id") if gate_info else None
 
     from backend.api.data_loader import load_ohlcv as _load_ohlcv
     _RANGE_BARS: dict[str, int] = {"1D": 1440, "1W": 10080, "1M": 43200, "3M": 129600, "1Y": 525600}
@@ -233,7 +294,8 @@ def get_ohlcv(
     if start or end:
         df = _load_ohlcv(start, end, chunk_size=chunk_size or 10000, range_str=range)
         if df.empty:
-            return {"data": [], "total_count": 0, "returned_count": 0, "trades": []}
+            return {"data": [], "total_count": 0, "returned_count": 0, "trades": [],
+                    "trades_run": trades_run}
         if len(df) > MAX_CANDLES:
             step = math.ceil(len(df) / MAX_CANDLES)
             df = df.iloc[::step]
@@ -245,7 +307,8 @@ def get_ohlcv(
 
         df = _load_ohlcv(start, end, chunk_size=target_bars, range_str=range)
         if df.empty:
-            return {"data": [], "total_count": 0, "returned_count": 0, "trades": []}
+            return {"data": [], "total_count": 0, "returned_count": 0, "trades": [],
+                    "trades_run": trades_run}
 
         # Stride-sample down to MAX_CANDLES so the JSON payload stays small and the
         # SVG chart (one <g> per bar) doesn't try to render hundreds of thousands of nodes.
@@ -342,6 +405,9 @@ def get_ohlcv(
         "total_count": total,
         "returned_count": len(rows),
         "trades": collated_trades,
+        # P2-5 (F2): provenance of the trade overlay. null = the caller did not
+        # select a run, so the overlay comes from whatever the root report holds.
+        "trades_run": trades_run,
     }
 
 
@@ -524,12 +590,14 @@ def get_backtest(
     mode: str = Query("full", pattern="(full|range)"),
     start: str = Query(""),
     end: str = Query(""),
+    run_id: str = Query("", description="P2-5: require the collated report of this exact run"),
 ):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     # Check response cache first — this endpoint takes 7s on first call
-    cache_key = strategy
+    cache_key = f"{strategy}:{run_id}"
     if cache_key in _backtest_cache:
         return _backtest_cache[cache_key]
 
@@ -547,6 +615,8 @@ def get_backtest(
             "calibrated_params": cal,
             "skipped_signals": [],
             "executions": [],
+            # P2-5 additive: which run this collated report belongs to
+            "run": _run_block_for_report(strategy),
         }
         _backtest_cache[cache_key] = result
         return result
@@ -562,9 +632,11 @@ def get_backtest(
 def get_trade_detail(
     strategy: str,
     trade_id: int,
+    run_id: str = Query("", description="P2-5: require the collated report of this exact run"),
 ):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -636,15 +708,21 @@ def get_trade_detail(
 
 # ─── GET /api/summary/{strategy} ───────────────────────────────────
 @router.get("/api/summary/{strategy}")
-def get_summary(strategy: str):
+def get_summary(
+    strategy: str,
+    run_id: str = Query("", description="P2-5: require the collated report of this exact run"),
+):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     if not collated or not collated.get("summary"):
         raise HTTPException(status_code=404, detail=f"No summary data for strategy: {strategy}")
     try:
-        return _sanitize_summary(collated["summary"])
+        result = _sanitize_summary(collated["summary"])
+        result["run"] = _run_block_for_report(strategy)  # P2-5 additive
+        return result
     except Exception as e:
         import traceback
         print(f"ERROR in _sanitize_summary: {e}")
@@ -659,15 +737,17 @@ def get_equity(
     start: str = Query(""),
     end: str = Query(""),
     chunk_size: int = Query(1440),
+    run_id: str = Query("", description="P2-5: require the collated report of this exact run"),
 ):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     # Windowed requests (chart scrolling) use get_equity_range which slices by
     # timestamp; named ranges use the tail-based get_equity_window. Cache key
     # includes the window so repeated scrolls are instant.
     is_windowed = bool(start or end)
-    cache_key = f"{strategy}:window:{start}:{end}:{chunk_size}" if is_windowed else f"{strategy}:{range}:{chunk_size}"
+    cache_key = f"{strategy}:window:{start}:{end}:{chunk_size}:{run_id}" if is_windowed else f"{strategy}:{range}:{chunk_size}:{run_id}"
     if cache_key in _equity_cache:
         return _equity_cache[cache_key]
 
@@ -682,7 +762,9 @@ def get_equity(
         equity_df = get_equity_window(strategy, target_bars, max_points=2048)
 
     if equity_df is None or equity_df.empty:
-        result = {"equity_curve": [], "baseline_equity": [], "asset_equity": [], "calibration_points": []}
+        result = {"equity_curve": [], "baseline_equity": [], "baseline_note": None,
+                  "asset_equity": [], "calibration_points": [],
+                  "run": _run_block_for_report(strategy)}
         _equity_cache[cache_key] = result
         return result
 
@@ -691,9 +773,21 @@ def get_equity(
 
     # Baseline & buy-and-hold series from the same windowed slice
     baseline_equity = []
+    baseline_note: str | None = None
     asset_equity = []
     if "baseline_equity_usd" in equity_df.columns:
-        baseline_equity = equity_df["baseline_equity_usd"].tolist()
+        baseline_col = equity_df["baseline_equity_usd"]
+        if baseline_col.notna().any():
+            baseline_equity = baseline_col.tolist()
+        else:
+            # P2-5 finding F3 (writer side, pipeline behavior — untouched): the
+            # collator writes an all-NaN baseline_equity_usd when its baseline
+            # handshake did not run. Returning zeros for it would fabricate a flat
+            # baseline line; serve an empty series and say why instead.
+            baseline_note = (
+                "collated_equity_curve.csv baseline_equity_usd is entirely empty for "
+                "this report (the collator's baseline handshake did not run) — no "
+                "baseline series is served rather than a fabricated zero line.")
     if "raw_asset_close" in equity_df.columns and "close" in equity_df.columns and len(equity_df) > 0:
         initial_cap = 100000
         first_close = float(equity_df["close"].iloc[0])
@@ -701,48 +795,140 @@ def get_equity(
             asset_equity = [initial_cap * (c / first_close) for c in equity_df["close"].tolist()]
 
     result = {
-        "equity_curve": equity_out,
-        "baseline_equity": baseline_equity,
-        "asset_equity": asset_equity,
+        # P2-5 fix (pre-existing defect): collated baseline_equity_usd can be all-NaN
+        # (collator writes NaN when no baseline handshake ran), which crashed JSON
+        # serialization with "Out of range float values are not JSON compliant: nan".
+        # Partial NaN is sanitized inf/nan -> 0.0 like every other endpoint already
+        # does; an entirely-empty column is reported honestly (baseline_note above).
+        "equity_curve": sanitize_dict(equity_out),
+        "baseline_equity": sanitize_dict(baseline_equity),
+        "baseline_note": baseline_note,
+        "asset_equity": sanitize_dict(asset_equity),
         "calibration_points": [],
+        # P2-5 additive: which run the served collated equity curve belongs to
+        "run": _run_block_for_report(strategy),
     }
     _equity_cache[cache_key] = result
     return result
 
 
+# ─── GET /api/runs ─────────────────────────────────────────────────
+@router.get("/api/runs")
+def get_runs(strategy: str = Query("", description="vm|tv|trend, or empty for all")):
+    """P2-5: list WFV run trees with summaries read from each run_meta.json."""
+    if strategy and not _strategy_valid(strategy):
+        raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    try:
+        runs = [run_summary(d) for d in list_run_dirs()]
+    except RunResolutionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if strategy:
+        # Strategy-scoped listing; trees without run_meta (strategy unknown) are
+        # kept and flagged run_meta_present=false rather than silently dropped.
+        runs = [r for r in runs if r.get("strategy") in (strategy, None)]
+    runs.sort(key=lambda r: r["run_id"], reverse=True)  # newest first
+    return {"strategy": strategy or "all", "count": len(runs), "runs": runs}
+
+
 # ─── GET /api/wfv/{strategy} ───────────────────────────────────────
 @router.get("/api/wfv/{strategy}")
-def get_wfv(strategy: str):
+def get_wfv(
+    strategy: str,
+    run_id: str = Query("", description="P2-5: explicit run selection; default = latest run of this strategy"),
+):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    try:
+        return load_wfv_bundle(strategy, run_id)
+    except RunIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RunResolutionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-    windows = load_wfv_windows(strategy)
-    aggregates = load_wfv_aggregates(strategy)
-    per_window = load_wfv_per_window(strategy)
-    baseline = load_collated_baseline(strategy)
 
-    return sanitize_dict({
-        "windows": windows,
-        "aggregates": aggregates,
-        "per_window": per_window,
-        "baseline": baseline,
-    })
+# ─── GET /api/wfv/{strategy}/windows ───────────────────────────────
+@router.get("/api/wfv/{strategy}/windows")
+def get_wfv_windows(
+    strategy: str,
+    run_id: str = Query(""),
+):
+    """Window list for one run, skipped windows included with their status."""
+    if not _strategy_valid(strategy):
+        raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    run_dir, run_meta = _run_or_404(strategy, run_id)
+    windows = load_wfv_windows(strategy, run_id)
+    return {
+        "run": {"run_id": run_dir.name,
+                "strategy": (run_meta or {}).get("strategy"),
+                "mode": (run_meta or {}).get("mode"),
+                "total_windows": (run_meta or {}).get("total_windows"),
+                "outcomes": (run_meta or {}).get("outcomes")},
+        "collated_report": collated_report_info(strategy, run_dir),
+        "windows": sanitize_dict(windows),
+    }
+
+
+# ─── GET /api/wfv/{strategy}/windows/{window_idx} ──────────────────
+@router.get("/api/wfv/{strategy}/windows/{window_idx}")
+def get_wfv_window_detail(
+    strategy: str,
+    window_idx: int,
+    run_id: str = Query(""),
+):
+    """Per-window summary stats / manifest / calibration params from the run tree.
+    Skipped windows return 200 with status — never 404/500 for a manifest skip."""
+    if not _strategy_valid(strategy):
+        raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    try:
+        return load_wfv_window_detail(strategy, window_idx, run_id)
+    except RunIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RunResolutionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ─── GET /api/wfv/{strategy}/windows/{window_idx}/equity ───────────
+@router.get("/api/wfv/{strategy}/windows/{window_idx}/equity")
+def get_wfv_window_equity(
+    strategy: str,
+    window_idx: int,
+    run_id: str = Query(""),
+    max_points: int = Query(2048, ge=64, le=10000),
+):
+    """Per-window equity curve (backtest_results/equity_curve.csv, stride-sampled).
+    Skipped windows return status + empty curve."""
+    if not _strategy_valid(strategy):
+        raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    try:
+        return load_wfv_window_equity(strategy, window_idx, run_id, max_points)
+    except RunIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RunResolutionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ─── GET /api/param_evolution/{strategy} ───────────────────────────
 @router.get("/api/param_evolution/{strategy}")
-def get_param_evolution(strategy: str):
+def get_param_evolution(
+    strategy: str,
+    run_id: str = Query(""),
+):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
-
-    return load_param_evolution(strategy)
+    try:
+        return load_param_evolution(strategy, run_id)
+    except RunIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RunResolutionError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ─── Analysis endpoints ────────────────────────────────────────────
 @router.get("/api/analysis/{strategy}/pnl-distribution")
-def get_pnl_distribution(strategy: str):
+def get_pnl_distribution(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -752,9 +938,10 @@ def get_pnl_distribution(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/monthly-returns")
-def get_monthly_returns(strategy: str):
+def get_monthly_returns(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     equity_df = collated.get("equity_curve") if collated else None
@@ -764,9 +951,10 @@ def get_monthly_returns(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/exit-reasons")
-def get_exit_reasons(strategy: str):
+def get_exit_reasons(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -776,9 +964,10 @@ def get_exit_reasons(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/streaks")
-def get_streaks(strategy: str):
+def get_streaks(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -788,9 +977,10 @@ def get_streaks(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/mfe-mae")
-def get_mfe_mae(strategy: str):
+def get_mfe_mae(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -800,9 +990,10 @@ def get_mfe_mae(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/duration-vs-pnl")
-def get_duration_scatter(strategy: str):
+def get_duration_scatter(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     trades_df = collated.get("trades") if collated else None
@@ -812,9 +1003,10 @@ def get_duration_scatter(strategy: str):
 
 
 @router.get("/api/analysis/{strategy}/drawdown-timeline")
-def get_drawdown_timeline(strategy: str):
+def get_drawdown_timeline(strategy: str, run_id: str = Query("")):
     if not _strategy_valid(strategy):
         raise HTTPException(status_code=400, detail=f"Invalid strategy: {strategy}")
+    _collated_gate_or_404(strategy, run_id)
 
     collated = load_all_collated(strategy)
     equity_df = collated.get("equity_curve") if collated else None
