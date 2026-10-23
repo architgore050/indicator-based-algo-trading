@@ -19,6 +19,7 @@ from logging_utils import (get_logger, get_lifecycle_logger, close_lifecycle_log
                            suppress_pandas_warnings, setup_root_logger)
 
 import moo_selection as moo
+import run_registry  # P2-6: external run registry (M1c trust root)
 
 PYTHON = sys.executable
 
@@ -1015,7 +1016,9 @@ def process_window(i, strategy, args, oos_start_base, rows_per_window, total_wfv
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", type=str, choices=["tv", "vm", "trend"], required=True)
+    # P2-6: --strategy is required for a calibration run but optional for the
+    # registry-only --backfill-registry mode (which spans every strategy).
+    parser.add_argument("--strategy", type=str, choices=["tv", "vm", "trend"], default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workers")
     # P2-2: run identity. --run-id overrides the generated id (deterministic
@@ -1038,7 +1041,36 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute + record the WFV schedule (run_meta.json) and exit "
                              "before any data slicing or calibration.")
+    # P2-6: external run registry controls (docs/P2-6_run_registry_retention.md).
+    parser.add_argument("--backfill-registry", action="store_true",
+                        help="Register existing run trees that predate the registry "
+                             "(from their run_meta.json) into wfv_run_registry and exit. "
+                             "Never overwrites an existing registration; combine with "
+                             "--strategy to scope the backfill.")
+    parser.add_argument("--prune-runs", type=int, default=None, metavar="N",
+                        help="After this run finalizes, keep only the newest N COMPLETED "
+                             "run trees for this strategy (registry-driven; the just-"
+                             "finished run is never pruned, registry rows survive with "
+                             "pruned_at). OFF by default.")
+    parser.add_argument("--prune-dry-run", action="store_true",
+                        help="With --prune-runs: report what WOULD be pruned, delete nothing.")
     args = parser.parse_args()
+
+    if args.strategy is None and not args.backfill_registry:
+        parser.error("--strategy is required unless --backfill-registry is used")
+
+    # --- P2-6: registry-only backfill mode (no calibration, no GPU) ----------
+    if args.backfill_registry:
+        runs_dir = Path(args.runs_dir) if args.runs_dir else RUNS_DIR
+        registry = run_registry.connect_registry()
+        try:
+            registry.ensure_schema()
+            summary = run_registry.backfill_runs(
+                registry, runs_dir, strategy=args.strategy, log=logger.info)
+        finally:
+            registry.close()
+        logger.info(f"[P2-6] Registry backfill complete for {runs_dir}.")
+        return
 
     # Logic Parameters (needed before VRAM estimation)
     # P0-5: oos_start_base is derived, not configured. The first OOS window can
@@ -1256,77 +1288,133 @@ def main():
     # can reconstruct the run summary from the run directory alone.
     window_statuses = []
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        # Phase 1: All annual windows
-        logger.info("--- Phase 1: Annual Windows ---")
-        annual_futures = []
-        for i in annual_indices:
-            annual_futures.append(executor.submit(
-                process_window, 
-                i, args.strategy, args, oos_start_base, rows_per_window, 
-                total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
-            ))
+    # --- P2-6: external run registry (M1c trust root) ------------------------
+    # The plan is registered in PostgreSQL BEFORE calibration starts and finalized
+    # after run_meta.json closes. The registry lives OUTSIDE wfv/runs/<run_id>/, so
+    # rewriting the tree cannot rewrite its attestation (M1c closure). An
+    # unreachable registry is a hard stop: calibration that cannot be attested
+    # afterwards is not worth running. --dry-run returned above and is deliberately
+    # NOT registered — a schedule-only plan produced no evidence to attest.
+    registry = run_registry.connect_registry()
+    try:
+        registry.ensure_schema()
+        prior = registry.register(run_meta)
+        if prior is not None:
+            logger.warning(
+                f"[P2-6] run_id {run_id!r} was ALREADY registered in the run registry "
+                f"(previous status {prior[0]!r}). Re-registered as 'started' — only an "
+                f"IDENTICAL plan is accepted; a completed registration with a different "
+                f"plan raises RegistryConflict and this run refuses to start.")
+        logger.info(f"[P2-6] Run {run_id!r} registered in {run_registry.REGISTRY_TABLE}: "
+                    f"planned_windows={run_meta['total_windows']}, "
+                    f"planned_ledger_sha256={run_registry.canonical_ledger_sha256(ledger)[:16]}..., "
+                    f"data_sha256={run_meta['data_sha256'][:16]}...")
 
-        for i, f in tqdm(list(zip(annual_indices, annual_futures)),
-                         desc="Phase 1 — Annual Windows", unit="window"):
+        try:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                # Phase 1: All annual windows
+                logger.info("--- Phase 1: Annual Windows ---")
+                annual_futures = []
+                for i in annual_indices:
+                    annual_futures.append(executor.submit(
+                        process_window, 
+                        i, args.strategy, args, oos_start_base, rows_per_window, 
+                        total_wfv_rows, recal_windows_count, full_recal_interval, 
+                        full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
+                    ))
+
+                for i, f in tqdm(list(zip(annual_indices, annual_futures)),
+                                 desc="Phase 1 — Annual Windows", unit="window"):
+                    try:
+                        window_statuses.append((i, f.result()))
+                    except RuntimeError as e:
+                        if "ABORT" in str(e):
+                            logger.error(f"WFV run aborted: {e}")
+                            raise
+                        raise
+                    except Exception as e:
+                        logger.error(f"Annual window failed: {e}")
+                        raise
+
+                # Phase 2: All monthly windows
+                logger.info("--- Phase 2: Monthly Windows ---")
+                monthly_futures = []
+                for i in monthly_indices:
+                    monthly_futures.append(executor.submit(
+                        process_window, 
+                        i, args.strategy, args, oos_start_base, rows_per_window, 
+                        total_wfv_rows, recal_windows_count, full_recal_interval, 
+                        full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
+                    ))
+
+                for i, f in tqdm(list(zip(monthly_indices, monthly_futures)),
+                                 desc="Phase 2 — Monthly Windows", unit="window"):
+                    try:
+                        window_statuses.append((i, f.result()))
+                    except RuntimeError as e:
+                        if "ABORT" in str(e):
+                            logger.error(f"WFV run aborted: {e}")
+                            raise
+                        raise
+                    except Exception as e:
+                        logger.error(f"Monthly window failed: {e}")
+                        raise
+        except BaseException:
+            # Crash / abort / interrupt: the registration must not stay 'started'
+            # as though the run might still complete. Best-effort 'failed' stamp,
+            # then the original exception propagates unchanged.
             try:
-                window_statuses.append((i, f.result()))
-            except RuntimeError as e:
-                if "ABORT" in str(e):
-                    logger.error(f"WFV run aborted: {e}")
-                    raise
-                raise
-            except Exception as e:
-                logger.error(f"Annual window failed: {e}")
-                raise
+                if registry.mark_failed(run_id):
+                    logger.error(f"[P2-6] run {run_id!r} marked 'failed' in the run registry.")
+                else:
+                    logger.error(f"[P2-6] run {run_id!r} had no 'started' registry row to mark "
+                                 f"failed — the registration state is already inconsistent.")
+            except Exception as reg_exc:
+                logger.error(f"[P2-6] could not mark run {run_id!r} failed in the registry: "
+                             f"{reg_exc}")
+            raise
 
-        # Phase 2: All monthly windows
-        logger.info("--- Phase 2: Monthly Windows ---")
-        monthly_futures = []
-        for i in monthly_indices:
-            monthly_futures.append(executor.submit(
-                process_window, 
-                i, args.strategy, args, oos_start_base, rows_per_window, 
-                total_wfv_rows, recal_windows_count, full_recal_interval, 
-                full_cal_rows, WFV_DIR, row_to_chunk, pre_roll_bars, run_id
-            ))
+        # P1-7 run summary: skipped windows are reported, never hidden.
+        skipped = [s for s in window_statuses if s[1] == NO_ADMISSIBLE_TRIAL_STATUS]
+        completed = len(window_statuses) - len(skipped)
 
-        for i, f in tqdm(list(zip(monthly_indices, monthly_futures)),
-                         desc="Phase 2 — Monthly Windows", unit="window"):
-            try:
-                window_statuses.append((i, f.result()))
-            except RuntimeError as e:
-                if "ABORT" in str(e):
-                    logger.error(f"WFV run aborted: {e}")
-                    raise
-                raise
-            except Exception as e:
-                logger.error(f"Monthly window failed: {e}")
-                raise
+        # P2-2: the run summary is persisted into run_meta.json (skipped windows
+        # included) so the run dir alone can reconstruct what happened.
+        run_meta = finalize_run_meta(WFV_DIR, window_statuses, run_meta, full_recal_interval)
 
-    # P1-7 run summary: skipped windows are reported, never hidden.
-    skipped = [s for s in window_statuses if s[1] == NO_ADMISSIBLE_TRIAL_STATUS]
-    completed = len(window_statuses) - len(skipped)
+        # P2-6: the external counterpart of finalize_run_meta. The registry records
+        # 'completed' with the same window arithmetic the collation gate re-checks.
+        registry.finalize(run_id, completed, len(skipped))
+        logger.info(f"[P2-6] run {run_id!r} finalized in {run_registry.REGISTRY_TABLE} "
+                    f"(completed_windows={completed}, skipped_windows={len(skipped)}).")
 
-    # P2-2: the run summary is persisted into run_meta.json (skipped windows
-    # included) so the run dir alone can reconstruct what happened.
-    run_meta = finalize_run_meta(WFV_DIR, window_statuses, run_meta, full_recal_interval)
-
-    logger.info(
-        f"WFV run summary: {completed} window(s) completed, "
-        f"{len(skipped)} window(s) skipped as NO_ADMISSIBLE_TRIAL "
-        f"(manifest.json recorded per skipped window; run_meta.json outcomes recorded)."
-    )
-    if skipped:
-        logger.warning(
-            "Skipped windows carry NO signals/backtest results by design — they are "
-            "explicitly inadmissible windows, NOT default-parameter substitutions. "
-            "Collation (P1-8 integrity validation) must account for them."
+        logger.info(
+            f"WFV run summary: {completed} window(s) completed, "
+            f"{len(skipped)} window(s) skipped as NO_ADMISSIBLE_TRIAL "
+            f"(manifest.json recorded per skipped window; run_meta.json outcomes recorded)."
         )
-    logger.info(f"WFV Pipeline Complete. Run dir: {WFV_DIR} (run_id={run_id}).")
-    logger.info("Collate with: python collate_wfv_results.py --strategy "
-                f"{args.strategy}   (auto-discovers the latest run under {runs_dir})")
+        if skipped:
+            logger.warning(
+                "Skipped windows carry NO signals/backtest results by design — they are "
+                "explicitly inadmissible windows, NOT default-parameter substitutions. "
+                "Collation (P1-8 integrity validation) must account for them."
+            )
+
+        # P2-6 retention (opt-in, default OFF): after finalization, prune older
+        # COMPLETED run trees for this strategy beyond the newest N. Registry-driven:
+        # only rows the registry vouches for as 'completed' are candidates, the run
+        # that just finished is never pruned, unregistered directories are reported
+        # and left untouched, and every registry row survives with pruned_at.
+        if args.prune_runs is not None:
+            run_registry.prune_run_dirs(
+                registry, runs_dir, args.strategy, args.prune_runs,
+                protect_run_id=run_id, dry_run=args.prune_dry_run, log=logger.info)
+
+        logger.info(f"WFV Pipeline Complete. Run dir: {WFV_DIR} (run_id={run_id}).")
+        logger.info("Collate with: python collate_wfv_results.py --strategy "
+                    f"{args.strategy}   (auto-discovers the latest run under {runs_dir})")
+    finally:
+        registry.close()
 
 if __name__ == "__main__":
     # Required for multiprocessing on Windows

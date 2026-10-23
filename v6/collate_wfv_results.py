@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from logging_utils import LIFECYCLE_MAX_LINE_BYTES  # re-exported: the gate checks it
+import run_registry  # P2-6: the external run registry (M1c trust root)
 from wfv_ledger import (
     build_expected_ledger,
     normalize_ledger,
@@ -54,6 +55,52 @@ RUNS_SUBDIR = "runs"
 RUN_META_FILE_NAME = "run_meta.json"
 LIFECYCLE_FILE_NAME = "lifecycle.jsonl"
 RUN_META_SCHEMA = "wfv_run_meta/v1"
+
+# P2-6 (reviewer finding F11): the collator's --run-id had no traversal guard. The
+# orchestrator validates its --run-id (P2-2 §2) and the backend validates every
+# run_id it resolves from untrusted HTTP (backend/api/run_resolver._validate_run_id,
+# MAX_RUN_ID_LEN=128 + control-character rejection); the collator was the last
+# consumer without one — discover_run_dir(runs_dir, "../../", "vm") resolved a
+# directory OUTSIDE runs/. The CLI is developer-input, so this was never a P2-5
+# hole, but a guard-less consumer is a guard-less footgun: a mistyped --run-id can
+# silently point collation at another directory. The rules below MIRROR the
+# backend's (same cap, same rejections) so all three consumers agree; the pin is
+# test/test_backend_run_discovery.py check G2.
+MAX_RUN_ID_LEN = 128
+
+
+def validate_run_id(run_id: str) -> str:
+    """Reject a run_id that is not a safe directory name (F11).
+
+    Mirrors backend/api/run_resolver._validate_run_id and the orchestrator's
+    --run-id check: no path separators, no '..', no edge whitespace, no control
+    characters, and a length cap (orchestrator run ids are 23 chars:
+    YYYYmmdd_HHMMSS_<6hex>; Linux caps a path component at 255 bytes and
+    Path.is_dir() raises ENAMETOOLONG beyond it).
+    """
+    if run_id != run_id.strip():
+        raise RuntimeError(f"Integrity Check Failed: run_id {run_id!r} has edge whitespace.")
+    for bad in ("..", "/", "\\"):
+        if bad in run_id:
+            raise RuntimeError(
+                f"Integrity Check Failed: run_id {run_id!r} contains {bad!r} — a run id "
+                f"is a directory NAME under runs/, never a path.")
+    if len(run_id) > MAX_RUN_ID_LEN:
+        raise RuntimeError(
+            f"Integrity Check Failed: run_id is {len(run_id)} chars — exceeds the "
+            f"{MAX_RUN_ID_LEN}-char cap (orchestrator run ids are 23 chars: "
+            f"YYYYmmdd_HHMMSS_<6hex>).")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in run_id):
+        raise RuntimeError(
+            f"Integrity Check Failed: run_id {run_id!r} contains control characters.")
+    return run_id
+
+
+def _run_dir_strategy(run_dir: Path):
+    """The strategy recorded in a run tree's run_meta.json, or None (no meta /
+    meta without a strategy). A corrupt meta is a hard failure (read_run_meta)."""
+    return (read_run_meta(run_dir) or {}).get("strategy")
+
 def _safe_std(values):
     """Compute std without RuntimeWarning from NaN values."""
     with warnings.catch_warnings():
@@ -275,20 +322,33 @@ def _is_run_dir(d: Path) -> bool:
 
 
 def discover_run_dir(runs_dir, run_id=None, strategy=None) -> Path:
-    """Resolve which run tree to collate (P2-2).
+    """Resolve which run tree to collate (P2-2, hardened by P2-6 F11/F17).
 
-    run_id given  -> <runs_dir>/<run_id> must exist.
-    run_id absent -> lexicographic max of the run directory NAMES (chronological,
-                     because run ids are timestamp-prefixed). Never getmtime.
-    strategy given -> discovery is strategy-scoped: wfv/runs/ holds runs of all
-                     three strategies, so the latest tree OF THE REQUESTED STRATEGY
-                     is chosen and other-strategy runs are reported, not collated.
-                     A run tree without run_meta (pre-P2-2) stays eligible.
+    run_id given  -> validated (F11: no traversal, no control chars, length cap)
+                     and <runs_dir>/<run_id> must exist.
+    run_id absent -> the latest run OF THE REQUESTED STRATEGY, chosen by
+                     lexicographic max of the run DIRECTORY NAME. run_id is
+                     timestamp-prefixed (%Y%m%d_%H%M%S_<6hex>), so name order IS
+                     chronological order. getmtime is deliberately NOT used:
+                     copying or touching a run tree rewrites its mtime and would
+                     silently change which run "latest" means (P2-2 deviation D6).
+    strategy given -> discovery is strategy-scoped in TWO TIERS (P2-6 F17):
+                     1. trees whose run_meta records the requested strategy;
+                     2. only if none exists, a run_meta-less (pre-P2-2) tree is
+                        used as a fallback, LOUDLY reported.
+                     The old rule — a meta-less tree is eligible everywhere, so
+                     20261231_…_zzzzzz with no meta outranks a real vm run — let an
+                     interrupted run directory (created before its meta is written)
+                     shadow genuine evidence. Tier order makes the strategy-matched
+                     tree win; the fallback stays available so legacy trees remain
+                     collatable, but never silently.
+                     A foreign-strategy tree is reported, never collated.
     A legacy pre-P2-2 tree (window_* directories directly under the parent of
     runs_dir) is reported with instructions instead of being collated implicitly.
     """
     runs_path = Path(runs_dir)
     if run_id:
+        validate_run_id(run_id)
         candidate = runs_path / run_id
         if not candidate.is_dir():
             known = sorted(d.name for d in runs_path.iterdir()
@@ -327,22 +387,35 @@ def discover_run_dir(runs_dir, run_id=None, strategy=None) -> Path:
             f"window_* scan: that is the cross-run contamination hole P2-2 closes.")
     chosen_name = candidates[-1]
     if strategy:
-        matching, foreign = [], []
+        matching, metaless, foreign = [], [], []
         for name in candidates:
-            meta = read_run_meta(runs_path / name)
-            got = (meta or {}).get("strategy")
-            if got is None or got == strategy:
+            got = _run_dir_strategy(runs_path / name)
+            if got == strategy:
                 matching.append(name)
+            elif got is None:
+                metaless.append(name)
             else:
                 foreign.append(f"{name} ({got})")
-        if not matching:
+        if matching:
+            chosen_name = matching[-1]
+            if metaless:
+                print(f"[P2-6 F17] Run discovery: {len(metaless)} run tree(s) carry no "
+                      f"run_meta.json and are NOT eligible against strategy-matched "
+                      f"trees: {metaless}. Pass --run-id to collate one deliberately.")
+        elif metaless:
+            chosen_name = metaless[-1]
+            print(f"[P2-6 F17] Run discovery: NO run tree under {runs_path} records "
+                  f"strategy {strategy!r} in its run_meta.json; falling back to the "
+                  f"latest meta-less (pre-P2-2) tree {chosen_name}. Its strategy is "
+                  f"unrecorded — the integrity gate will validate it by the P1-8 method "
+                  f"and report it as legacy.")
+        else:
             raise RuntimeError(
                 f"No run tree under {runs_path} belongs to strategy {strategy!r}. "
                 f"Runs present: {foreign}. Collation is strategy-scoped — pass "
                 f"--run-id for one of these runs, or run the {strategy} orchestrator "
                 f"first; collating a {strategy} report out of another strategy's "
                 f"evidence is refused.")
-        chosen_name = matching[-1]
         if foreign:
             print(f"[P2-2] Run discovery: ignoring {len(foreign)} run tree(s) of other "
                   f"strategies: {foreign}")
@@ -672,8 +745,64 @@ def _resolve_expected_ledger(wfv_path: Path, expected_windows, config: dict,
     )
 
 
+def _verify_registry_attestation(run_meta: dict, registry):
+    """P2-6 (M1c closure): external registry attestation of the run's plan.
+
+    The registry lives OUTSIDE the collated tree (PostgreSQL, not a file inside
+    wfv/runs/<run_id>/), so a forger who rewrites every file in the tree —
+    including a fully self-consistent shrunk run_meta.json — still cannot move
+    the row that was written before calibration started. The gate compares the
+    tree's run_meta against that row and fails closed on any divergence.
+
+    A missing row, a non-'completed' status, or any plan-field divergence is a
+    hard integrity failure. `registry=None` connects the configured registry
+    (fail closed if unreachable): run-scoped evidence that cannot be attested
+    is refused, not trusted.
+    """
+    run_id = run_meta.get("run_id")
+    own_connection = registry is None
+    if own_connection:
+        registry = run_registry.connect_registry()
+    try:
+        row = registry.get_run(run_id)
+        if row is None:
+            raise RuntimeError(
+                f"Integrity Check Failed: run {run_id!r} has NO row in the external run "
+                f"registry (table {run_registry.REGISTRY_TABLE}). A run-scoped (P2-2) tree "
+                f"whose plan is not attested outside the collated tree cannot be collated "
+                f"(M1c: the tree cannot vouch for itself). If this run predates the "
+                f"registry, register it first: orchestrate_calibration.py --backfill-registry.")
+        if row.get("status") != run_registry.STATUS_COMPLETED:
+            raise RuntimeError(
+                f"Integrity Check Failed: registry row for run {run_id!r} has status "
+                f"{row.get('status')!r}, not {run_registry.STATUS_COMPLETED!r}. The registry "
+                f"records 'completed' only when the orchestrator finalized the run; a "
+                f"'started' or 'failed' registration means this tree's completion is not "
+                f"externally attested.")
+        plan = run_registry._plan_from_meta(run_meta)
+        for field in ("strategy", "mode", "planned_windows", "planned_ledger_sha256",
+                      "data_sha256", "config_sha256", "config_fingerprint", "data_rows"):
+            registry_val, meta_val = row.get(field), plan[field]
+            if registry_val is not None and meta_val is not None:
+                same = (str(registry_val) == str(meta_val)
+                        if field in ("data_sha256", "config_sha256", "config_fingerprint",
+                                     "planned_ledger_sha256")
+                        else registry_val == meta_val)
+                if not same:
+                    raise RuntimeError(
+                        f"Integrity Check Failed: registry attestation mismatch for run "
+                        f"{run_id!r}: {field} is {registry_val!r} in the registry but "
+                        f"{meta_val!r} in the tree's run_meta.json. The registry recorded "
+                        f"the plan BEFORE calibration; the tree now claims something "
+                        f"different — the tree or its run_meta.json was modified after the run.")
+        return row
+    finally:
+        if own_connection:
+            registry.close()
+
+
 def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
-                           config=None, data_csv=None) -> dict:
+                           config=None, data_csv=None, registry=None) -> dict:
     """Fail-closed integrity gate for a WFV run tree (P1-8).
 
     Checks, in order:
@@ -706,6 +835,14 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
          consumed-config fingerprint + config file hash, and the planned chunk
          ledger vs the sliced_data actually on disk. A tree without run_meta is
          a pre-P2-2 legacy tree: validated by the P1-8 method, reported as legacy.
+      0b. P2-6 registry attestation (run-scoped trees only): the external run
+          registry (PostgreSQL table wfv_run_registry, OUTSIDE the collated
+          tree) must hold a 'completed' row for this run_id whose plan fields
+          (strategy, mode, planned_windows, planned_ledger_sha256, data/config
+          hashes, config fingerprint, data_rows) match the tree's run_meta.json.
+          The row was written before calibration started, so a rewritten tree
+          cannot rewrite its attestation (M1c closure). Missing row, wrong
+          status, or any plan divergence -> RuntimeError.
       7. Cross-window contiguity: overlap (first_ts <= last_ts) → RuntimeError
          naming both windows and timestamps; gaps are only legitimate when they
          correspond exactly to manifest-marked skipped windows' OOS spans —
@@ -752,6 +889,14 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
                 f"Integrity Check Failed: run_meta.json records {run_meta['data_rows']} data "
                 f"rows for run {run_meta['run_id']}, but {data_csv} now has {n_data_rows}. "
                 f"The dataset was extended or truncated after the run.")
+
+    # --- 0b. P2-6 registry attestation (run-scoped trees only) ---
+    # After the identity + data_rows checks (so dataset-extension forgeries keep
+    # their existing message) and BEFORE the ledger is resolved from the tree:
+    # the plan the registry vouched for is checked against the tree's claim.
+    registry_row = None
+    if run_meta is not None:
+        registry_row = _verify_registry_attestation(run_meta, registry)
 
     # --- 1. Expected ledger (never inferred from window results) ---
     ledger, ledger_source, mode = _resolve_expected_ledger(
@@ -1267,6 +1412,11 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
         "seed_verified_windows": seed_verified,
         "seed_unverified_windows": seed_unverified,
         "data_csv": str(data_csv),
+        # P2-6 (M1c): external attestation evidence. For legacy (pre-P2-2)
+        # trees the registry is N/A — there is no run_id to attest.
+        "registry_verified": registry_row is not None,
+        "registry_status": (registry_row or {}).get("status"),
+        "registry_backfilled": (registry_row or {}).get("backfilled"),
     }
     print(f"[Integrity Check] PASSED: {len(ledger)} window(s) validated "
           f"({len(succ_sorted)} successful, {len(skipped)} manifest-skipped, "
@@ -1282,6 +1432,13 @@ def validate_wfv_integrity(wfv_dir: str, strategy: str, expected_windows=None,
               f"the P1-8 method; run-level identity and fingerprints are unavailable.")
     print(f"[Integrity Check] OOS seed provenance verified fail-closed for all "
           f"{len(seed_verified)} successful window(s); seed_unverified is empty by design.")
+    if registry_row is not None:
+        print(f"[Integrity Check] Registry attestation verified: run_id={run_id} "
+              f"status={registry_row.get('status')} backfilled={registry_row.get('backfilled')} "
+              f"(plan fields match the external {run_registry.REGISTRY_TABLE} row).")
+    else:
+        print(f"[Integrity Check] NOTE: registry attestation N/A — this tree has no "
+              f"run_meta.json (pre-P2-2 legacy), so there is no run_id to attest.")
     return report
 
 
@@ -1340,13 +1497,13 @@ def aggregate_lifecycle_logs(wfv_dir, output_dir=None):
 
 
 def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
-                    expected_windows=None, data_csv=None):
+                    expected_windows=None, data_csv=None, registry=None):
     # --- P1-8 INTEGRITY GATE — VERY FIRST STEP, before the baseline handshake
     # and before any concatenation. Fail closed: any violation raises
     # RuntimeError and no collated report is produced (docs/P1-8_collation_integrity.md).
     integrity_report = validate_wfv_integrity(
         wfv_dir, strategy, expected_windows=expected_windows,
-        config=CONF, data_csv=data_csv)
+        config=CONF, data_csv=data_csv, registry=registry)
 
     # P2-2: the run's own record, for the diagnostics report. The gate has already
     # verified it against the tree (identity + fingerprints + chunk ledger).
@@ -1386,7 +1543,13 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
     baseline_data = _run_baseline(output_dir, strategy)
     baseline_equity = None
     baseline_summary = None
+    # P2-6 F3: honest baseline visibility. When the handshake is skipped the
+    # collated equity CSV OMITS the baseline column entirely (previously it
+    # wrote an all-NaN column that downstream consumers read as "baseline
+    # exists but is empty").
+    baseline_status = "skipped (baseline signal generation or backtest failed — see [baseline] log lines)"
     if baseline_data is not None:
+        baseline_status = "computed"
         baseline_equity = baseline_data['equity']
         baseline_summary = baseline_data['summary']
         # Save baseline diagnostics JSON
@@ -1606,7 +1769,12 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
                                  index=baseline_equity['timestamp']).to_dict()
         combined_equity_df['baseline_equity_usd'] = combined_equity_df['timestamp'].map(baseline_map).values
     else:
-        combined_equity_df['baseline_equity_usd'] = np.nan
+        # P2-6 F3: no baseline handshake -> NO baseline column at all. An
+        # all-NaN column masquerades as a present-but-empty baseline; absence
+        # is the honest state and the backend/frontend already treat a missing
+        # baseline_equity_usd column as "no baseline" (routes.py guards with
+        # `if "baseline_equity_usd" in equity_df.columns`).
+        pass
 
     # --- Buy-and-hold asset benchmark (vectorized, zero loops) ---
     PROJECT_DIR = Path(__file__).resolve().parent
@@ -1750,6 +1918,8 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
                 # explicit gap records, seed verification coverage). The gate ran
                 # as the very first step of collate_results and passed.
                 'integrity': integrity_report,
+                # P2-6 F3: why the baseline column is present or absent.
+                'baseline_status': baseline_status,
                 # P2-2 run-level visibility: which run this evidence belongs to, what
                 # the orchestrator planned, and how each window ended. Reconstructed
                 # from the run directory alone (run_meta.json + manifests), so a run
@@ -1825,7 +1995,8 @@ def collate_results(wfv_dir='wfv', output_dir=None, strategy='vm',
     
     # Baseline equity
     color_baseline = "#2ca02c"
-    has_baseline = combined_equity_df['baseline_equity_usd'].notna().any()
+    has_baseline = ('baseline_equity_usd' in combined_equity_df.columns
+                    and combined_equity_df['baseline_equity_usd'].notna().any())
     if has_baseline:
         ax1.plot(combined_equity_df['timestamp'], combined_equity_df['baseline_equity_usd'],
                  color=color_baseline, label='Baseline (Default Params)', linewidth=0.15)
@@ -1910,12 +2081,19 @@ if __name__ == "__main__":
                              "(default: v6/data.csv)")
     args = parser.parse_args()
 
-    if args.wfv_dir:
-        wfv_dir = args.wfv_dir
-        print(f"[P2-2] Collating explicit tree (--wfv-dir): {wfv_dir}")
-    else:
-        runs_dir = args.runs_dir or str(PROJECT_DIR / "wfv" / RUNS_SUBDIR)
-        wfv_dir = discover_run_dir(runs_dir, args.run_id, strategy=args.strategy)
-    collate_results(wfv_dir=str(wfv_dir), output_dir=args.output_dir, strategy=args.strategy,
-                    expected_windows=args.expected_windows, data_csv=args.data_csv)
+    try:
+        if args.wfv_dir:
+            wfv_dir = args.wfv_dir
+            print(f"[P2-2] Collating explicit tree (--wfv-dir): {wfv_dir}")
+        else:
+            runs_dir = args.runs_dir or str(PROJECT_DIR / "wfv" / RUNS_SUBDIR)
+            wfv_dir = discover_run_dir(runs_dir, args.run_id, strategy=args.strategy)
+        collate_results(wfv_dir=str(wfv_dir), output_dir=args.output_dir, strategy=args.strategy,
+                        expected_windows=args.expected_windows, data_csv=args.data_csv)
+    except RuntimeError as exc:
+        # Fail-closed CLI contract (P2-6): a refused run_id or a failed integrity
+        # gate is a clean error line + exit 1 — the refusal is the designed
+        # outcome, not a crash, and it must not surface as a raw traceback.
+        print(f"[FATAL] {exc}", file=sys.stderr)
+        sys.exit(1)
 

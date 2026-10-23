@@ -18,7 +18,9 @@ Discovery semantics MIRROR ``collate_wfv_results.discover_run_dir`` (P2-2 §7):
     or touching a run tree rewrites mtime and would silently change "latest");
   * strategy-scoped: wfv/runs/ holds vm/tv/trend runs, so the latest tree OF THE
     REQUESTED strategy is chosen and other-strategy trees are reported, not served;
-  * a tree without run_meta.json (pre-P2-2) stays eligible but is reported as such;
+  * strategy-scoped discovery is TWO-TIER (P2-6 F17): trees whose run_meta
+    records the requested strategy outrank meta-less (pre-P2-2) trees; a meta-less
+    tree is used only as a fallback and the fallback is reported on stderr;
   * an explicit run_id must exist and (when run_meta is present) match the strategy.
 
 Why the collator's helper is replicated instead of imported: importing
@@ -202,21 +204,40 @@ def discover_run_dir(strategy: str, run_id: str = "",
             f"Run the orchestrator first "
             f"(python orchestrate_calibration.py --strategy {strategy} --smoke).")
 
+    # P2-6 F17 (mirrors collate_wfv_results.discover_run_dir): strategy-matched
+    # trees outrank meta-less (pre-P2-2) trees. The old flat rule — a meta-less
+    # tree is eligible for every strategy — let an interrupted run directory
+    # (created before its run_meta.json is written) shadow genuine evidence of
+    # the requested strategy. Meta-less trees remain reachable as a LOUDLY
+    # reported fallback so legacy trees stay servable, never silently ranked.
     matching: list[tuple[Path, dict | None]] = []
+    metaless: list[tuple[Path, dict | None]] = []
     foreign: list[str] = []
     for d in candidates:
         meta = read_run_meta(d)
         got = (meta or {}).get("strategy")
-        if got is None or got == strategy:
+        if got == strategy:
             matching.append((d, meta))
+        elif got is None:
+            metaless.append((d, meta))
         else:
             foreign.append(f"{d.name} ({got})")
-    if not matching:
-        raise RunResolutionError(
-            f"No run tree under {runs_path} belongs to strategy {strategy!r}. "
-            f"Runs present: {foreign}. Run selection is strategy-scoped — pass "
-            f"run_id for one of these runs or run the {strategy} orchestrator first.")
-    return matching[-1]  # lexicographic max of matching names
+    if matching:
+        if metaless:
+            print(f"[P2-6 F17] Run discovery: {len(metaless)} run tree(s) carry no "
+                  f"run_meta.json and are NOT eligible against strategy-matched "
+                  f"trees: {[d.name for d, _ in metaless]}.", file=sys.stderr)
+        return matching[-1]  # lexicographic max of matching names
+    if metaless:
+        print(f"[P2-6 F17] Run discovery: NO run tree under {runs_path} records "
+              f"strategy {strategy!r} in its run_meta.json; falling back to the "
+              f"latest meta-less (pre-P2-2) tree {metaless[-1][0].name}. Its strategy "
+              f"is unrecorded — it is served as legacy evidence.", file=sys.stderr)
+        return metaless[-1]
+    raise RunResolutionError(
+        f"No run tree under {runs_path} belongs to strategy {strategy!r}. "
+        f"Runs present: {foreign}. Run selection is strategy-scoped — pass "
+        f"run_id for one of these runs or run the {strategy} orchestrator first.")
 
 
 def collated_dir_for(strategy: str) -> Path:

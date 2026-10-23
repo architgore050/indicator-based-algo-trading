@@ -97,12 +97,14 @@ TMP.mkdir(parents=True, exist_ok=True)
 # A. Default discovery parity: collator vs backend resolver, per strategy
 # ---------------------------------------------------------------------------
 runs = build_scratch(TMP / "a")
-# Eligibility rule (P2-2 §7, identical in both implementations): a tree WITHOUT
-# run_meta.json stays eligible for every strategy, so it can outrank a
-# strategy-matching tree with an earlier name (20260103_000000_cccccc outranks
-# 20260102_000000_bbbbbb for trend). Pinned here as expected values.
+# Eligibility rule (P2-6 F17 rewrite of P2-2 §7, identical in both
+# implementations): strategy-matched trees OUTRANK meta-less (pre-P2-2) trees;
+# a meta-less tree is only a fallback. So for trend the strategy-matched
+# 20260102_000000_bbbbbb now beats the meta-less 20260103_000000_cccccc
+# (the old flat rule let an interrupted, meta-less directory shadow real
+# evidence — the F17 finding). Pinned here as expected values.
 for strategy, expected in (("vm", "20260104_000000_dddddd"),
-                           ("trend", "20260103_000000_cccccc"),
+                           ("trend", "20260102_000000_bbbbbb"),
                            ("tv", "20260105_000000_eeeeee")):
     collator_pick = cw.discover_run_dir(runs, None, strategy)
     backend_pick, _meta = rr.discover_run_dir(strategy, "", runs)
@@ -110,7 +112,8 @@ for strategy, expected in (("vm", "20260104_000000_dddddd"),
           collator_pick.name == backend_pick.name == expected,
           f"collator={collator_pick.name} backend={backend_pick.name}")
 
-# A4: a tree without run_meta stays eligible for BOTH implementations.
+# A4: a tree without run_meta stays reachable for BOTH implementations — as the
+# fallback tier when no strategy-matched tree exists (P2-6 F17), loudly reported.
 runs_nometa = TMP / "a4" / "runs"
 make_run(runs_nometa, "20260106_000000_nometa", None, (1,))
 c = cw.discover_run_dir(runs_nometa, None, "vm")
@@ -244,12 +247,32 @@ for bad in bad_ids:
 check("G1: every malformed run_id is a RunIdError (HTTP 400), never a filesystem read",
       all_rejected, f"rejected {len(bad_ids)}/{len(bad_ids)}" + (f" leaks: {rejected_detail}" if rejected_detail else ""))
 
-# G2 (documented divergence): the collator's CLI --run-id has NO traversal guard.
-# Pinned as a finding so it cannot be mistaken for backend behavior — the backend
-# (G1) is the guarded consumer.
-escaped = cw.discover_run_dir(runs, "../../", "vm")
-check("G2: collator accepts a traversal run_id (CLI-only gap, pinned; backend rejects it)",
-      str(escaped).endswith("runs/../.."), f"collator resolved {escaped}")
+# G2 (P2-6 F11, gap CLOSED): the collator's --run-id now mirrors the backend
+# guard (validate_run_id mirrors _validate_run_id): every malformed id is
+# refused before any filesystem read. The pinned P2-5 divergence is retired.
+all_guarded = True
+guarded_detail = []
+for bad in bad_ids:
+    raised_g2, kind_g2 = raises(lambda bad=bad: cw.discover_run_dir(runs, bad, "vm"),
+                                (RuntimeError,))
+    if not raised_g2:
+        all_guarded = False
+        guarded_detail.append(f"{bad!r}->accepted")
+check("G2: collator now rejects every malformed run_id (F11 closed, parity with backend G1)",
+      all_guarded, f"rejected {len(bad_ids)}/{len(bad_ids)}" + (f" leaks: {guarded_detail}" if guarded_detail else ""))
+
+# G2b: the CLI path fails closed too — the collator's __main__ converts the
+# guard's RuntimeError into exit code 1, never a traceback and never a resolved
+# path outside runs/.
+import subprocess
+proc_g2b = subprocess.run(
+    [sys.executable, str(Path(cw.__file__).resolve()),
+     "--run-id", "../../evil", "--runs-dir", str(runs), "--output", str(TMP / "g2b.json")],
+    capture_output=True, text=True, timeout=120)
+last_err = (proc_g2b.stderr.strip().splitlines() or [""])[-1]
+check("G2b: collator CLI rejects a traversal run_id with exit 1 (no traceback, no resolved path)",
+      proc_g2b.returncode == 1 and "Traceback" not in proc_g2b.stderr and "run_id" in proc_g2b.stderr,
+      f"exit {proc_g2b.returncode}; last stderr: {last_err[:100]!r}")
 
 # ---------------------------------------------------------------------------
 # H. Live cross-check against the REAL wfv/runs tree (read-only)
@@ -281,10 +304,14 @@ if real_runs.is_dir():
         except Exception:
             metas[n] = None
     for strategy in ("vm", "trend"):
-        expected = [n for n in names if metas[n] in (strategy, None)]
+        matching = [n for n in names if metas[n] == strategy]
+        metaless = [n for n in names if metas[n] is None]
+        # P2-6 F17: strategy-matched tier first; meta-less only as fallback.
+        expected = (matching[-1] if matching else (metaless[-1] if metaless else None))
         b, _ = rr.discover_run_dir(strategy, "", real_runs)
-        check(f"H2: {strategy} default = lexicographic max of matching names",
-              expected and b.name == expected[-1], f"expected={expected[-1] if expected else None} got={b.name}")
+        check(f"H2: {strategy} default = strategy-matched max (meta-less fallback only if none match)",
+              expected is not None and b.name == expected,
+              f"expected={expected} got={b.name} matching={matching} meta-less={metaless}")
 else:
     check("H1/H2 skipped: no real wfv/runs tree present", False, str(real_runs))
 

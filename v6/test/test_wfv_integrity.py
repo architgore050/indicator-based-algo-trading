@@ -66,6 +66,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -73,6 +74,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import collate_wfv_results as collate
+import run_registry
 from wfv_ledger import build_expected_ledger, compute_pre_roll_bars, expected_chunk_set
 
 # ---------------------------------------------------------------------------
@@ -593,10 +595,27 @@ def main():
                                mode=mode, **meta_overrides)
             return run_dir, csv_copy
 
+        def auto_registry(run_dir):
+            """Hermetic stand-in for the external run registry (P2-6 M1c).
+
+            Built from the tree's CURRENT run_meta.json at call time: it models
+            "the registry faithfully recorded the plan this tree claims", so the
+            pre-existing S22-S38 scenarios keep failing (and passing) through
+            their ORIGINAL gate checks, untouched by the new attestation. The
+            M1c mutation proofs (S39-S41) instead build a WRITE-TIME stub whose
+            values the later forgery cannot reach — that asymmetry is exactly
+            what a real out-of-tree PostgreSQL row provides.
+            """
+            meta = collate.read_run_meta(Path(run_dir))
+            if meta is None:
+                return None  # legacy tree: registry attestation is N/A
+            return run_registry.registry_stub_from_meta(meta)
+
         def validate_run(run_dir, data_csv, expected=None, config=None):
             return collate.validate_wfv_integrity(
                 run_dir, "vm", expected_windows=expected,
-                config=config or TEST_CONFIG, data_csv=data_csv)
+                config=config or TEST_CONFIG, data_csv=data_csv,
+                registry=auto_registry(run_dir))
 
         # ------------------------------------------------------------------
         print("\n=== S22: run_meta happy path (run identity + fingerprints) ===")
@@ -613,6 +632,9 @@ def main():
         check(report["data_sha256"] == collate.sha256_file(csv22), "S22f data fingerprint reported")
         check(report["config_fingerprint"] == collate.config_fingerprint(TEST_CONFIG, "vm"),
               "S22g config fingerprint reported")
+        check(report["registry_verified"] is True
+              and report["registry_status"] == run_registry.STATUS_COMPLETED,
+              "S22h registry attestation verified (stub registry, P2-6)")
         check(report["skipped_window_indices"] == [2], "S22h skip set from manifests")
         # explicit override must AGREE with run_meta, never silently replace it
         expect_error(lambda: validate_run(wfv, csv22, expected=4 + 1),
@@ -777,6 +799,8 @@ def main():
         check(report["passed"] is True, "S34a legacy tree still validates via the chunk ledger")
         check(report["run_meta_present"] is False and report["fingerprints_verified"] is False,
               "S34b legacy status reported honestly")
+        check(report["registry_verified"] is False and report["registry_status"] is None,
+              "S34c registry attestation N/A for a legacy tree (no run_id to attest)")
 
         # ------------------------------------------------------------------
         print("\n=== S35: lifecycle backtest event names a different signal file ===")
@@ -851,6 +875,82 @@ def main():
         report = validate_run(wfv, csv38d)
         check(report["passed"] is True,
               "S38e honest outcomes dict passes (cross-check has no false positive)")
+
+        # ==================================================================
+        # P2-6 (M1c closure) — the external registry as trust root. S39 is the
+        # headline mutation proof: the EXACT forgery the P2-2 gate could not
+        # catch (a fully self-consistent shrunk run_meta.json, docs/P2-2 §13)
+        # now fails closed against a registry row that lives outside the tree.
+        # ==================================================================
+        print("\n=== S39: self-consistent shrinkage forgery fails against the registry (M1c) ===")
+        wfv39, csv39 = run_tree("s39", "20261022_101039_s39aaa",
+                                {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        meta39 = json.loads(open(os.path.join(wfv39, collate.RUN_META_FILE_NAME)).read())
+        reg39 = run_registry.registry_stub_from_meta(meta39)  # records the ORIGINAL 4-window plan
+        # The forger rewrites EVERYTHING inside the tree into a self-consistent
+        # 2-window run: meta, window dirs, and the sliced_data chunk ledger.
+        shrunk = meta39["planned_ledger"][:2]
+        forged = dict(meta39)
+        forged["total_windows"] = 2
+        forged["planned_ledger"] = shrunk
+        forged["planned_window_dirs"] = [e["dir_name"] for e in shrunk]
+        forged["expected_chunks"] = sorted(expected_chunk_set(shrunk, PRE_ROLL))
+        with open(os.path.join(wfv39, collate.RUN_META_FILE_NAME), "w") as f:
+            json.dump(forged, f, indent=2)
+        for d in sorted(os.listdir(wfv39)):
+            if d.startswith("window_3_") or d.startswith("window_4_"):
+                shutil.rmtree(os.path.join(wfv39, d))
+        keep_chunks = set(expected_chunk_set(shrunk, PRE_ROLL))
+        sliced = os.path.join(wfv39, "sliced_data")
+        for f_ in sorted(os.listdir(sliced)):
+            s, e = map(int, f_[len("rows_"):-len(".csv")].split("_"))
+            if (s, e) not in keep_chunks:
+                os.remove(os.path.join(sliced, f_))
+        # Without the registry this tree WOULD pass: every in-tree check is
+        # self-consistent (that was the open M1c residual). With the row the
+        # orchestrator wrote BEFORE calibration, the shrunk plan cannot hide.
+        expect_error(
+            lambda: collate.validate_wfv_integrity(
+                wfv39, "vm", config=TEST_CONFIG, data_csv=csv39, registry=reg39),
+            "registry attestation mismatch",
+            "S39 shrunk tree fails closed against the out-of-tree registry row (M1c closed)")
+        # Control: the SAME forged tree validated against a call-time stub
+        # (i.e. WITHOUT a genuine pre-calibration row) still passes every
+        # in-tree check — proving it is the EXTERNAL row that closes M1c,
+        # not any check inside the gate.
+        report39 = collate.validate_wfv_integrity(
+            wfv39, "vm", config=TEST_CONFIG, data_csv=csv39,
+            registry=auto_registry(wfv39))
+        check(report39["passed"] is True,
+              "S39b control: forged tree is in-tree self-consistent (registry is the only tripwire)")
+
+        # ------------------------------------------------------------------
+        print("\n=== S40: run-scoped tree with NO registry row fails closed ===")
+        wfv40, csv40 = run_tree("s40", "20261022_101040_s40aaa",
+                                {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        expect_error(
+            lambda: collate.validate_wfv_integrity(
+                wfv40, "vm", config=TEST_CONFIG, data_csv=csv40, registry=run_registry.InMemoryRegistry()),
+            "has NO row in the external run registry",
+            "S40 unattested run refuses to collate")
+
+        # ------------------------------------------------------------------
+        print("\n=== S41: registry status not 'completed' fails closed ===")
+        wfv41, csv41 = run_tree("s41", "20261022_101041_s41aaa",
+                                {1: "success", 2: "skipped", 3: "success", 4: "success"}, data_csv)
+        meta41 = json.loads(open(os.path.join(wfv41, collate.RUN_META_FILE_NAME)).read())
+        reg41 = run_registry.registry_stub_from_meta(meta41, status=run_registry.STATUS_STARTED)
+        expect_error(
+            lambda: collate.validate_wfv_integrity(
+                wfv41, "vm", config=TEST_CONFIG, data_csv=csv41, registry=reg41),
+            "not 'completed'",
+            "S41 'started' registration means completion is not attested")
+        reg41b = run_registry.registry_stub_from_meta(meta41, status=run_registry.STATUS_FAILED)
+        expect_error(
+            lambda: collate.validate_wfv_integrity(
+                wfv41, "vm", config=TEST_CONFIG, data_csv=csv41, registry=reg41b),
+            "not 'completed'",
+            "S41b 'failed' registration also fails closed")
 
     print(f"\nWFV INTEGRITY TEST PASSED ({checks['n']} checks)")
 

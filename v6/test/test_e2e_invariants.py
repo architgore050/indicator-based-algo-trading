@@ -261,6 +261,19 @@ def _exec_scratch_calib(edits: list[tuple[str, str]], mod_name: str):
 # Shared scratch WFV runs (built once, reused by Tests 1/5/7 + mutations)
 # ---------------------------------------------------------------------------
 
+def _ensure_registry_rows(runs_root: Path) -> None:
+    """P2-6: a REUSED scratch tree predates its registry row (it was built
+    before the registry existed). Backfill through the real orchestrator mode
+    — idempotent (existing rows are never overwritten) and it exercises the
+    production --backfill-registry path instead of faking it. Rebuilt trees
+    need nothing: the orchestrator registers them itself."""
+    p = run_py(["orchestrate_calibration.py", "--backfill-registry",
+                "--runs-dir", str(runs_root)], timeout=300)
+    if p.returncode != 0:
+        raise AssertionError(f"registry backfill for {runs_root} exited {p.returncode}: "
+                             f"{(p.stderr or p.stdout)[-400:]}")
+
+
 def ensure_scratch_run() -> Path:
     """ONE shared 2-window vm smoke WFV run (annual + monthly-with-parent)."""
     if CTX.get("vm_run_dir"):
@@ -272,6 +285,7 @@ def ensure_scratch_run() -> Path:
         outcomes = meta.get("outcomes") or {}
         if outcomes and meta.get("finished_at"):
             print(f"[setup] reusing scratch vm run {VM_RUN_ID} (outcomes={outcomes})")
+            _ensure_registry_rows(VM_RUNS)  # P2-6: reused tree needs its registry row
             CTX["vm_run_dir"] = run_dir
             return run_dir
     VM_RUNS.mkdir(parents=True, exist_ok=True)
@@ -344,6 +358,7 @@ def ensure_trend_run() -> Path | None:
         meta = json.loads(meta_path.read_text())
         if meta.get("outcomes") and meta.get("finished_at"):
             print(f"[setup] reusing scratch trend run {TREND_RUN_ID}")
+            _ensure_registry_rows(TREND_RUNS)  # P2-6: reused tree needs its registry row
             CTX["trend_run_dir"] = run_dir
             return run_dir
     TREND_RUNS.mkdir(parents=True, exist_ok=True)
