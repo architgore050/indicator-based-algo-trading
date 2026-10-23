@@ -45,9 +45,6 @@ v6/calibration_results_*_monthly_refine_*.json
 Thumbs.db
 
 # AI orchestration docs (internal, not for sharing)
-orchestration_skill.md
-testing_skill.md
-diagnosis_skill.md
-diagnose_code_context.md
+# (the four root skill files were un-ignored 2026-10-23 — skills are repo content, not scratch)
 todo.txt
 AGENTS.md

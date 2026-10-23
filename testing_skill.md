@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Mandatory testing rules for all subagents and orchestrators working on the XAUUSD algorithmic trading system. Covers smoke tests, parity validation, error searching, WSL execution, recursive bug fixing, and cleanup procedures.
+Mandatory testing rules for all subagents and orchestrators working on the XAUUSD algorithmic trading system. Covers smoke tests, parity validation, error searching, native-Linux RAPIDS execution, recursive bug fixing, and cleanup procedures.
 
 **This skill is for every subagent that modifies code, runs scripts, or produces pipeline output.** No subagent may return work as "done" without following these rules.
 
@@ -47,21 +47,13 @@ exit status 1 | exit status 2
 
 ### How to Search
 
-```powershell
-# After running a script, save output under `v6/tmp/` (gitignored — never a tracked path):
-wsl bash -c 'cd /mnt/c/... && python script.py' > v6/tmp/<name>.txt 2>&1
+```bash
+# From the repo root, run inside the rapids venv and capture stdout+stderr under v6/tmp/ (gitignored — never a tracked path):
+cd v6 && source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+python -u script.py > tmp/<name>.txt 2>&1
 ```
 
-⚠️ **CRITICAL: UTF-16 Encoding Trap**
-
-PowerShell captures WSL output as UTF-16 LE. `grep`/`findstr` will fail to match patterns in the captured file even when errors are present. This has caused tracebacks to slip through multiple audit cycles.
-
-**Always convert the captured log to UTF-8 before searching** (this trap only applies to the retired PowerShell→WSL capture path; native Linux `bash` redirects already write UTF-8):
-```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6/tmp/<name>.txt > /tmp/test_utf8.txt'
-```
-
-Then search `/tmp/test_utf8.txt` instead of the raw captured log.
+Native Linux bash redirects already write UTF-8, so the retired PowerShell→WSL capture path (UTF-16 LE logs that grep/findstr silently failed to match, letting tracebacks slip through audit cycles) no longer applies — no iconv conversion step is needed on the current environment.
 
 ⚠️ **Tracebacks Embedded in Log Lines**
 
@@ -70,24 +62,23 @@ Optuna's `[W ...] Trial N failed with parameters: ... because of the following e
 **Search strategy:**
 ```bash
 # Search for embedded tracebacks (check inside any line containing "failed")
-grep -n "failed\|TypeError\|ValueError" /tmp/test_utf8.txt | head -20
+grep -n "failed\|TypeError\|ValueError" tmp/<name>.txt | head -20
 
 # Also search for the full pattern: trial failed → error message
-grep -A3 "Trial.*failed" /tmp/test_utf8.txt
+grep -A3 "Trial.*failed" tmp/<name>.txt
 ```
 
 ### Verification Steps
-1. Save output to `v6/tmp/<name>.txt` (gitignored) or `/tmp/test_output.txt`
-2. **Convert to UTF-8** before searching (see warning above)
-3. Search for all error patterns listed above — including embedded tracebacks in log lines
-4. Verify output file has content (`wc -l > 0` or check file size)
-5. Check tail of output for completion messages
-6. Read **both top AND bottom** of the output file
-7. Clean up temp files after testing
+1. Save output to `v6/tmp/<name>.txt` (gitignored) or `/tmp/test_output.txt` — always with `2>&1`
+2. Search for all error patterns listed above — including embedded tracebacks in log lines
+3. Verify output file has content (`wc -l > 0` or check file size)
+4. Check tail of output for completion messages
+5. Read **both top AND bottom** of the output file
+6. Clean up temp files after testing
 
 ### Path Note
 
-The project folder on disk is named **"algo"** (not "ago"): `indicator based algo trading`. All paths in bash commands must use this spelling. The working directory tool already points to the correct location, so relative paths like `v6/tmp/<name>.txt` work fine. (The old `docs/test.txt` capture target is retired — it is no longer tracked and is gitignored; write run logs under `v6/tmp/`.)
+The project lives on native ext4 at `/home/archit-gore/projects/indicator-based-algo-trading` (the old Windows/NTFS-mount folder paths are retired — see `docs/MIGRATION_native_ext4.md`). The working directory tool already points to the correct location, so relative paths like `v6/tmp/<name>.txt` work fine. The old `docs/test.txt` capture target is retired — it is no longer tracked, is gitignored, and must not be recreated; write run logs under `v6/tmp/`.
 
 ---
 
@@ -102,14 +93,23 @@ The project folder on disk is named **"algo"** (not "ago"): `indicator based alg
 Default to `--smoke` mode for all tasks unless explicitly told otherwise — for fast end-to-end "it did not crash" feedback only. When a result needs to be believed, run the corresponding parity/validation test with real data depth.
 
 ### Standard Smoke Test Commands
-Run from the `v6/` directory:
+Run from the `v6/` directory, inside the rapids venv (see Section 5). Every GPU run uses the low-memory convention and captures logs with `2>&1`:
+
+```bash
+cd /home/archit-gore/projects/indicator-based-algo-trading/v6
+source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB \
+  python -u <script> … > tmp/<name>.txt 2>&1; echo EXIT=$?
+```
 
 | Script | Command |
 |--------|---------|
-| **WFV Pipeline (Orchestrator)** | `python orchestrate_calibration.py --strategy vm --smoke` |
+| **WFV Pipeline (Orchestrator)** | `python orchestrate_calibration.py --strategy vm --smoke --workers 1` |
 | **SOTA Calibration (Optuna)** | `python optuna_calibrate_vm.py --smoke --start-row 2999000 --end-row 3000000` |
 | **Signal Generation (VM)** | `python generate_vm_automation_logic_signals.py --mode test --start-row 3000000 --end-row 3043200` |
 | **Backtesting** | `python backtest_xauusd_signal_csv.py --strategy vm --mode test --headless --output-dir path/to/results` |
+
+`--workers 1` keeps smoke orchestrator runs light (the resident local-inference engine holds most of the GPU — see Section 4's size-flag rules). Orchestrator scratch runs should use `--run-id <id> --runs-dir tmp/<scratch>/runs` so they never touch the real `wfv/runs/` evidence trees.
 
 ---
 
@@ -124,49 +124,71 @@ Numeric comparisons must use `atol=1e-8` (absolute tolerance of 1e-8). GPU float
 ### What Parity Tests Cover
 - Indicator calculations (`definitions.py` parity test)
 - GPU I/O (`gpu_io.py` parity test)
-- Backtesting results (`backtest_xauusd_signal_csv.py` parity test)
+- Backtest results (`backtest_xauusd_signal_csv.py` parity test)
 - Calibration/Optuna (`optuna_calibrate_*.py` parity test)
+
+### Documented Size Flags (mandatory on this host)
+The resident local-inference engine holds ~15.5 of the 16.3 GiB GPU, leaving ~750 MB headroom. **Never invoke GPU tests bare** — their full-size defaults OOM. Always use each test's documented size flags:
+
+| Test | Required invocation |
+|---|---|
+| `parity_maintenance/parity_test_definitions.py` | `--smoke` (bare defaults to 525,600 rows → CUDA OOM) |
+| `parity_maintenance/test_backtest_config_isolation.py` | `--rows 40000` (bare defaults to 100,000/strategy → CUDA OOM) |
+| `parity_maintenance/parity_test_backtesting.py` | `--compare-backup --end-row 50000` |
+| `parity_maintenance/parity_test_optuna_calibrate.py` | `--compare-backup` |
+
+Run all GPU legs under the low-memory convention (`CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB`), sequentially, one leg at a time.
+
+### The `v6/test/` Suite (contract + invariant tests)
+Distinct from the `.bak` parity suites in `parity_maintenance/`: `v6/test/` holds the standalone WFV contract/invariant runners (`test_e2e_invariants.py`, `test_wfv_integrity.py`, `test_lifecycle_schema.py`, `test_cpcv_*`, `test_signal_parity.py`, `test_param_consumption.py`, … — pytest is not installed in the rapids venv; each file is a `__main__` runner with `EXIT 0` on pass). Conventions:
+- Pinned fixtures live in `v6/test/fixtures/` — read-only, never mutated by tests.
+- Scratch trees (scratch WFV runs via `--runs-dir`, mutated copies, per-leg logs) live under gitignored `v6/tmp/` — the real `wfv/runs/` evidence trees, `config.json`, `calibration_results_*.json`, and `.bak` files are never touched by tests.
+- Negative controls / mutation proofs must genuinely FAIL the target guard (EXIT 1); a guard that never fires is treated as broken.
 
 ### Protected Files
 **Do NOT delete testing scripts** (`*test*.py`, `*_signals_test.csv`), backups (`.bak`/`.backup` files). `.bak` files are specifically required for parity testing scripts at runtime. These are critical for validation.
 
-All parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`. Stray `*test*.py` and `*_bak.py` files in the v6 root are stale and should be cleaned up.
+All pandas-baseline parity test scripts and `.bak` backup files live in `v6/parity_maintenance/`; the contract/invariant suites live in `v6/test/`. Stray `*test*.py` and `*_bak.py` files in the v6 root are stale and should be cleaned up.
 
 ---
 
-## 5. WSL + RAPIDS Execution
+## 5. Native Linux + RAPIDS Execution
 
-**Every Python script that uses GPU/cudf/cupy MUST be run through WSL with the rapids conda environment activated.** This is NOT optional. This is NOT a suggestion. This is a hard requirement for ALL GPU-related scripts.
+**Every Python script that uses GPU/cudf/cupy MUST be run inside the `~/venvs/rapids` virtualenv on native Ubuntu 24.04.** This is NOT optional. This is NOT a suggestion. This is a hard requirement for ALL GPU-related scripts. (The WSL + conda execution era is retired — see `docs/MIGRATION_native_ext4.md`.)
 
 ### Correct Execution Format
 
-**Use SINGLE quotes `'...'` around the entire WSL command. Double quotes `"` cause PowerShell quoting issues.**
-
-```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python your_script.py'
+```bash
+cd /home/archit-gore/projects/indicator-based-algo-trading/v6
+source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+python your_script.py
 ```
 
 ### Component Breakdown
 
 | Component | Purpose |
 |---|---|
-| `wsl bash -c '...'` | Runs the entire command inside WSL Ubuntu, not Windows PowerShell |
-| `cd /mnt/c/...` | Mounts the Windows filesystem path into WSL's `/mnt/c/` namespace |
-| `source ...conda.sh && conda activate rapids` | Activates the RAPIDS conda environment containing cudf, cupy, and all CUDA dependencies |
+| `source ~/venvs/rapids/bin/activate` | Activates the venv containing cudf, cupy, optuna, pandas, and all CUDA deps (RAPIDS pip wheels, venv on native ext4) |
+| `unset PYTHONPATH` | The shell exports a ROS `PYTHONPATH` that leaks into every Python process and can shadow venv packages — always clear it before pipeline runs |
 | `python your_script.py` | Runs the target script with GPU support enabled |
+
+For GPU test/battery legs add the low-memory convention: `CUPY_CUDA_MEMORY_POOL=disabled CUDF_MEMORY_POOL_SIZE=64MB` (and `timeout 1800` as execution insurance).
+
+### PostgreSQL Dependency
+
+The Optuna calibrators (`optuna_calibrate_*.py`) connect to `postgresql://gorea@localhost/optuna_db` (trust auth on localhost). PostgreSQL must be installed and running, with role `gorea` and database `optuna_db`, before any calibration or orchestrator run.
 
 ### Consequences of NOT Using This Format
 
-- **Scripts silently fall back to pandas/numpy** — GPU code paths become dead code. The script "works" but produces no GPU acceleration, defeating the entire architecture.
-- **Scripts crash with CUDA context errors** — `cupy` and `cudf` cannot initialize without the rapids environment's CUDA libraries, causing hard failures.
-- **Scripts produce incorrect results** — CPU and GPU implementations may differ slightly in floating-point behavior. Running on CPU when GPU is expected produces subtly wrong numbers.
-- **Parity tests give false passes** — If both baseline and refactored code run on CPU due to wrong execution format, they match each other but neither matches the intended GPU output. The test passes while the actual GPU migration is broken.
+- **Scripts crash with CUDA/context errors** — `cupy` and `cudf` cannot initialize without the venv's CUDA libraries. The script will fail with a hard error.
+- **No silent fallback** — the dual-path pandas/cudf dispatch was removed during the GPU migration. There is no CPU fallback path; if the venv isn't activated, the script simply won't run.
+- **ROS PYTHONPATH pollution** — skipping `unset PYTHONPATH` risks importing ROS site-packages instead of venv packages.
 
-### Nested WSL Warning
-When the orchestrator is already running inside WSL with rapids activated, subprocesses inherit the environment and do NOT need `wsl bash -c` wrapping. Wrapping in `bash -c` creates nested WSL calls that fail with exit code 2.
+### Subprocess Wrapping
+The orchestrator runs natively with the venv activated and spawns subprocesses that **inherit the environment** — they need NO shell wrapping (`get_env_activation()` returns `""` on Linux). The retired `wsl bash -c "..."` wrapper created nested calls that failed with exit code 2; never re-introduce wrapper nesting.
 
 ### Shell Quoting
-- `/bin/sh` (dash) does not support `source`. Always use `bash -c "source ..."` — the default shell on many systems is dash, not bash.
+- `/bin/sh` (dash) does not support `source`. When wrapping shell activation in a shell string, always use `bash -c "source ..."` — the default shell on many systems is dash, not bash.
 - Shell quoting bugs in subprocess commands cause silent failures. An unclosed `bash -c "..."` string or trailing space causes subprocesses to drop into a REPL (`>>>`) or exit with status 2. Always verify the constructed command string before declaring tests pass.
 
 ---
@@ -175,12 +197,12 @@ When the orchestrator is already running inside WSL with rapids activated, subpr
 
 When running smoke tests or any script, capture and save output under `v6/tmp/` (gitignored) for error analysis. This enables post-run inspection of timing, warnings, and failures without cluttering the interactive terminal — and without rewriting a tracked file. The old `docs/test.txt` target is retired: it is no longer tracked, is gitignored, and must not be recreated.
 
-```powershell
-# Always use 2>&1 to capture both stdout and stderr
-wsl bash -c 'cd /mnt/c/... && python script.py' > v6/tmp/<name>.txt 2>&1
+```bash
+# From v6/, inside the rapids venv. Always use 2>&1 to capture both stdout and stderr:
+python -u script.py > tmp/<name>.txt 2>&1
 ```
 
-**WSL output capture must use `2>&1`.** Without it, errors go to stderr and the captured file appears clean while the script actually failed.
+**Output capture must use `2>&1`.** Without it, errors go to stderr and the captured file appears clean while the script actually failed. (The retired `wsl bash -c '...' > file` capture path is gone — the orchestrator and its subprocesses run natively.)
 
 ---
 
@@ -220,12 +242,12 @@ At various points, bugs can be "bad decisions" — things where the intended beh
 ## 8. Critical Operational Rules (Testing-Relevant)
 
 ### Headless Execution
-Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless WSL.
+Always ensure `matplotlib.use('Agg')` in scripts to avoid Tcl/Tk errors on headless Linux.
 
 ### cudf Inspection
-Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
+Never print or inspect cudf DataFrames directly in the terminal — it hangs or crashes. Convert to pandas first (`pdf = df.to_pandas()`) before any `print()`, `head()`, or inspection call. Keep inspected slices small to avoid VRAM/CPU bandwidth bottlenecks.
 
-**cudf.to_pandas() segfaults in some WSL environments.** Use `cudf.to_arrow().to_pandas()` as a bridge when `to_pandas()` fails. This is a known workaround for cudf/numba CUDA context incompatibility in certain WSL setups.
+**cudf.to_pandas() segfaulted in some WSL environments (historical).** The `cudf.to_arrow().to_pandas()` bridge is still used defensively in `definitions.py` and `gpu_io.py`; on native Ubuntu `to_pandas()` works normally.
 
 ### cudf API Differences
 - `.view("int64")` does NOT work on cudf Series. Use `.astype("int64")` instead. This is a cudf API difference from pandas.
@@ -241,17 +263,17 @@ Never print or inspect cudf DataFrames directly in the WSL terminal — it hangs
 
 | Bug | Cause | Fix |
 |---|---|---|
-| Nested WSL → exit code 2 | Orchestrator in WSL, subprocess wrapped in `wsl bash -c` | `get_env_activation()` returns `""` in WSL — no wrapping |
+| Nested WSL → exit code 2 (historical, WSL era) | Orchestrator in WSL, subprocess wrapped in `wsl bash -c` | `get_env_activation()` returns `""` on native Linux — no wrapping |
 | Shell quoting → `>>>` REPL | Unclosed `bash -c "..."` or trailing space in `env_activation` | Verify constructed command string |
 | `/bin/sh` (dash) doesn't support `source` | Default shell is dash, not bash | Always use `bash -c "source ..."` |
-| `cudf.to_pandas()` segfaults | CUDA context incompatibility in some WSL setups | Use `cudf.to_arrow().to_pandas()` as bridge |
+| `cudf.to_pandas()` segfaults (historical, WSL era) | CUDA context incompatibility in some WSL setups | `cudf.to_arrow().to_pandas()` bridge kept defensively in `definitions.py`/`gpu_io.py` |
 | `.view("int64")` fails on cudf | cudf API difference from pandas | Use `.astype("int64")` |
 | Datetime timezone mismatch | `pd.to_datetime(..., utc=True)` produces tz-aware, downstream expects tz-naive | Add `.dt.tz_localize(None)` |
 | SQLite race condition | Multiple workers, identical `datetime.now()` DB filenames | Use PID + UUID |
 | Parallel workers → JSONDecodeError | Non-atomic writes to shared files | Atomic writes: temp file + `os.replace()` |
 | Empty signal CSV → `EmptyDataError` | Signal files with headers but no data rows | Check file size, wrap reads in try/except |
 | Pandas deprecation warnings | Internal pandas operations flood terminal | Suppress at import: `warnings.filterwarnings("ignore", category=FutureWarning)` |
-| cudf print hangs WSL terminal | Direct print of cudf DataFrame in WSL | Convert to pandas first: `pdf = df.to_pandas()` |
+| cudf print hangs terminal | Direct print of cudf DataFrame | Convert to pandas first: `pdf = df.to_pandas()` |
 
 ---
 
@@ -286,71 +308,53 @@ If a script exceeds its expected timeout, interrupt it and investigate — this 
 
 ## 12. Exact Tool Call Reference
 
-### Running Scripts (WSL + Rapids)
-```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && source /home/gorea/miniconda3/etc/profile.d/conda.sh && conda activate rapids && python script.py'
+(The retired PowerShell + `wsl bash -c` + conda command forms predate the native-Ubuntu migration; the current forms are below.)
+
+### Running Scripts (native Linux + rapids venv)
+```bash
+cd /home/archit-gore/projects/indicator-based-algo-trading/v6
+source ~/venvs/rapids/bin/activate && unset PYTHONPATH
+python script.py
 ```
 
 ### Capturing Output
-```powershell
-wsl bash -c 'cd /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6 && python script.py' > v6/tmp/<name>.txt 2>&1
-```
-
-### Converting to UTF-8 (retired PowerShell-capture path only)
-PowerShell captured WSL output as UTF-16 LE, so grep/findstr failed to match patterns even when errors were present. **Native Linux bash redirects write UTF-8 — this step is no longer needed on the current environment:**
-```powershell
-wsl bash -c 'iconv -f UTF-16LE -t UTF-8 /mnt/c/Users/gorea/Desktop/indicator\ based\ algo\ trading/indicator\ based\ algo\ trading/v6/tmp/<name>.txt > /tmp/test_utf8.txt'
+```bash
+# From v6/, inside the activated venv
+python -u script.py > tmp/<name>.txt 2>&1; echo EXIT=$?
 ```
 
 ### Reading Output Files
-```powershell
-# Read top of file (use relative path from workspace root)
-read ./v6/tmp/<name>.txt
-
-# Read bottom of file (for completion messages)
-read ./v6/tmp/<name>.txt -Offset <last_lines> -Limit 50
-```
+Use the read tool:
+- Read top of file: `read ./v6/tmp/<name>.txt`
+- Read bottom of file (completion messages): `read ./v6/tmp/<name>.txt` with `offset` near the end of the file and `limit` ~50.
 
 ### Error Searching
-⚠️ **Search the UTF-8 copy (`/tmp/test_utf8.txt`), NOT the raw UTF-16 capture** — the UTF-16 encoded file will not match patterns.
+Bash redirects are UTF-8 — search the captured file directly (no iconv step needed):
+```bash
+grep -nE "ERROR|Traceback|Exception|Warning|Failed|Crash" v6/tmp/<name>.txt | head -20
+grep -nE "AttributeError|TypeError|ValueError|KeyError|IndexError" v6/tmp/<name>.txt
+grep -nF ">>>" v6/tmp/<name>.txt
+grep -nF "exit status" v6/tmp/<name>.txt
 
-```powershell
-# Search for error keywords (in UTF-8 converted file)
-findstr /I "ERROR Traceback Exception Warning Failed Crash" /tmp/test_utf8.txt
-
-# Search for specific error types
-findstr /I "AttributeError TypeError ValueError KeyError IndexError" /tmp/test_utf8.txt
-
-# Search for structural patterns
-findstr /C:">>>" /tmp/test_utf8.txt
-findstr /C:"exit status" /tmp/test_utf8.txt
-
-# Search for embedded tracebacks in Optuna log lines
-grep -n "failed\|TypeError\|ValueError" /tmp/test_utf8.txt | head -20
-grep -A3 "Trial.*failed" /tmp/test_utf8.txt
+# Embedded tracebacks in Optuna log lines
+grep -n "failed\|TypeError\|ValueError" v6/tmp/<name>.txt | head -20
+grep -A3 "Trial.*failed" v6/tmp/<name>.txt
 ```
 
 ### File Verification
-```powershell
-# Check file has content
-powershell -Command "(Get-Item ./v6/tmp/<name>.txt).Length -gt 0"
-
-# Count lines
-powershell -Command "(Get-Content ./v6/tmp/<name>.txt).Count"
+```bash
+wc -l v6/tmp/<name>.txt          # line count > 0
+wc -c v6/tmp/<name>.txt          # byte size > 0
+tail -20 v6/tmp/<name>.txt       # completion messages
 ```
 
 ### Code Changes
-```powershell
-# Edit files using the edit tool (not bash)
-# Use Read tool first, then Edit tool for changes
-# Never use bash for file editing — use the dedicated Edit tool
-```
+Edit files using the edit tool (not bash). Use the read tool first, then the edit tool for changes. Never use bash for file editing.
 
 ### Cleanup
-```powershell
-# Remove temp files (run logs live under v6/tmp/, which is gitignored)
-Remove-Item v6\tmp\<name>.txt -ErrorAction SilentlyContinue
-Remove-Item *.tmp -ErrorAction SilentlyContinue
+```bash
+# Remove temp run logs (v6/tmp/ is gitignored, so leftovers are harmless but should not accumulate)
+rm -f v6/tmp/<name>.txt
 ```
 
 ---
@@ -369,3 +373,4 @@ Remove-Item *.tmp -ErrorAction SilentlyContinue
 
 *Last updated: 2026-08-20 — Extracted from orchestration_skill.md and AGENTS.md. Consolidated testing rules into standalone skill document.*
 *Last updated: 2026-10-22 — smoke-mode intent corrected (smoke = fast end-to-end/no-crash proof on tiny slices; its objectives are never performance evidence — the ≥1-year data-depth rule now applies to parity/validation tests), and run-log capture moved from `docs/test.txt` to `v6/tmp/` (gitignored). The WSL/PowerShell command examples in this file are historical and predate the native-Ubuntu migration.*
+*Last updated: 2026-10-23 — environment references fully modernized to native Ubuntu + rapids venv (execution format, output capture, tool-call reference rewritten to bash; WSL-era bug rows marked historical), documented GPU-test size-flag table added (bare parity invocations OOM on this host), `v6/test/` contract/invariant suite conventions added, PostgreSQL Optuna storage dependency documented.*

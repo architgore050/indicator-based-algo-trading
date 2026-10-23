@@ -410,8 +410,9 @@ if isinstance(src, cudf.Series):
 When a pipeline produces no output and no errors, trace backward through every stage. The bug is never in the last stage — it's upstream somewhere. Additionally:
 
 - **Tracebacks can be hidden inside structured log lines.** Optuna embeds error details inside `[W ...] Trial N failed` entries, not as standalone "Traceback" at line start. Always search inside log content, not just line headers.
-- **UTF-16 encoding breaks grep.** PowerShell captures WSL output as UTF-16 LE. Standard grep patterns won't match — always convert to UTF-8 first before searching for errors.
+- **UTF-16 encoding breaks grep (historical, PowerShell-capture era).** PowerShell captured WSL output as UTF-16 LE, so standard grep patterns would not match. Native Linux bash redirects write UTF-8 — search captured files directly; the general lesson (verify your search can actually see the bytes you are searching) still applies.
 
 ---
 
 *Last updated: 2026-08-20 — Created as standalone skill. Distinguished from testing_skill.md (testing = verify code works; diagnosis = understand WHY something isn't working).*
+*Last updated: 2026-10-23 — UTF-16/PowerShell grep lesson marked historical (native Linux bash redirects are UTF-8); diagnostic methodology unchanged.*
