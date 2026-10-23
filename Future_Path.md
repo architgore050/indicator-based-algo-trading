@@ -8,7 +8,7 @@
 
 ## Current Status
 
-The P0/P1/P2 external-review program is still in progress on the `fix/wfv-correctness-external-review` branch (see `docs/PLAN.md`): P0 and P1 items are largely resolved, P2 items are in progress. Calibration reproducibility is an **open investigation item** (§7) — the pipeline is bit-reproducible only under the current `n_jobs = 1` pin, and no permanent reproducibility policy has been chosen yet. What remains are **infrastructural upgrades** — each one is a substantial project that would touch multiple components of the pipeline and require its own design, implementation, and validation cycle.
+The P0/P1/P2 external-review program is still in progress on the `fix/wfv-correctness-external-review` branch (see `docs/PLAN.md`): P0 and P1 items are largely resolved, P2 items are in progress. Calibration reproducibility is an **open investigation item** (§7) — the pipeline is bit-reproducible only under the current `n_jobs = 1` pin, and no permanent reproducibility policy has been chosen yet. Dead-tunable-parameter removal is an **open decision item** (§8) — 7 genuinely dead + 1 behaviorally inert tunables await per-key developer adjudication; none is covered by a verdict in `docs/externalReview_pipeline_correctness.md`, so `config.json` was left untouched. What remains are **infrastructural upgrades** — each one is a substantial project that would touch multiple components of the pipeline and require its own design, implementation, and validation cycle.
 
 ---
 
@@ -208,16 +208,96 @@ Open item — needs deeper investigation, no policy chosen yet; decision deferre
 
 ---
 
+## 8. Dead Tunable Parameters — Removal Decision (7 dead + 1 behaviorally inert)
+
+**Status: OPEN — awaiting per-key developer adjudication.** Recorded 2026-10-23 under the developer instruction *"implement the changes given in the VERDICTS in `docs/externalReview_pipeline_correctness.md`; if there is any key you want to edit that is NOT covered there, put it in `Future_Path.md`"*. A verdict-coverage audit (below) found **none of the 8 keys is covered by any verdict**, so **no `config.json` and no test change was made** — the keys are recorded here for the developer to adjudicate individually.
+
+### Problem
+
+`v6/test/test_e2e_invariants.py` Test 8 (P2-3) classified all **76** tunable range dimensions (`vm_ranges` 20 + `tv_ranges` 39 + `trend_ranges` 17): **68 ACTIVE, 7 `DEAD_CONFIRMED`, 1 `INERT_MASKED`**. The 7 dead ones are *dead outputs*: each key IS read by its generator and passed into an indicator function, but the specific output column it tunes is never consumed by any gate condition. The dimension therefore contributes **zero gradient** to the MOO objective (median PSR / median MaxDD / median Profit Factor): NSGA-II spends population diversity and trial budget on a knob that cannot change any objective, and its boundary hits are noise mistaken for signal. The 8th key is live-read but behaviorally inert — its gate masks genuinely move, yet no signal ever flips.
+
+Full evidence: `docs/P2-3_e2e_invariants.md` §6 (adjudication ledger + full 76-row table) and Review findings **R4** (independent re-traces — all 7 confirmed at signal *and* indicator level), **R5** (loxx verdict holds, evidence numbers corrected), **R6** (arithmetic correction).
+
+### Verdict-coverage audit (why nothing was implemented)
+
+Grep of `docs/externalReview_pipeline_correctness.md` for each key name (and for `multi_rsi`, `bbbo`, `loxx`, `atr_lb`, `vol_band`): **zero occurrences of any of the 8 keys anywhere in the doc.** The parameter-range verdict (P1-1) covers four *other* keys and its out-of-scope boundary is explicit — *"Do not change any other parameter ranges or default values"* (doc line 675). P2-1 covers config *bookkeeping* keys only. P2-3's verdict builds the detection guardrail; Test 8 is a detector, not a removal instruction.
+
+| Key | Covered by a verdict? | Dispositive evidence |
+|---|---|---|
+| `vm:multi_rsi_p2` | **No** | Key absent from the doc; P1-1 verdict covers only `use_fast_stoch_exit`/`use_slow_stoch_exit`, `tsm_vol_z_entry`, `phase3_refinement_pct`, `min_sell_confirmations`, then forbids "any other parameter ranges or default values" |
+| `vm:multi_rsi_p3` | **No** | Same |
+| `tv:el_macd_fast` | **No** | Same |
+| `tv:el_macd_slow` | **No** | Same |
+| `tv:el_macd_signal` | **No** | Same |
+| `tv:bbbo_mult_upper` | **No** | Same |
+| `tv:loxx_vol_band_period` | **No** | Same; P2-3's verdict mandates *detecting* dead parameters, not removing them |
+| `trend:bo_atr_lb` | **No** | Same |
+
+Precedent for what "covered by a verdict" looks like (already implemented, do not re-litigate): **P1-1** hardcoded `use_fast_stoch_exit`/`use_slow_stoch_exit` to `True` and kept them out of `vm_ranges`; **implemented** `tsm_vol_z_entry` and added it to `trend_ranges`; **deleted** `phase3_refinement_pct`; **capped** `min_sell_confirmations` `[1,10] → [1,3]`. **P2-1** deleted `warmup_bars`/`wfv_start_row`/`wfv_total_rows`, kept `n_startup_trials` and `calibration_rows_per_trial`. P2-3's own carry-forward list item 1 states the removal decision is open and *"explicit developer approval required"*.
+
+### Per-key evidence (live config ranges; reviewer-verified probes, `docs/P2-3_e2e_invariants.md` §6 + R4/R5)
+
+Probe depth: vm/tv 20,000 bars, trend 30,000 bars (deviation D8, VRAM headroom); lo vs hi across the full sampled range.
+
+| Key (live range) | Indicator output it tunes (moves) | Gate-consumed outputs (0 diff) | Signal events lo vs hi | Class |
+|---|---|---|---|---|
+| `vm:multi_rsi_p2` [20, 50] | `R2MAVW` differs 19,873/20,000 | VM confluence reads only `multi_rsi["R1MAVW"]` (generator :358/:372) — 0 differ | identical (124) | DEAD_CONFIRMED |
+| `vm:multi_rsi_p3` [30, 100] | `R3MAVW` differs 19,873/20,000 | `R1MAVW` 0 differ | identical (124) | DEAD_CONFIRMED |
+| `tv:el_macd_fast` [5, 150] | `MACD`/`MACD_Signal` differ 19,999/20,000 | `el_bull` reads only `RSI2`/`RSI3`/`Signal_K` (generator :386-388) — 0 differ | identical (200) | DEAD_CONFIRMED |
+| `tv:el_macd_slow` [30, 500] | same consumption path | same | identical (200) | DEAD_CONFIRMED |
+| `tv:el_macd_signal` [5, 100] | same consumption path | same | identical (200) | DEAD_CONFIRMED |
+| `tv:bbbo_mult_upper` [0.2, 8.0] | `bbbo["Upper"]` differs 19,894/20,000 | `bbbo_bull` reads only `Oscillator`/`Lower` (generator :396-397) — 0 differ | identical (200) | DEAD_CONFIRMED |
+| `trend:bo_atr_lb` [7, 60] | `breakout["ATR"]` differs 29,992/30,000 | trend gates read only `EMA_Trend`/`Break_Up`/`Break_Dn` (generator :335-375) — 0 differ | identical (373) | DEAD_CONFIRMED |
+| `tv:loxx_vol_band_period` [10, 150] | `Band_Up`/`Band_Dn` move; masks that read them move — `loxx_upper_touch` differs **17**/20,000, `loxx_bear` differs **77**/20,000 at the pinned fixture | no signal ever flips | identical (200) at every bound, all rungs (pinned / deep / relaxed / alt-2015 / alt-2019) | INERT_MASKED |
+
+**Corrected loxx evidence (R5).** The original figures — 1,699/20,000 `loxx_upper_touch`, 0/20,000 `loxx_bear`, "masked by a persistent `(Trend < 0)` term" — were **stale pre-D7 provenance**: 1,699 reproduces only with config-default loxx params, 0/20,000 reproduces in no configuration, and `(Trend < 0)` covers only ~50% of bars at the pin. The mechanism claim is wrong (the masks do move); the **verdict holds** (no signal ever flips across the full range).
+
+### Cost of keeping them / benefit of removal
+
+- **7/76 = 9.2%** of every calibration trial budget across all strategies and phases (10.5% including the inert one). Per strategy: **vm 2/20 = 10.0%**, **tv 4/39 = 10.3%** (12.8% incl. inert), **trend 1/17 = 5.9%**. (Reviewer arithmetic correction R6, superseding the earlier "7.1% of ~94".)
+- **8 NSGA-II dimensions** with zero objective gradient — population diversity and every Phase-1/2/3 trial evaluation spent on dimensions that cannot move median PSR, median MaxDD, or Profit Factor.
+- Removal recovers that budget directly and is the concrete, evidence-backed first installment of `docs/PLAN.md` **Task 4.4** (Optuna search-space reduction, target 30-50% fewer trials).
+- Variant B additionally saves GPU time: `definitions.py` could stop computing the dead legs (`R2`/`R3` multi-RSI chains, EL-MACD legs, breakout `ATR`).
+
+### What would change
+
+Two variants, deliberately separated because they have very different blast radii:
+
+- **Variant A — ranges only (minimal).** Delete the 8 keys from `vm_ranges`/`tv_ranges`/`trend_ranges`. The generators keep reading them from `*_strategy_params` defaults (`multi_rsi_p2=34`, `multi_rsi_p3=55`, `el_macd_fast=50`, `el_macd_slow=100`, `el_macd_signal=30`, `bbbo_mult_upper=1.5`, `loxx_vol_band_period=34`, `bo_atr_lb=28`), so **signal output is unchanged** and the dead indicator legs are still computed. Recovers 8 dimensions + ~9.2% trial budget with zero behavioral change.
+- **Variant B — ranges + `strategy_params` + indicator math.** Also drop the generator plumbing and stop computing the dead columns in `definitions.py`. Bigger speed win, but it touches indicator function signatures (AGENTS.md: signatures are preserved for consumers), the P0-8 `compute_signals_df` parity contract, and the Test 8 reverse (consumed-must-be-declared) audit — which fails if a generator still reads a key that is in neither `strategy_params` nor the ranges.
+- **Guardrail bookkeeping (either variant).** Delete the matching `DEAD_PARAM_ALLOWLIST` entries in `v6/test/test_e2e_invariants.py` (~lines 1207-1276) so the ledger does not certify dead parameters that are no longer tunable. **Honest correction to a common assumption:** Test 8 iterates the *live* ranges, so an orphaned allowlist entry does **not** fail the suite — the enforced failure modes are (i) a new dead param with no allowlist entry, (ii) an allowlisted param that becomes ACTIVE, (iii) allowlist evidence tokens that no longer match the source, (iv) a consumed-but-undeclared key in the reverse audit. Allowlist cleanup is therefore a **hygiene requirement, not an enforced failure**; a removal commit must do it manually.
+- **Warm-up / pre-roll math.** `optuna_calibrate_vm.py:227` (`lb("multi_rsi_p3", 30)`) and `optuna_calibrate_tv.py:141,145` (`lb("el_macd_slow", 30) + lb("el_macd_signal", 5)`, `lb("loxx_vol_band_period", 10))` read these keys' lower bounds, and `wfv_ledger.compute_pre_roll_bars` scans every `_lb`/`_period`-suffixed range bound plus an explicit `el_macd_slow + el_macd_signal` composite chain. Their fallback defaults equal the current lower bounds (30/5/10) and the dominant pre-roll term remains `tsm_slow_lb` 5760 → pre-roll 5810, so removal is numerically neutral **today** — but it is neutral *by fallback coincidence*, and the derivation should be re-checked deliberately rather than inherited silently.
+
+### Structural impact
+
+- `config.json` — `vm_ranges` (2 keys), `tv_ranges` (4), `trend_ranges` (1); Variant B also touches the three `*_strategy_params` blocks. **Frozen: explicit developer approval required.**
+- `v6/test/test_e2e_invariants.py` — `DEAD_PARAM_ALLOWLIST` entries + the 76-row ledger expectation.
+- `docs/P2-3_e2e_invariants.md` §6/§7 and the AGENTS.md Experience-Learning entry ("7 of 76 range dims ≈ 9.2%") would need updating to reflect whatever is removed.
+- Variant B only: `v6/definitions.py`, `v6/generate_vm_automation_logic_signals.py`, `v6/generate_tv_strategy1_signals.py`, `v6/generate_trend_following_signals.py`.
+- Validation battery for any removal commit: `test_e2e_invariants.py` (full suite), `test_param_consumption.py`, `test_config_single_source.py`, `test_signal_parity.py`, `test_preroll_equivalence.py`, a vm orchestrator smoke + collation, and `parity_maintenance/test_backtest_config_isolation.py --rows 40000` — all under the low-memory convention.
+
+### Why deferred
+
+- `config.json` is frozen without explicit developer approval (AGENTS.md), and the developer's stated intent is to **adjudicate each parameter individually** — this section exists to make each key's evidence independently decidable.
+- No verdict in `docs/externalReview_pipeline_correctness.md` covers any of the 8 keys; P1-1's verdict explicitly excludes "any other parameter ranges or default values". Implementing removal anyway would be inventing a verdict.
+- Removing dimensions changes the calibration search space, so previously calibrated parameter sets and run-to-run comparisons are no longer directly comparable — the Full-Run Deferral policy says sensitivity evidence should be re-derived against the clean baseline run before the space is permanently cut.
+- `tv:loxx_vol_band_period` is a distinct decision from the 7: it is *live-read and behaviorally inert*, not dead. Removing it is defensible on budget grounds but it is a judgment about future gate changes (a different `min_sell_confirmations` or trend-term configuration could unmask it), not a factual deadness claim.
+
+**Cross-references:** `docs/P2-3_e2e_invariants.md` §6 + Review findings R4/R5/R6/R13 (carry-forward item 1); `docs/PLAN.md` Task 4.4; AGENTS.md Experience Learning → "Tunable parameters must be proven consumed at the OUTPUT level".
+
+---
+
 ## Execution Order
 
 These upgrades should be tackled in this order:
 
 1. ~~**Search Space Optimization**~~ **DONE (2026-08-26)** — Exit flags ON, ranges widened, trial counts adjusted. See `docs/wfv_restructuring_implementation.md`.
 2. ~~**Semi-Pre-Informed Phase 3**~~ **DONE (2026-08-26)** — Two-phase scheduling + distribution-based prior inheritance implemented. See `docs/wfv_restructuring_implementation.md`.
-3. **Risk Management Additions** — Add SL/TP/TSL/circuit breaker to established strategy. Measure the delta vs baseline.
-4. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
-5. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.
-6. **Session-Aware Spread** — Lowest priority. Marginal accuracy gain for significant complexity.
+3. **Dead Tunable Parameter Removal (§8)** — awaiting per-key developer adjudication. Cheapest item on this list (Variant A is a config + allowlist edit only) and it recovers ~9.2% of every calibration trial budget. Pairs with `docs/PLAN.md` Task 4.4.
+4. **Risk Management Additions** — Add SL/TP/TSL/circuit breaker to established strategy. Measure the delta vs baseline.
+5. **ATR-Based Position Sizing** — Layer on volatility-adjusted sizing. Replace fixed position size.
+6. **Heavy-Tail Slippage** — Requires empirical slippage data. Do once execution data is available.
+7. **Session-Aware Spread** — Lowest priority. Marginal accuracy gain for significant complexity.
 
 ---
 
@@ -225,10 +305,11 @@ These upgrades should be tackled in this order:
 
 - Each item is self-contained and can be implemented independently.
 - None are blocking — the pipeline works as-is.
+- §8 is the one item that is a **decision**, not an engineering project: Variant A (ranges-only removal) is behavior-neutral — signal output is unchanged because the generators fall back to `*_strategy_params` defaults — so it can be executed whenever the developer approves the keys, independent of the baseline run.
 - None should be attempted before a clean baseline WFV run establishes whether the strategy has positive expectancy.
 - GPU acceleration (cudf/cupy) is not required for any of these — they are structural/logic changes, not computational bottlenecks.
 - Parity tests should be written for each upgrade to ensure behavioral changes are intentional, not accidental.
 
 ---
 
-*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Updated 2026-10-22 with new §7 Calibration Reproducibility Policy (open item — mirrors `docs/PLAN.md` Task 4.8) and a corrected Current Status paragraph. Review and update after each baseline WFV run.*
+*Created 2026-08-24. Updated 2026-08-24 with Optuna DB audit findings (0/2,093 blind-search profitability; ~20% anchored monthly success; P3 tight-bound empty-signal pathology) and new §6 Semi-Pre-Informed Phase 3. Updated 2026-10-22 with new §7 Calibration Reproducibility Policy (open item — mirrors `docs/PLAN.md` Task 4.8) and a corrected Current Status paragraph. Updated 2026-10-23 with new §8 Dead Tunable Parameters — Removal Decision (7 `DEAD_CONFIRMED` + 1 `INERT_MASKED` tunables from P2-3 Test 8; verdict-coverage audit found **none** covered by a verdict in `docs/externalReview_pipeline_correctness.md`, so `config.json` and the Test 8 allowlist were deliberately left untouched). Review and update after each baseline WFV run.*
